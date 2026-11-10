@@ -57,7 +57,8 @@ bool usb_audio_control_ready(const struct usb_audio_control *p, uint64_t now)
 {
     /* Let EP0's SET_REPORT status stage complete before disconnecting. */
     return p->revoke_pending ||
-           (p->pending && now - p->request_us >= 100000ULL);
+           (p->pending && now >= p->request_us &&
+            now - p->request_us >= 100000ULL);
 }
 
 void usb_audio_control_apply(struct usb_audio_control *p, bool enabled,

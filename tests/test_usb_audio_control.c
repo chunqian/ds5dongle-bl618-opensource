@@ -19,6 +19,9 @@ static void test_control(void)
     cmd[6] = 1;
     assert(usb_audio_control_command(&p, cmd, sizeof(cmd), 100));
     assert(!p.visible && p.pending && p.requested);
+    assert(!usb_audio_control_ready(&p, 99)); /* older sample must not underflow */
+    assert(!usb_audio_control_ready(&p, 0));
+    assert(!usb_audio_control_ready(&p, 100));
     assert(!usb_audio_control_ready(&p, 100099));
     /* Duplicate SET must not delay the disconnect beyond the original grace. */
     assert(usb_audio_control_command(&p, cmd, sizeof(cmd), 100000));
@@ -54,6 +57,7 @@ static void test_control(void)
     usb_audio_control_configured(&p);
     usb_audio_control_reset(&p, 16100000);
     assert(p.visible && !p.requested && p.revoke_pending);
+    assert(usb_audio_control_ready(&p, 0)); /* revoke bypasses command grace */
     assert(usb_audio_control_ready(&p, 16100000)); /* even before CONFIGURED */
     cmd[6] = 1;
     assert(!usb_audio_control_command(&p, cmd, sizeof(cmd), 16100001));

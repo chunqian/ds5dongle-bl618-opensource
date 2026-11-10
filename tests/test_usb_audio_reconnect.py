@@ -28,16 +28,32 @@ harness = r"""
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#define taskENTER_CRITICAL() ((void)0)
-#define taskEXIT_CRITICAL() ((void)0)
+#define taskENTER_CRITICAL() enter_critical()
+#define taskEXIT_CRITICAL() exit_critical()
 #define pdMS_TO_TICKS(x) (x)
 #define LOG_INF(...) ((void)0)
 static struct usb_audio_control audio_control;
 static bool usb_configured, ep_in_busy, kbd_ep_busy, pending_active;
 static bool first_usb_send_logged, detached;
 static unsigned profile, profile_changes, connects, inject;
+static unsigned critical_depth, unprotected_time_samples;
+static bool inject_command_on_enter;
 static uint64_t now_us;
-static uint64_t bflb_mtimer_get_time_us(void) { return now_us; }
+static void enter_critical(void) {
+    /* An IRQ may complete immediately before task interrupts are masked. */
+    if (!critical_depth && inject_command_on_enter) {
+        inject_command_on_enter = false;
+        now_us++;
+        const uint8_t cmd[] = {4,'D','A','U','D',1,1};
+        assert(usb_audio_control_command(&audio_control, cmd, sizeof(cmd), now_us));
+    }
+    critical_depth++;
+}
+static void exit_critical(void) { assert(critical_depth); critical_depth--; }
+static uint64_t bflb_mtimer_get_time_us(void) {
+    if (!critical_depth) unprotected_time_samples++;
+    return now_us;
+}
 static void usb_soft_disconnect(void) { detached = true; }
 static void usb_soft_connect(void) { assert(detached); detached = false; connects++; }
 static void usb_audio_stop(void) {}
@@ -57,6 +73,7 @@ harness += "static void bus_reset(void) {\n" + event_body("USBD_EVENT_RESET") + 
 harness += "static void physical_disconnect(void) {\n" + event_body("USBD_EVENT_DISCONNECTED") + "}\n"
 harness += r"""
 static void vTaskDelay(unsigned ms) {
+    assert(!critical_depth);
     assert(detached && ms == 250);
     now_us += ms * 1000;
     unsigned event = inject;
@@ -71,6 +88,8 @@ static void setup(void) {
     ep_in_busy = kbd_ep_busy = pending_active = first_usb_send_logged = false;
     detached = false;
     profile = profile_changes = connects = inject = 0;
+    critical_depth = unprotected_time_samples = 0;
+    inject_command_on_enter = false;
     now_us = 0;
 }
 static void request(bool enabled) {
@@ -95,6 +114,19 @@ int main(void) {
     setup(); now_us = 10000000;
     usb_gamepad_process_deferred();
     assert(!audio_control.visible && !connects);
+
+    /* Fresh SET_REPORT between the old clock-sample position and IRQ masking
+     * must still receive the complete 100ms grace, including its last us. */
+    setup(); now_us = 1000000; inject_command_on_enter = true;
+    usb_gamepad_process_deferred();
+    assert(!connects && !audio_control.visible && audio_control.pending);
+    assert(!unprotected_time_samples);
+    now_us += 99999;
+    usb_gamepad_process_deferred();
+    assert(!connects && !audio_control.visible);
+    now_us++;
+    usb_gamepad_process_deferred();
+    assert(connects == 1 && audio_control.visible && !critical_depth);
 
     setup(); enable();
     unsigned before = profile_changes;
@@ -124,7 +156,7 @@ int main(void) {
         assert(!audio_control.grant_until_us && profile == 0 && !detached);
         bus_reset(); configured(); enable();
     }
-    puts("PASS: actual reset/task paths, reset/unplug during wait, stable layout, recovery, no reconnect loop");
+    puts("PASS: atomic time/request snapshot, full command grace, reset/unplug recovery, no reconnect loop");
 }
 """
 with tempfile.TemporaryDirectory(prefix="ds5-usb-reconnect-") as directory:

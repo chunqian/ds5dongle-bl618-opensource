@@ -24,14 +24,14 @@
 
 #if defined(BOARD_LCTECH_616)
   #ifdef FORCE_FS_MODE
-    #define FIRMWARE_VERSION "LCT616-DS5 3.18-HidAudio-R1"
+    #define FIRMWARE_VERSION "LCT616-DS5 3.18-HidAudio-R2"
   #else
-    #define FIRMWARE_VERSION "LCT616-DS5 3.18H-HidAudio-R1"
+    #define FIRMWARE_VERSION "LCT616-DS5 3.18H-HidAudio-R2"
   #endif
 #elif defined(BOARD_M0S_DOCK)
-#define FIRMWARE_VERSION "M0S-DS5 3.5-HidAudio-R1"
+#define FIRMWARE_VERSION "M0S-DS5 3.5-HidAudio-R2"
 #else
-#define FIRMWARE_VERSION "BL618-DS5 3.5-HidAudio-R1"
+#define FIRMWARE_VERSION "BL618-DS5 3.5-HidAudio-R2"
 #endif
 
 #define USBD_MAX_POWER      250
@@ -782,8 +782,9 @@ void usb_gamepad_set_dse_mode(bool dse)
 ATTR_TCM_SECTION
 void usb_gamepad_process_deferred(void)
 {
-    uint64_t now = bflb_mtimer_get_time_us();
     taskENTER_CRITICAL();
+    /* Sample time and ISR-written request state in the same critical section. */
+    uint64_t now = bflb_mtimer_get_time_us();
     bool change = (usb_configured || audio_control.revoke_pending) &&
                   usb_audio_control_ready(&audio_control, now);
     bool expired = usb_audio_control_expired(&audio_control, now);
