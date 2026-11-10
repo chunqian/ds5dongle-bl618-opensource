@@ -21,6 +21,9 @@ void config_validate(void)
                b->config_version, CONFIG_VERSION);
         memset(b, 0xFF, sizeof(*b));
         b->config_version = CONFIG_VERSION;
+        b->led_r = CONFIG_DEFAULT_LED_R;
+        b->led_g = CONFIG_DEFAULT_LED_G;
+        b->led_b = CONFIG_DEFAULT_LED_B;
     }
 
     if (isnan(b->haptics_gain) || b->haptics_gain < 1.0f || b->haptics_gain > 2.0f)
@@ -59,12 +62,12 @@ void config_validate(void)
         b->dse_detected = 0;
     if (b->usb_stealth > 1)
         b->usb_stealth = 0;
-    /* Default LED color to white for configs migrated from older firmware
+    /* Use the default LED color for configs migrated from older firmware
      * (memset(0) leaves these as 0,0,0 which would be black). */
     if (b->led_r == 0 && b->led_g == 0 && b->led_b == 0) {
-        b->led_r = 0xFF;
-        b->led_g = 0xFF;
-        b->led_b = 0xFF;
+        b->led_r = CONFIG_DEFAULT_LED_R;
+        b->led_g = CONFIG_DEFAULT_LED_G;
+        b->led_b = CONFIG_DEFAULT_LED_B;
     }
     if (b->tp_mode > 4)
         b->tp_mode = 0;
@@ -98,9 +101,9 @@ void config_load(void)
         cfg.enable_wake       = 0;
         cfg.enable_usb_sn     = 1;     /* DS5Dongle always provides serial */
         cfg.usb_stealth       = 0;     /* USB visible at boot (non-stealth) */
-        cfg.led_r             = 0xFF;
-        cfg.led_g             = 0xFF;
-        cfg.led_b             = 0xFF;
+        cfg.led_r             = CONFIG_DEFAULT_LED_R;
+        cfg.led_g             = CONFIG_DEFAULT_LED_G;
+        cfg.led_b             = CONFIG_DEFAULT_LED_B;
         cfg.tp_mode           = 0;     /* off */
         cfg.tp_mode_enabled_mask = 0x03; /* mode 0 + mode 1 enabled */
         cfg.tp_mouse_sensitivity = 8;

@@ -4,6 +4,11 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+/* Default controller lightbar color: dim blue (#000040). */
+#define CONFIG_DEFAULT_LED_R 0x00
+#define CONFIG_DEFAULT_LED_G 0x00
+#define CONFIG_DEFAULT_LED_B 0x40
+
 /*
  * Configuration body — layout-compatible with DS5Dongle's Config_body
  * for potential companion-app interoperability.  Audio-related fields
@@ -29,9 +34,9 @@ struct __attribute__((packed)) config_body {
     uint8_t lock_volume;          /* bool       — ignore host volume changes */
     uint8_t dse_detected;         /* bool — Auto mode remembers last detection */
     uint8_t usb_stealth;          /* bool — hide USB until BT controller connects */
-    uint8_t led_r;                /* [0-255] custom LED red   (0xFF = default white) */
-    uint8_t led_g;                /* [0-255] custom LED green (0xFF = default white) */
-    uint8_t led_b;                /* [0-255] custom LED blue  (0xFF = default white) */
+    uint8_t led_r;                /* [0-255] custom LED red   (default 0x00) */
+    uint8_t led_g;                /* [0-255] custom LED green (default 0x00) */
+    uint8_t led_b;                /* [0-255] custom LED blue  (default 0x40) */
     uint8_t tp_mode;              /* 0=off, 1=dpad, 2=Lmouse+Rdpad, 3=Ldpad+Rmouse, 4=split */
     uint8_t tp_mode_enabled_mask; /* bitmask of enabled modes (bit0-bit4) */
     uint8_t tp_mouse_sensitivity; /* [1-32], default 8 */

@@ -204,11 +204,11 @@ static const uint8_t init_set_state[DS5_USB_OUTPUT_PAYLOAD_LEN] = {
     /* [43] PlayerIndicators: none */
     0x00,
     /* [44] LedRed   — color only, safe to change */
-    0xFF,
+    CONFIG_DEFAULT_LED_R,
     /* [45] LedGreen — color only, safe to change */
-    0xFF,
+    CONFIG_DEFAULT_LED_G,
     /* [46] LedBlue  — color only, safe to change */
-    0xFF,
+    CONFIG_DEFAULT_LED_B,
 };
 
 /* ---- BT HID callbacks ---- */
