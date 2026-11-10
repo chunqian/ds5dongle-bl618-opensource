@@ -1086,12 +1086,15 @@ static bool ds5_feature_fallback(uint8_t report_id, uint8_t *buf, uint32_t *len)
 
     case DS5_FEATURE_REPORT_CALIBRATION: {
         /* Report 0x05 — Calibration data (41 bytes)
-         * Typical DualSense factory values; the kernel driver has
-         * division-by-zero protection and will use its own defaults
-         * if any denominator is zero. */
+         * Nominal calibration until the real controller data is cached.
+         * Both gyro speed fields are positive magnitudes in degrees/s.
+         * With +/-8192 raw counts at +/-512 degrees/s, the host obtains
+         * 16 counts per degree/s (normalized gain: 1024 / 16 = 64).
+         * A zero speed sum would silently zero all calibrated gyro axes;
+         * denominator-only validation does not reject that case. */
         memset(buf, 0, 41);
         buf[0] = 0x05;
-        int16_t *cal = (int16_t *)(buf + 1);
+        int16_t cal[17];
         cal[0]  = 0;       /* gyro_pitch_bias */
         cal[1]  = 0;       /* gyro_yaw_bias   */
         cal[2]  = 0;       /* gyro_roll_bias  */
@@ -1101,14 +1104,20 @@ static bool ds5_feature_fallback(uint8_t report_id, uint8_t *buf, uint32_t *len)
         cal[6]  = -8192;   /* gyro_yaw_minus   */
         cal[7]  = 8192;    /* gyro_roll_plus   */
         cal[8]  = -8192;   /* gyro_roll_minus  */
-        cal[9]  = 1024;    /* gyro_speed_plus  */
-        cal[10] = -1024;   /* gyro_speed_minus */
+        cal[9]  = 512;     /* gyro_speed_plus  */
+        cal[10] = 512;     /* gyro_speed_minus */
         cal[11] = 8192;    /* acc_x_plus   */
         cal[12] = -8192;   /* acc_x_minus  */
         cal[13] = 8192;    /* acc_y_plus   */
         cal[14] = -8192;   /* acc_y_minus  */
         cal[15] = 8192;    /* acc_z_plus   */
         cal[16] = -8192;   /* acc_z_minus  */
+        /* The report ID makes these fields unaligned; encode explicitly. */
+        for (unsigned i = 0; i < 17; i++) {
+            uint16_t value = (uint16_t)cal[i];
+            buf[1 + 2 * i] = (uint8_t)value;
+            buf[2 + 2 * i] = (uint8_t)(value >> 8);
+        }
         *len = 41;
         return true;
     }
