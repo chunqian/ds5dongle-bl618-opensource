@@ -17,6 +17,7 @@ sdk_set_main_file(src/main.c)
 target_sources(app PRIVATE
     src/bt_hid_host.c
     src/ds5_protocol.c
+    src/usb_audio_control.c
     src/usb_gamepad.c
     src/ds5_usb_audio.c
     src/audio.c

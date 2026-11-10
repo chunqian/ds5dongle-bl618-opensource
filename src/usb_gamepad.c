@@ -1,4 +1,5 @@
 #include "usb_gamepad.h"
+#include "usb_audio_control.h"
 #include "compiler/compiler_ld.h"
 #include "ds5_usb_audio.h"
 #include "audio.h"
@@ -23,14 +24,14 @@
 
 #if defined(BOARD_LCTECH_616)
   #ifdef FORCE_FS_MODE
-    #define FIRMWARE_VERSION "LCT616-DS5 3.18"
+    #define FIRMWARE_VERSION "LCT616-DS5 3.18-HidAudio-R1"
   #else
-    #define FIRMWARE_VERSION "LCT616-DS5 3.18H"
+    #define FIRMWARE_VERSION "LCT616-DS5 3.18H-HidAudio-R1"
   #endif
 #elif defined(BOARD_M0S_DOCK)
-#define FIRMWARE_VERSION "M0S-DS5 3.5"
+#define FIRMWARE_VERSION "M0S-DS5 3.5-HidAudio-R1"
 #else
-#define FIRMWARE_VERSION "BL618-DS5 3.5"
+#define FIRMWARE_VERSION "BL618-DS5 3.5-HidAudio-R1"
 #endif
 
 #define USBD_MAX_POWER      250
@@ -48,6 +49,8 @@
 static bool current_dse_mode = false;
 
 static volatile bool usb_config_save_pending = false;
+static struct usb_audio_control audio_control;
+
 static volatile bool usb_reset_pending = false;
 static volatile bool usb_remap_save_pending  = false;
 static volatile uint8_t usb_remap_save_profile = 0;
@@ -421,8 +424,7 @@ static uint8_t device_desc[] = {
 #define HID_SECTION_OFFSET          (AUDIO_DESC_OFFSET + USB_AUDIO_DESC_SIZE)  /* 195 */
 #define CONFIG_DESC_WDLEN_OFF       (HID_SECTION_OFFSET + 9 + 7)  /* 211: gamepad HID wDescriptorLength */
 #define BINTERVAL_GAMEPAD_EP_IN_OFF (HID_SECTION_OFFSET + 9 + 9 + 6) /* 219 */
-#define BINTERVAL_GAMEPAD_EP_OUT_OFF (BINTERVAL_GAMEPAD_EP_IN_OFF + 7) /* 226 */
-#define KBD_INTF_OFF  (BINTERVAL_GAMEPAD_EP_OUT_OFF + 1) /* 227: keyboard intf descriptor */
+#define KBD_INTF_OFF  (HID_SECTION_OFFSET + 9 + 9 + 7) /* 220 */
 #define KBD_SUBCLASS_OFF (KBD_INTF_OFF + 6)  /* bInterfaceSubClass in kbd intf */
 #define KBD_PROTOCOL_OFF (KBD_INTF_OFF + 7)  /* bInterfaceProtocol in kbd intf */
 
@@ -504,6 +506,12 @@ static const uint8_t *desc_device_cb(uint8_t speed)
 static const uint8_t *desc_config_cb(uint8_t speed)
 {
     (void)speed;
+    static uint8_t hid_only_desc[9 + USB_HID_ONLY_SIZE];
+    if (!audio_control.visible) {
+        size_t len = usb_audio_hid_descriptor(config_desc, sizeof(config_desc),
+                                               hid_only_desc, sizeof(hid_only_desc));
+        return len ? hid_only_desc : NULL;
+    }
     return config_desc;
 }
 
@@ -527,7 +535,12 @@ static uint8_t other_speed_desc[USB_HID_CONFIG_SIZE];
 static const uint8_t *desc_other_speed_cb(uint8_t speed)
 {
     (void)speed;
-    memcpy(other_speed_desc, config_desc, sizeof(other_speed_desc));
+    const uint8_t *selected = desc_config_cb(speed);
+    if (!selected) return NULL;
+    uint16_t selected_len = selected[2] | ((uint16_t)selected[3] << 8);
+    if (selected_len > sizeof(other_speed_desc)) return NULL;
+    memset(other_speed_desc, 0, sizeof(other_speed_desc));
+    memcpy(other_speed_desc, selected, selected_len);
     other_speed_desc[1] = 0x07;
     uint16_t total = other_speed_desc[2] | (other_speed_desc[3] << 8);
     for (uint16_t i = 0; i + 2 < total && i + 2 < sizeof(other_speed_desc); ) {
@@ -616,6 +629,14 @@ static struct usbd_endpoint  hid_ep_in;
 static struct usbd_interface kbd_intf;
 static struct usbd_endpoint  kbd_ep_in;
 
+/* Only called before enumeration, during reset, or while detached. */
+static void apply_audio_profile(void)
+{
+    hid_intf.intf_num = audio_control.visible ? USB_INTF_GAMEPAD : 0;
+    kbd_intf.intf_num = audio_control.visible ? USB_INTF_KBD : 1;
+    usb_audio_set_visible(audio_control.visible);
+}
+
 static volatile bool usb_configured = false;
 static volatile bool ep_in_busy = false;
 static volatile bool kbd_ep_busy = false;
@@ -674,6 +695,7 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
 {
     switch (event) {
     case USBD_EVENT_CONFIGURED:
+        usb_audio_control_configured(&audio_control);
         usb_configured = true;
         ep_in_busy = false;
         kbd_ep_busy = false;
@@ -682,6 +704,12 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
             hook_configured();
         break;
     case USBD_EVENT_RESET:
+        usb_audio_control_reset(&audio_control, bflb_mtimer_get_time_us());
+        /* A reset alone need not recreate the host's interface objects.
+         * Force a real removal before replacing the audio configuration;
+         * the task changes descriptors only after the detached interval. */
+        if (audio_control.revoke_pending)
+            usb_soft_disconnect();
         usb_configured = false;
         ep_in_busy = false;
         kbd_ep_busy = false;
@@ -715,6 +743,12 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
         LOG_INF("[USB-EVT] CONNECTED (VBUS detected)\n");
         break;
     case USBD_EVENT_DISCONNECTED:
+        usb_audio_control_disconnect(&audio_control);
+        apply_audio_profile();
+        usb_configured = false;
+        usb_audio_stop();
+        usb_audio_mic_stop();
+        audio_set_mic_active(false);
         LOG_INF("[USB-EVT] DISCONNECTED (VBUS lost)\n");
         break;
     case USBD_EVENT_SET_REMOTE_WAKEUP:
@@ -748,6 +782,37 @@ void usb_gamepad_set_dse_mode(bool dse)
 ATTR_TCM_SECTION
 void usb_gamepad_process_deferred(void)
 {
+    uint64_t now = bflb_mtimer_get_time_us();
+    taskENTER_CRITICAL();
+    bool change = (usb_configured || audio_control.revoke_pending) &&
+                  usb_audio_control_ready(&audio_control, now);
+    bool expired = usb_audio_control_expired(&audio_control, now);
+    bool enabled = change && audio_control.requested;
+    uint32_t generation = audio_control.generation;
+    if (change || expired) {
+        usb_soft_disconnect();
+        usb_configured = false;
+    }
+    taskEXIT_CRITICAL();
+    if (change || expired) {
+        usb_audio_stop();
+        usb_audio_mic_stop();
+        audio_set_mic_active(false);
+        audio_reset_encoder();
+        vTaskDelay(pdMS_TO_TICKS(250));
+        taskENTER_CRITICAL();
+        usb_audio_control_apply(&audio_control, enabled, generation,
+                                bflb_mtimer_get_time_us());
+        apply_audio_profile();
+        ep_in_busy = false;
+        kbd_ep_busy = false;
+        pending_active = false;
+        enabled = audio_control.visible;
+        usb_soft_connect();
+        taskEXIT_CRITICAL();
+        LOG_INF("[USB-AUDIO] Reconnected: audio visibility=%d\n", enabled);
+    }
+
     if (usb_reset_pending) {
         usb_reset_pending = false;
         config_save();
@@ -873,6 +938,8 @@ int usb_gamepad_init(usb_gamepad_output_cb_t output_cb)
 
     LOG_INF("[USB-INIT] Calling usbd_initialize(0, 0x%08lx, handler)...\n",
            (unsigned long)USB_BASE);
+    usb_audio_control_disconnect(&audio_control);
+    apply_audio_profile();
     usbd_initialize(0, USB_BASE, usbd_event_handler);
     LOG_INF("[USB-INIT] usbd_initialize returned\n");
 
@@ -956,7 +1023,6 @@ void usb_gamepad_set_polling_rate(uint8_t mode)
     }
 #endif
     config_desc[BINTERVAL_GAMEPAD_EP_IN_OFF]  = interval;
-    config_desc[BINTERVAL_GAMEPAD_EP_OUT_OFF] = interval;
     LOG_INF("[USB] Polling rate: mode=%d bInterval=%d\n", mode, interval);
 }
 
@@ -1141,7 +1207,7 @@ void usbd_hid_get_report(uint8_t busid, uint8_t intf, uint8_t report_id,
 {
     (void)busid;
 
-    if (intf == USB_INTF_KBD) {
+    if (kbd_registered && intf == kbd_intf.intf_num) {
         memset(kbd_idle_report, 0, sizeof(kbd_idle_report));
         *data = kbd_idle_report;
         *len  = (report_id == 0x02) ? 1 : 8; /* CC=1B bitmap, Kbd=8B (no Report ID prefix) */
@@ -1199,7 +1265,8 @@ void usbd_hid_get_report(uint8_t busid, uint8_t intf, uint8_t report_id,
             feature_resp_buf[12] = get_battery_level();
             feature_resp_buf[13] = get_battery_state();
             *data = feature_resp_buf;
-            *len  = 14;
+            usb_audio_control_status(&audio_control, feature_resp_buf + 14);
+            *len  = 22;
         } else if (report_id == 0xFB) {
             feature_resp_buf[0] = 0xFB;
             feature_resp_buf[1] = remap_get_active_profile();
@@ -1255,7 +1322,7 @@ void usbd_hid_set_report(uint8_t busid, uint8_t intf, uint8_t report_id,
 {
     (void)busid;
 
-    if (intf == USB_INTF_KBD) {
+    if (kbd_registered && intf == kbd_intf.intf_num) {
         return;
     }
 
@@ -1277,6 +1344,9 @@ void usbd_hid_set_report(uint8_t busid, uint8_t intf, uint8_t report_id,
             LOG_INF("[USB] CMD 0x01: config updated\n");
         } else if (cmd == 0x02) {
             usb_config_save_pending = true;
+        } else if (cmd == 0x04) {
+            usb_audio_control_command(&audio_control, payload, payload_len,
+                                      bflb_mtimer_get_time_us());
         } else if (cmd == 0x03) {
             usb_reset_pending = true;
         }

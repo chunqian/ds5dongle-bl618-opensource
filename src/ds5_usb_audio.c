@@ -409,6 +409,24 @@ const uint8_t *usb_audio_get_desc(uint16_t *len)
     return audio_desc;
 }
 
+void usb_audio_set_visible(bool visible)
+{
+    struct usbd_interface *interfaces[] = {
+        &audio_intf_ctrl, &audio_intf_stream, &audio_intf_mic
+    };
+    for (uint8_t i = 0; i < 3; ++i) {
+        struct usbd_interface *intf = interfaces[i];
+        usbd_audio_init_intf(0, intf, 0x0100, entity_table,
+                            sizeof(entity_table) / sizeof(entity_table[0]));
+        intf->intf_num = visible ? i : 0xff;
+        if (!visible) {
+            intf->class_interface_handler = NULL;
+            intf->class_endpoint_handler = NULL;
+            intf->notify_handler = NULL;
+        }
+    }
+}
+
 bool usb_audio_is_active(void)
 {
     if (stream_active)

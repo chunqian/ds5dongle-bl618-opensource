@@ -307,6 +307,41 @@ firmware/               板级烧录配置 + 本地编译产物（二进制已 g
 
 ## 网页配置
 
+### 本地 HidAudio 固件：由 Mac 应用开启声卡
+
+`HidAudio` 版本上电时仅呈现 HID 手柄及按配置启用的键盘，不呈现 USB
+扬声器、耳机和麦克风。CR 的 macOS 版本在发现支持此协议的 USB 适配器后，
+发送专用 HID Feature 命令开启声卡；iOS/iPadOS 版本不发送命令，因此保持纯 HID。
+不再通过 USB 请求特征推测操作系统。未运行支持此协议的软件时，Mac 上也没有声卡。
+
+切换后会有约 250ms 的 USB 断开，系统随后重新枚举手柄和音频接口。设置仅在 RAM
+中保存，不写入配置 Flash；断电、物理拔插或已完成枚举后的新 USB reset 会恢复隐藏，
+Mac 应用需要重新发送命令。关闭声卡时音频驱动的 HD 震动和麦克风不可用，HID 输入、
+陀螺仪、扳机及 HID 普通震动通道保留。退出 CR 不主动关闭已开启的声卡。
+
+`HidAudio-R1` 修正复位恢复：新 USB reset 撤销声卡授权时，先主动断开 USB，再在任务中
+切换为纯 HID，避免主机缓存的接口编号失效。重连等待期间若再次收到 reset、拔插或相反
+命令，旧开启请求会失效，最终保持隐藏；Mac 可在新一轮 HID 枚举后重新授权开启。
+
+协议（下列偏移均包含 Report ID）：
+
+- `GET_FEATURE 0xF9`：原有前 14 字节保持不变；字节 14–17 为 ASCII `DAUD`，
+  字节 18 为协议版本 `1`，字节 19 为当前声卡可见状态，20 为请求状态，21 为待切换状态。
+- `SET_FEATURE 0xF6`：发送 `F6 04 44 41 55 44 01 XX` 并补零到 64 字节；
+  `XX=01` 开启，`XX=00` 关闭。主机必须先检查上述专用标记，不能仅凭 Sony VID/PID
+  向原装手柄或旧固件发送命令。重复发送相同状态不会触发重新枚举。
+
+构建：`USB_SPEED=hs bash build_macos.sh build`。
+本地验证：
+
+```bash
+clang -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -Isrc \
+  tests/test_usb_audio_control.c src/usb_audio_control.c -o /tmp/test-usb-audio-control
+/tmp/test-usb-audio-control
+python3 tests/test_ds5_calibration.py
+python3 tests/test_usb_audio_reconnect.py
+```
+
 配套的网页配置工具出于维护早期用户利益考虑，**不开源**。当前网页地址：[ps5.ds5678.top](https://ps5.ds5678.top)。开源固件仍可通过网页调整各项配置（USB Feature Report 0xF6–0xF9 / 0xFB），但**本开源版本不支持在线 OTA**。有一定动手能力的开发者可以自行实现自己的网页配置页——结合 AI 辅助，实现起来非常简单。
 
 ## 致谢

@@ -36,6 +36,7 @@
  */
 void usb_audio_early_init(void);
 void usb_audio_register(uint8_t busid);
+void usb_audio_set_visible(bool visible);
 
 /**
  * Get the audio portion of the config descriptor.
