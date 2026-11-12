@@ -33,7 +33,7 @@ harness = r"""
 #define pdMS_TO_TICKS(x) (x)
 #define LOG_INF(...) ((void)0)
 static struct usb_audio_control audio_control;
-static bool usb_configured, ep_in_busy, kbd_ep_busy, pending_active;
+static bool usb_configured, ep_in_busy, kbd_ep_busy, pending_valid, pending_active;
 static bool first_usb_send_logged, detached;
 static unsigned profile, profile_changes, connects, inject;
 static unsigned critical_depth, unprotected_time_samples;
@@ -85,7 +85,7 @@ static void vTaskDelay(unsigned ms) {
 static void setup(void) {
     memset(&audio_control, 0, sizeof(audio_control));
     usb_configured = true;
-    ep_in_busy = kbd_ep_busy = pending_active = first_usb_send_logged = false;
+    ep_in_busy = kbd_ep_busy = pending_valid = pending_active = first_usb_send_logged = false;
     detached = false;
     profile = profile_changes = connects = inject = 0;
     critical_depth = unprotected_time_samples = 0;
@@ -101,10 +101,12 @@ static void configured(void) {
     usb_configured = true;
 }
 static void enable(void) {
+    pending_valid = pending_active = true; /* Cached input from the old profile. */
     request(true);
     now_us += 100001;
     usb_gamepad_process_deferred();
     assert(profile == 3 && audio_control.visible && !detached);
+    assert(!pending_valid && !pending_active);
     bus_reset(); /* The reset caused by our own reconnect retains the grant. */
     assert(profile == 3 && audio_control.visible && !detached);
     configured();

@@ -1,0 +1,17 @@
+altgraph==0.17.5
+cffi==2.1.1
+configobj==5.0.9
+cryptography==37.0.4
+macholib==1.16.4
+packaging==26.3
+psutil==7.2.2
+pycklink==0.1.1
+pycparser==3.12
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.10
+pylink-square==2.1.0
+pyserial==3.5
+setuptools==84.2.1
+six==1.17.0
+telnetlib-313-and-up==3.13.1; python_version >= "3.13"
+toml==0.10.0

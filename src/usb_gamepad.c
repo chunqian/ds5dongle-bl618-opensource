@@ -13,6 +13,7 @@
 #include "usbd_hid.h"
 #include "bl616_glb.h"
 #include "bflb_efuse.h"
+#include "bflb_irq.h"
 #include "bflb_mtimer.h"
 #include "board.h"
 #include <string.h>
@@ -24,14 +25,14 @@
 
 #if defined(BOARD_LCTECH_616)
   #ifdef FORCE_FS_MODE
-    #define FIRMWARE_VERSION "LCT616-DS5 3.18-HidAudio-R2"
+    #define FIRMWARE_VERSION "LCT616-DS5 3.18-HidAudio-R4"
   #else
-    #define FIRMWARE_VERSION "LCT616-DS5 3.18H-HidAudio-R2"
+    #define FIRMWARE_VERSION "LCT616-DS5 3.18H-HidAudio-R4"
   #endif
 #elif defined(BOARD_M0S_DOCK)
-#define FIRMWARE_VERSION "M0S-DS5 3.5-HidAudio-R2"
+#define FIRMWARE_VERSION "M0S-DS5 3.5-HidAudio-R4"
 #else
-#define FIRMWARE_VERSION "BL618-DS5 3.5-HidAudio-R2"
+#define FIRMWARE_VERSION "BL618-DS5 3.5-HidAudio-R4"
 #endif
 
 #define USBD_MAX_POWER      250
@@ -653,13 +654,25 @@ static USB_NOCACHE_RAM_SECTION uint8_t usb_in_buf[64];
 static USB_NOCACHE_RAM_SECTION uint8_t kbd_buf[USB_KBD_EP_MPS];
 
 static volatile uint8_t pending_payload[DS5_USB_INPUT_PAYLOAD_LEN];
+/* Valid cache and unsent update are distinct: periodic modes may replay a
+ * valid frame, while real-time mode consumes each newly published update. */
+static volatile bool    pending_valid = false;
 static volatile bool    pending_active = false;
 
 ATTR_TCM_SECTION
 static void try_send_pending(void)
 {
-    if (!pending_active || !usb_configured || ep_in_busy)
-         return;
+    /* Called from both the USB task and endpoint ISR. Keep the snapshot,
+     * endpoint ownership and dirty flag in one interrupt-safe transaction. */
+    uint8_t first_report[10];
+    bool log_first = false;
+    uintptr_t irq_state = bflb_irq_save();
+    bool realtime = config_polling_mode() == 2;
+    if (!pending_valid || (realtime && !pending_active) ||
+        !usb_configured || ep_in_busy) {
+        bflb_irq_restore(irq_state);
+        return;
+    }
     usb_in_buf[0] = DS5_USB_REPORT_ID_INPUT;
     memcpy(usb_in_buf + 1, (const void *)pending_payload,
            DS5_USB_INPUT_PAYLOAD_LEN);
@@ -667,12 +680,23 @@ static void try_send_pending(void)
     int ret = usbd_ep_start_write(0, USB_GAMEPAD_EP_IN, usb_in_buf, 64);
     if (ret < 0) {
         ep_in_busy = false;
-    } else if (!first_usb_send_logged) {
-        first_usb_send_logged = true;
+        /* Keep this frame pending; the task will retry even without new BT input. */
+    } else {
+        /* Consume only after the driver accepts it. Real-time completion
+         * waits for a new update; periodic modes may reuse the valid cache. */
+        pending_active = false;
+        if (!first_usb_send_logged) {
+            first_usb_send_logged = true;
+            memcpy(first_report, usb_in_buf, sizeof(first_report));
+            log_first = true;
+        }
+    }
+    bflb_irq_restore(irq_state);
+    if (log_first) {
         LOG_INF("[USB] First input: [%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x]\n",
-               usb_in_buf[0], usb_in_buf[1], usb_in_buf[2], usb_in_buf[3],
-               usb_in_buf[4], usb_in_buf[5], usb_in_buf[6], usb_in_buf[7],
-               usb_in_buf[8], usb_in_buf[9]);
+               first_report[0], first_report[1], first_report[2], first_report[3],
+               first_report[4], first_report[5], first_report[6], first_report[7],
+               first_report[8], first_report[9]);
     }
 }
 
@@ -702,6 +726,7 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
         LOG_INF("[USB-EVT] CONFIGURED — host enumeration complete!\n");
         if (hook_configured)
             hook_configured();
+        try_send_pending();
         break;
     case USBD_EVENT_RESET:
         usb_audio_control_reset(&audio_control, bflb_mtimer_get_time_us());
@@ -712,6 +737,8 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
             usb_soft_disconnect();
         usb_configured = false;
         ep_in_busy = false;
+        pending_valid = false;
+        pending_active = false;
         kbd_ep_busy = false;
         first_usb_send_logged = false;
         usb_audio_stop();
@@ -738,6 +765,7 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
         LOG_INF("[USB-EVT] RESUME\n");
         if (hook_resume)
             hook_resume();
+        try_send_pending();
         break;
     case USBD_EVENT_CONNECTED:
         LOG_INF("[USB-EVT] CONNECTED (VBUS detected)\n");
@@ -746,6 +774,9 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
         usb_audio_control_disconnect(&audio_control);
         apply_audio_profile();
         usb_configured = false;
+        ep_in_busy = false;
+        pending_valid = false;
+        pending_active = false;
         usb_audio_stop();
         usb_audio_mic_stop();
         audio_set_mic_active(false);
@@ -807,6 +838,7 @@ void usb_gamepad_process_deferred(void)
         apply_audio_profile();
         ep_in_busy = false;
         kbd_ep_busy = false;
+        pending_valid = false;
         pending_active = false;
         enabled = audio_control.visible;
         usb_soft_connect();
@@ -846,6 +878,9 @@ void usb_gamepad_process_deferred(void)
                entry.report_id, entry.len, entry.is_dse ? " (DSE)" : "");
         bt_hid_host_set_feature_crc(entry.report_id, entry.data, entry.len);
     }
+
+    /* Recover a failed queue attempt even when the controller stops sending. */
+    try_send_pending();
 }
 
 int usb_gamepad_init(usb_gamepad_output_cb_t output_cb)
@@ -1030,8 +1065,13 @@ void usb_gamepad_set_polling_rate(uint8_t mode)
 ATTR_TCM_SECTION
 int usb_gamepad_send_raw_input(const uint8_t *payload)
 {
+    /* Never let the endpoint ISR read a partly updated pending report.
+     * While busy, newer frames replace older unsent ones to avoid a backlog. */
+    uintptr_t irq_state = bflb_irq_save();
     memcpy((void *)pending_payload, payload, DS5_USB_INPUT_PAYLOAD_LEN);
+    pending_valid = true;
     pending_active = true;
+    bflb_irq_restore(irq_state);
     try_send_pending();
     return 0;
 }
