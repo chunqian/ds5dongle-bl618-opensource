@@ -19,6 +19,7 @@ def extract(signature):
 
 harness = r'''
 #include <assert.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -28,6 +29,7 @@ typedef struct { uint8_t type; bt_addr_t a; } bt_addr_le_t;
 /* Relevant SDK union layout: LE has a type byte before the address;
  * BR has the address first, followed by the peer's IO capability. */
 struct bt_conn {
+    unsigned refs;
     union {
         struct { bt_addr_le_t dst; } le;
         struct { bt_addr_t dst; uint8_t remote_io_capa; } br;
@@ -45,25 +47,32 @@ static unsigned key_count, writes;
 static uint8_t legacy_index;
 static bool have_address, have_legacy, info_error, fail_write;
 static void (*during_write)(void);
+#define BT_L2CAP_DISCONNECTED 0
+struct bt_l2cap_br_chan { struct { struct bt_conn *conn; unsigned state, psm; } chan; };
+enum bt_hid_host_state { BT_HID_STATE_IDLE, BT_HID_STATE_SCANNING, BT_HID_STATE_DISCONNECTING };
 static struct {
     struct bt_conn *conn;
+    bool acl_disconnected;
+    struct bt_l2cap_br_chan ctrl_chan, intr_chan;
+    unsigned connect_pending_tick;
     bool has_target;
     bt_addr_t target_addr;
-    int state;
+    enum bt_hid_host_state state;
     bool ctrl_connected, intr_connected, ctrl_accepting, intr_accepting;
     bool outgoing, is_dse, check_dse, security_pending, security_done;
     bool sdp_pending, connect_pending;
     unsigned handshake;
 } hid_ctx;
-#define BT_HID_STATE_IDLE 0
-#define BT_HID_STATE_SCANNING 1
 #define BT_HCI_ERR_REMOTE_USER_TERM_CONN 0x13
 #define BT_ADDR_STR_LEN 18
 static int blacklist_count, cached_rssi;
-static bool switch_pending;
+static bool switch_pending, first_intr_logged, first_output_logged, clear_bonds_pending;
+static void clear_bond_storage(void);
+void bt_hid_host_disconnect(void);
 static void bt_br_discovery_stop(void) {}
-static void bt_conn_disconnect(struct bt_conn *conn, int reason) { (void)conn; (void)reason; }
-static void bt_conn_unref(struct bt_conn *conn) { (void)conn; }
+static int bt_conn_disconnect(struct bt_conn *conn, int reason) { (void)conn; (void)reason; return 0; }
+static struct bt_conn *bt_conn_ref(struct bt_conn *conn) { ++conn->refs; return conn; }
+static void bt_conn_unref(struct bt_conn *conn) { assert(conn->refs); --conn->refs; }
 static void bt_br_set_connectable(bool enabled) { (void)enabled; }
 static void bt_br_set_discoverable(bool enabled) { (void)enabled; }
 static void feature_cache_clear(void) {}
@@ -130,6 +139,11 @@ for signature in (
     "void bt_hid_host_persist_if_dirty(",
     "int bt_hid_host_try_reconnect(",
     "int bt_hid_host_switch_next(",
+    "void bt_hid_host_disconnect(",
+    "static void conn_disconnected(",
+    "static void clear_bond_storage(void)\n{",
+    "static bool hid_channel_released(",
+    "bool bt_hid_host_poll_disconnect(",
     "void bt_hid_host_clear_bonds(",
 ):
     harness += "\n" + extract(signature) + "\n"
@@ -143,7 +157,7 @@ static void select_first_during_write(void) {
     taskENTER_CRITICAL(); bonded_list_select_index(0); taskEXIT_CRITICAL();
 }
 int main(void) {
-    struct bt_conn first = {0}, second = {0};
+    struct bt_conn first = {.refs=1}, second = {.refs=1};
     const bt_addr_t first_addr = {{1, 2, 3, 4, 5, 6}};
     const bt_addr_t second_addr = {{0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6}};
     const bt_addr_t zero = {{0}};
@@ -241,6 +255,10 @@ int main(void) {
     hid_ctx.conn=&first; auth_pairing_complete(&first,true);
     assert(pairing_addr_pending);
     bt_hid_host_clear_bonds();
+    assert(hid_ctx.conn==&first && key_count && clear_bonds_pending);
+    assert(hid_ctx.state==BT_HID_STATE_DISCONNECTING && !bt_hid_host_poll_disconnect());
+    conn_disconnected(&first,0x13);
+    assert(bt_hid_host_poll_disconnect() && first.refs==0);
     assert(!key_count && !bonded_count && !pairing_addr_pending && !hid_ctx.has_target);
     expect_active(zero); assert(!memcmp(&saved_address,&zero,6));
     auth_pairing_complete(&first,true); /* Late callback from the cleared ACL. */

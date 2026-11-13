@@ -34,7 +34,9 @@ struct bt_l2cap_br_chan {
 };
 struct net_buf { unsigned len, frees; uint8_t data[700]; } buffers[128];
 typedef void (*bt_conn_tx_cb_t)(struct bt_conn *, void *);
+enum { BT_HID_STATE_CONNECTED, BT_HID_STATE_DISCONNECTING };
 static struct {
+    int state;
     struct bt_conn *conn;
     bool intr_connected, ctrl_connected;
     struct bt_l2cap_br_chan intr_chan, ctrl_chan;
@@ -134,6 +136,7 @@ static void setup(void) {
     completion_count=completion_index=0;
     reset_during_send=refill_on_error=false;
     connection.refs=other.refs=1;
+    hid_ctx.state=BT_HID_STATE_CONNECTED;
     hid_ctx.conn=&connection; hid_ctx.intr_connected=true;
     hid_ctx.intr_chan.chan.conn=&connection;
     hid_ctx.intr_chan.tx.cid=0x41; hid_ctx.intr_chan.tx.mtu=672;
@@ -227,6 +230,20 @@ int main(void) {
     reset_during_send=true; results[0]=-ENOTCONN; result_count=1;
     complete(); assert(!app_tx_busy && app_tx_head==app_tx_tail);
     enqueue(3); complete(); assert(!app_tx_busy);
+
+    /* Disconnect request freezes sends but retains queued work until the
+     * real teardown resets the session. A late completion must not drain it. */
+    setup(); enqueue(1); enqueue(2);
+    hid_ctx.state=BT_HID_STATE_DISCONNECTING;
+    complete(); bt_hid_host_poll_tx();
+    assert(sends==1 && !app_tx_busy && app_tx_head!=app_tx_tail);
+    uint8_t game[78]={0x31}, audio[142]={0x32}, feature[8]={0};
+    assert(bt_hid_host_send_output(game,sizeof(game))==-ENOTCONN);
+    assert(bt_hid_host_send_output(audio,sizeof(audio))==-ENOTCONN);
+    assert(bt_hid_host_get_feature(0x20)==-ENOTCONN);
+    assert(bt_hid_host_set_feature(0x80,feature,sizeof(feature))==-ENOTCONN);
+    assert(bt_hid_host_set_feature_crc(0x80,feature,sizeof(feature))==-ENOTCONN);
+    assert(sends==1 && connection.refs==1);
     setup();
     puts("PASS: SDK error propagation, single buffer release, FIFO recovery, bounded failures, stale callbacks and refs");
 }

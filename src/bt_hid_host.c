@@ -283,6 +283,7 @@ static void bonded_list_load(void)
 static struct {
     volatile enum bt_hid_host_state state;
     struct bt_conn *conn;
+    volatile bool acl_disconnected;
     bt_addr_t target_addr;
     bool has_target;
 
@@ -389,7 +390,8 @@ static int hid_send_buf(struct bt_l2cap_br_chan *chan, struct net_buf *buf,
     bool connected = (chan == &hid_ctx.intr_chan && hid_ctx.intr_connected) ||
                      (chan == &hid_ctx.ctrl_chan && hid_ctx.ctrl_connected);
     if (generation == app_tx_generation && (!cb || app_tx_busy) &&
-        connected && hid_ctx.conn && chan->chan.conn == hid_ctx.conn) {
+        connected && hid_ctx.state != BT_HID_STATE_DISCONNECTING &&
+        hid_ctx.conn && chan->chan.conn == hid_ctx.conn) {
         conn = bt_conn_ref(hid_ctx.conn);
         cid = chan->tx.cid;
         mtu = chan->tx.mtu;
@@ -430,7 +432,8 @@ static void hid_tx_drain_one(void)
         uint32_t generation;
         taskENTER_CRITICAL();
         if (app_tx_busy || app_tx_head == app_tx_tail ||
-            !hid_ctx.intr_connected || !hid_ctx.conn) {
+            !hid_ctx.intr_connected || !hid_ctx.conn ||
+            hid_ctx.state == BT_HID_STATE_DISCONNECTING) {
             taskEXIT_CRITICAL();
             return;
         }
@@ -703,6 +706,9 @@ static int l2cap_ctrl_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 
 static int l2cap_intr_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 {
+    if (!hid_ctx.conn || chan->conn != hid_ctx.conn ||
+        hid_ctx.state == BT_HID_STATE_DISCONNECTING)
+        return 0;
     uint8_t *data = buf->data;
     uint16_t len  = buf->len;
 
@@ -734,6 +740,8 @@ static void l2cap_ctrl_connected(struct bt_l2cap_chan *chan)
 {
     LOG_DBG("[HID-CB] l2cap_ctrl_connected ENTER chan=%p state=%d\n",
            chan, hid_ctx.state);
+    if (chan->conn != hid_ctx.conn || hid_ctx.state == BT_HID_STATE_DISCONNECTING)
+        return;
     hid_ctx.ctrl_accepting = false;
     hid_ctx.ctrl_connected = true;
 
@@ -757,6 +765,8 @@ static void l2cap_intr_connected(struct bt_l2cap_chan *chan)
 {
     LOG_DBG("[HID-CB] l2cap_intr_connected ENTER chan=%p state=%d\n",
            chan, hid_ctx.state);
+    if (chan->conn != hid_ctx.conn || hid_ctx.state == BT_HID_STATE_DISCONNECTING)
+        return;
     hid_ctx.intr_accepting = false;
     hid_ctx.intr_connected = true;
 
@@ -801,23 +811,23 @@ static void l2cap_intr_connected(struct bt_l2cap_chan *chan)
 static void l2cap_ctrl_disconnected(struct bt_l2cap_chan *chan)
 {
     LOG_INF("[HID] Control channel disconnected (conn=%p)\n", hid_ctx.conn);
+    if (!hid_ctx.conn || chan->conn != hid_ctx.conn)
+        return;
     hid_ctx.ctrl_accepting = false;
     hid_ctx.ctrl_connected = false;
-    if (!hid_ctx.intr_connected && hid_ctx.conn) {
-        set_state(BT_HID_STATE_DISCONNECTING);
-        bt_conn_disconnect(hid_ctx.conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-    }
+    if (!hid_ctx.intr_connected && !hid_ctx.acl_disconnected)
+        bt_hid_host_disconnect();
 }
 
 static void l2cap_intr_disconnected(struct bt_l2cap_chan *chan)
 {
     LOG_INF("[HID] Interrupt channel disconnected\n");
+    if (!hid_ctx.conn || chan->conn != hid_ctx.conn)
+        return;
     hid_ctx.intr_accepting = false;
     hid_ctx.intr_connected = false;
-    if (!hid_ctx.ctrl_connected && hid_ctx.conn) {
-        set_state(BT_HID_STATE_DISCONNECTING);
-        bt_conn_disconnect(hid_ctx.conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-    }
+    if (!hid_ctx.ctrl_connected && !hid_ctx.acl_disconnected)
+        bt_hid_host_disconnect();
 }
 
 static struct bt_l2cap_chan_ops ctrl_ops = {
@@ -898,7 +908,8 @@ static void auth_pairing_complete(struct bt_conn *conn, bool bonded)
 {
     LOG_INF("[BT] Pairing complete, bonded=%d\n", bonded);
 
-    if (conn == hid_ctx.conn && bonded) {
+    if (conn == hid_ctx.conn && bonded &&
+        hid_ctx.state != BT_HID_STATE_DISCONNECTING) {
         /* Pairing Complete may precede Link Key Notify. Remember the peer,
          * but only select it once the SDK actually has its key. */
         const bt_addr_t *addr = conn_get_br_addr(conn);
@@ -980,7 +991,7 @@ static void security_changed(struct bt_conn *conn, bt_security_t level,
     LOG_DBG("[BT-CB] security_changed ENTER conn=%p level=%d err=%d state=%d\n",
            conn, level, err, hid_ctx.state);
 
-    if (conn != hid_ctx.conn) {
+    if (conn != hid_ctx.conn || hid_ctx.state == BT_HID_STATE_DISCONNECTING) {
         LOG_DBG("[BT-CB] security_changed: not our conn, ignoring\n");
         return;
     }
@@ -1090,30 +1101,52 @@ static void conn_connected(struct bt_conn *conn, uint8_t err)
 static volatile int8_t cached_rssi = 1; /* 1 = unknown (positive → web shows "Unknown") */
 static volatile bool switch_pending = false;
 
+static bool clear_bonds_pending;
+static void clear_bond_storage(void);
+
 static void conn_disconnected(struct bt_conn *conn, uint8_t reason)
 {
-    LOG_INF("[BT-CB] conn_disconnected: conn=%p hid_ctx.conn=%p reason=0x%02x "
-           "state=%d\n", conn, hid_ctx.conn, reason, hid_ctx.state);
-
-    bonded_list_refresh();
+    LOG_INF("[BT] ACL disconnected: conn=%p owner=%p reason=0x%02x\n",
+            conn, hid_ctx.conn, reason);
     bonded_refresh_pending = true;
-    if (conn != hid_ctx.conn) {
-        LOG_INF("[BT] Old ACL teardown complete (unowned conn, reason 0x%02x, "
-               "state=%d)\n", reason, hid_ctx.state);
+    if (conn != hid_ctx.conn)
         return;
-    }
 
+    /* HCI Disconnection Complete can precede the SDK's deferred L2CAP
+     * teardown. Keep our reference and channel storage until both finish. */
+    hid_ctx.acl_disconnected = true;
+    set_state(BT_HID_STATE_DISCONNECTING);
+}
+
+static bool hid_channel_released(const struct bt_l2cap_br_chan *channel)
+{
+    /* The SDK clears chan.conn BEFORE destroy()/RTX cleanup. Waiting only
+     * for NULL would allow this higher-priority task to reuse storage early. */
+    if (channel->chan.conn || channel->chan.state != BT_L2CAP_DISCONNECTED ||
+        channel->chan.psm)
+        return false;
+#if defined(BFLB_BREDR_PATCH_CLEAR_L2CAP_BR_STALE_CID)
+    if (channel->rx.cid || channel->tx.cid)
+        return false;
+#endif
+#if defined(BFLB_BLE_PATCH_FREE_ALLOCATED_BUFFER_IN_OS)
+    if (channel->chan.rtx_work.timer.timer.hdl)
+        return false;
+#endif
+    return true;
+}
+
+bool bt_hid_host_poll_disconnect(void)
+{
+    if (!hid_ctx.acl_disconnected || !hid_ctx.conn ||
+        !hid_channel_released(&hid_ctx.ctrl_chan) ||
+        !hid_channel_released(&hid_ctx.intr_chan))
+        return false;
+
+    struct bt_conn *conn = hid_ctx.conn;
+    bonded_list_refresh();
     taskENTER_CRITICAL();
     pairing_addr_pending = false;
-    taskEXIT_CRITICAL();
-    const char *r_str = reason == 0x08 ? "CONN_TIMEOUT" :
-                        reason == 0x13 ? "REMOTE_USER" :
-                        reason == 0x16 ? "LOCAL_HOST" : "OTHER";
-    LOG_INF("[BT] Disconnected reason=0x%02x (%s)\n", reason, r_str);
-
-    bt_conn_unref(hid_ctx.conn);
-    hid_ctx.conn = NULL;
-
     hid_ctx.ctrl_connected = false;
     hid_ctx.intr_connected = false;
     hid_ctx.ctrl_accepting = false;
@@ -1126,28 +1159,29 @@ static void conn_disconnected(struct bt_conn *conn, uint8_t reason)
     hid_ctx.security_done = false;
     hid_ctx.sdp_pending = false;
     hid_ctx.connect_pending = false;
-
-    first_intr_logged  = false;
+    hid_ctx.connect_pending_tick = 0;
+    first_intr_logged = false;
     first_output_logged = false;
-
     app_tx_fifo_reset();
+    taskEXIT_CRITICAL();
 
     feature_cache_clear();
     dse_reset();
     cached_rssi = 1;
+    if (clear_bonds_pending)
+        clear_bond_storage();
 
+    hid_ctx.conn = NULL;
+    hid_ctx.acl_disconnected = false;
+    bt_conn_unref(conn);
+    /* IDLE notifies the application to reset audio/input and send neutral
+     * state. Preserve switch_pending until that notification is complete. */
+    set_state(BT_HID_STATE_IDLE);
+    switch_pending = false;
     bt_br_set_connectable(true);
     bt_br_set_discoverable(true);
-
-    LOG_INF("[BT] Re-enabled connectable+discoverable, ready for new connection\n");
-    set_state(BT_HID_STATE_IDLE);
-
-    if (switch_pending) {
-        switch_pending = false;
-        LOG_INF("[BT] Switch: old ACL teardown complete, waiting for "
-               "controller [%d/%d] to reconnect\n", active_idx, bonded_count);
-        return;
-    }
+    LOG_INF("[BT] Disconnect cleanup complete; waiting for controller\n");
+    return true;
 }
 
 static struct bt_conn_cb conn_callbacks = {
@@ -1208,6 +1242,8 @@ static void discovery_complete(struct bt_br_discovery_result *results,
 
 static int l2cap_server_reject_blacklisted(struct bt_conn *conn)
 {
+    if (hid_ctx.state == BT_HID_STATE_DISCONNECTING)
+        return -EACCES;
     const bt_addr_t *remote = conn_get_br_addr(conn);
     if (remote && blacklist_contains(remote)) {
         char a[BT_ADDR_STR_LEN];
@@ -1672,7 +1708,8 @@ bool bt_hid_host_poll_connect(void)
 
 bool bt_hid_host_poll_security(void)
 {
-    if (!hid_ctx.security_pending || !hid_ctx.conn)
+    if (!hid_ctx.security_pending || !hid_ctx.conn ||
+        hid_ctx.state == BT_HID_STATE_DISCONNECTING)
         return false;
 
     hid_ctx.security_pending = false;
@@ -1834,107 +1871,28 @@ int bt_hid_host_connect(const uint8_t *addr)
 
 void bt_hid_host_disconnect(void)
 {
-    LOG_INF("[BT] bt_hid_host_disconnect called (state=%d)\n", hid_ctx.state);
-    if (hid_ctx.conn) {
-        set_state(BT_HID_STATE_DISCONNECTING);
-        bt_conn_disconnect(hid_ctx.conn,
-                           BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-    }
-}
-
-void bt_hid_host_force_disconnect(void)
-{
-    LOG_WRN("[BT] Force disconnect — HID cleanup, conn=%p\n", hid_ctx.conn);
-
-    hid_ctx.ctrl_connected = false;
-    hid_ctx.intr_connected = false;
-    hid_ctx.ctrl_accepting = false;
-    hid_ctx.intr_accepting = false;
-    hid_ctx.outgoing = false;
-    hid_ctx.is_dse = false;
-    hid_ctx.check_dse = false;
-    memset(&hid_ctx.handshake, 0, sizeof(hid_ctx.handshake));
-    hid_ctx.connect_pending = false;
-    hid_ctx.sdp_pending = false;
-    hid_ctx.security_pending = false;
-    hid_ctx.security_done = false;
-
-    first_intr_logged  = false;
-    first_output_logged = false;
-
-    app_tx_fifo_reset();
-
-    feature_cache_clear();
-    dse_reset();
-
-    if (hid_ctx.conn) {
-        LOG_INF("[BT] Sending HCI Disconnect for ACL cleanup\n");
-        bt_conn_disconnect(hid_ctx.conn, 0x13);
-        bt_conn_unref(hid_ctx.conn);
-        hid_ctx.conn = NULL;
-    }
-
-    bt_br_set_connectable(true);
-    bt_br_set_discoverable(true);
-
-    set_state(BT_HID_STATE_IDLE);
-
-    bonded_list_refresh();
     taskENTER_CRITICAL();
-    pairing_addr_pending = false;
-    bonded_refresh_pending = true;
-    taskEXIT_CRITICAL();
-    /* Like DS5Dongle, return to passive acceptance after teardown. */
-
-}
-
-bool bt_hid_host_has_pending_conn(void)
-{
-    return hid_ctx.conn != NULL;
-}
-
-void bt_hid_host_drop_stale_conn(void)
-{
-    if (!hid_ctx.conn)
+    if (!hid_ctx.conn || hid_ctx.state == BT_HID_STATE_DISCONNECTING) {
+        taskEXIT_CRITICAL();
         return;
-
-    LOG_WRN("[BT] conn_disconnected never arrived — force cleanup\n");
-
-    bt_conn_unref(hid_ctx.conn);
-    hid_ctx.conn = NULL;
-
-    hid_ctx.ctrl_connected = false;
-    hid_ctx.intr_connected = false;
-    hid_ctx.ctrl_accepting = false;
-    hid_ctx.intr_accepting = false;
-    hid_ctx.outgoing = false;
-    hid_ctx.is_dse = false;
-    hid_ctx.check_dse = false;
-    hid_ctx.connect_pending = false;
-    hid_ctx.sdp_pending = false;
-    hid_ctx.security_pending = false;
-    hid_ctx.security_done = false;
-
-    app_tx_fifo_reset();
-
-    feature_cache_clear();
-
-    bonded_list_refresh();
-    taskENTER_CRITICAL();
-    pairing_addr_pending = false;
-    bonded_refresh_pending = true;
-    taskEXIT_CRITICAL();
-    set_state(BT_HID_STATE_IDLE);
-
-    if (switch_pending) {
-        switch_pending = false;
-        LOG_INF("[BT] Switch: stale conn cleared, waiting for "
-               "controller [%d/%d] to reconnect\n", active_idx, bonded_count);
     }
+    struct bt_conn *conn = bt_conn_ref(hid_ctx.conn);
+    enum bt_hid_host_state previous = hid_ctx.state;
+    hid_ctx.state = BT_HID_STATE_DISCONNECTING;
+    taskEXIT_CRITICAL();
 
-    bt_br_set_connectable(true);
-    bt_br_set_discoverable(true);
-    LOG_INF("[BT] Re-enabled connectable+discoverable after stale cleanup\n");
+    /* Request only. Cleanup and releasing our owner reference require the
+     * actual disconnect event, exactly as DS5Dongle's bt_disconnect(). */
+    int err = bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+    if (err && err != -ENOTCONN) {
+        LOG_WRN("[BT] Disconnect request failed (%d), retaining connection\n", err);
+        taskENTER_CRITICAL();
+        if (hid_ctx.conn == conn && !hid_ctx.acl_disconnected &&
+            hid_ctx.state == BT_HID_STATE_DISCONNECTING)
+            hid_ctx.state = previous; /* Allow a later request to retry. */
+        taskEXIT_CRITICAL();
+    }
+    bt_conn_unref(conn);
 }
 
 int bt_hid_host_read_rssi(int8_t *rssi)
@@ -1960,8 +1918,9 @@ int8_t bt_hid_host_get_cached_rssi(void)
 int bt_hid_host_send_output(const uint8_t *data, uint16_t len)
 {
     uint32_t generation = app_tx_generation;
-    if (!hid_ctx.intr_connected || !hid_ctx.conn)
-        return -1;
+    if (!hid_ctx.intr_connected || !hid_ctx.conn ||
+        hid_ctx.state == BT_HID_STATE_DISCONNECTING)
+        return -ENOTCONN;
 
     /* Route by report type:
      *   0x31 game output (78 B)  → 10-deep FIFO with CAN_SEND_NOW flow control
@@ -1993,6 +1952,11 @@ int bt_hid_host_send_output(const uint8_t *data, uint16_t len)
 
     /* FIFO path for 0x31 game output (equivalent to DS5Dongle's send_fifo) */
     taskENTER_CRITICAL();
+    if (generation != app_tx_generation || !hid_ctx.conn ||
+        !hid_ctx.intr_connected || hid_ctx.state == BT_HID_STATE_DISCONNECTING) {
+        taskEXIT_CRITICAL();
+        return -ENOTCONN;
+    }
     uint8_t next_tail = (app_tx_tail + 1) % APP_TX_DEPTH;
 
     /* Preserve the existing drop-oldest policy when the FIFO is full. */
@@ -2142,15 +2106,12 @@ int bt_hid_host_switch_next(void)
     bt_addr_to_str(addr, addr_str, sizeof(addr_str));
 
     if (hid_ctx.conn) {
-        /* Block further BT sends immediately */
-        hid_ctx.ctrl_connected = false;
-        hid_ctx.intr_connected = false;
         switch_pending = true;
 
         LOG_INF("[BT] Switching: disconnect current → wait ACL teardown → "
                "reconnect [%d/%d] %s\n", active_idx, bonded_count, addr_str);
-        bt_conn_disconnect(hid_ctx.conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-        /* conn_disconnected callback will handle full cleanup and
+        bt_hid_host_disconnect();
+        /* The disconnect completion path will handle full cleanup and
          * enable connectable only after old ACL is fully torn down. */
     } else {
         if (hid_ctx.state == BT_HID_STATE_SCANNING)
@@ -2199,60 +2160,37 @@ uint8_t bt_hid_host_get_active_idx(void)
     return active_idx;
 }
 
-void bt_hid_host_clear_bonds(void)
+static void clear_bond_storage(void)
 {
-    LOG_INF("[BT] Clearing all bonding info\n");
-
-    if (hid_ctx.state == BT_HID_STATE_SCANNING)
-        bt_br_discovery_stop();
-
-    /* Disconnect the current controller if connected */
-    if (hid_ctx.conn) {
-        bt_conn_disconnect(hid_ctx.conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-        bt_conn_unref(hid_ctx.conn);
-        hid_ctx.conn = NULL;
-    }
-
-    /* Clear the blacklist too — we want the controller to reconnect freely
-     * after a manual bond clear. The security watchdog handles stale keys. */
-    blacklist_count = 0;
-
-    hid_ctx.ctrl_connected = false;
-    hid_ctx.intr_connected = false;
-    hid_ctx.ctrl_accepting = false;
-    hid_ctx.intr_accepting = false;
-    hid_ctx.outgoing = false;
-    hid_ctx.is_dse = false;
-    hid_ctx.check_dse = false;
-    memset(&hid_ctx.handshake, 0, sizeof(hid_ctx.handshake));
-    hid_ctx.security_pending = false;
-    hid_ctx.security_done = false;
-    hid_ctx.sdp_pending = false;
-    hid_ctx.connect_pending = false;
-
     bt_keys_link_key_clear_addr(NULL);
-
+    blacklist_count = 0;
     blacklist_persist();
     blacklist_dirty = false;
-    LOG_INF("[BT] All link keys and blacklist cleared\n");
-
-    taskENTER_CRITICAL();
     pairing_addr_pending = false;
-    taskEXIT_CRITICAL();
     bonded_list_refresh();
     active_addr_dirty = true;
     bonded_list_persist();
-
     hid_ctx.has_target = false;
     memset(&hid_ctx.target_addr, 0, sizeof(hid_ctx.target_addr));
+    clear_bonds_pending = false;
+    LOG_INF("[BT] All link keys, blacklist and active selection cleared\n");
+}
 
+void bt_hid_host_clear_bonds(void)
+{
+    if (hid_ctx.state == BT_HID_STATE_SCANNING)
+        bt_br_discovery_stop();
+    hid_ctx.connect_pending = false;
+    clear_bonds_pending = true;
+    if (hid_ctx.conn) {
+        /* The SDK can still write a link key while the ACL is alive. */
+        bt_hid_host_disconnect();
+        return;
+    }
+    clear_bond_storage();
+    set_state(BT_HID_STATE_IDLE);
     bt_br_set_connectable(true);
     bt_br_set_discoverable(true);
-
-    feature_cache_clear();
-    dse_reset();
-
-    set_state(BT_HID_STATE_IDLE);
 }
 
 bool bt_hid_host_get_cached_feature(uint8_t report_id,

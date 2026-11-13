@@ -28,6 +28,7 @@ constants = SOURCE[SOURCE.index("static const uint8_t handshake_ids[]"):
                    SOURCE.index("static void handshake_begin")]
 support = r'''
 #include <assert.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -76,7 +77,7 @@ static unsigned critical_depth;
 static struct {
     struct bt_conn *conn;
     bt_addr_t target_addr;
-    bool has_target;
+    bool has_target, acl_disconnected;
     enum bt_hid_host_state state;
     bool ctrl_connected, intr_connected, check_dse, is_dse;
     bool security_done, outgoing, sdp_pending;
@@ -122,6 +123,8 @@ static int bt_addr_cmp(const bt_addr_t *a, const bt_addr_t *b) { return memcmp(a
 static void bonded_list_refresh(void) {}
 static bool bonded_list_copy_active(bt_addr_t *addr) { memset(addr,0,sizeof(*addr)); return false; }
 void bt_keys_link_key_clear_addr(const bt_addr_t *a) { assert(!bt_addr_cmp(a,&current.addr)); ++deleted_keys; }
+static struct bt_conn *bt_conn_ref(struct bt_conn *c) { ++c->refs; return c; }
+static void bt_conn_unref(struct bt_conn *c);
 static int bt_conn_disconnect(struct bt_conn *c, uint8_t reason) { assert(c==&current); ++disconnected; return 0; }
 void bt_hid_host_disconnect(void);
 static int l2cap_ctrl_recv(struct bt_l2cap_chan *, struct net_buf *);

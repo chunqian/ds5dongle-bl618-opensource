@@ -565,10 +565,7 @@ static void bt_task(void *arg)
     LOG_INF("[BT_TASK] Entering main loop\n");
 
     uint8_t usb_out[USB_OUTPUT_BUF_SZ];
-    uint16_t idle_ticks = 0;
     uint16_t loop_count = 0;
-    uint64_t disconnecting_since = 0;
-    uint64_t stale_conn_since = 0;
 
     /*
      * Button gesture FSM (polled at 10 Hz, independent of loop speed).
@@ -644,7 +641,6 @@ static void bt_task(void *arg)
                             LOG_ERR("[BTN] Failed to save reset request; release and retry\n");
                             led_status_set(LED_RED_BLINK);
                         }
-                        idle_ticks = 0;
                     }
                 } else {
                     btn_click_count++;
@@ -695,7 +691,6 @@ static void bt_task(void *arg)
                                 bt_hid_host_scan_start(0);
                             }
                         }
-                        idle_ticks = 0;
                     } else if (clicks >= 2) {
                         LOG_INF("[BTN] Double click — disconnect + fresh scan\n");
                         if (ds5_connected) {
@@ -704,7 +699,6 @@ static void bt_task(void *arg)
                         } else {
                             bt_hid_host_scan_start(0);
                         }
-                        idle_ticks = 0;
                     }
                 }
                 break;
@@ -727,20 +721,7 @@ static void bt_task(void *arg)
             }
         }
 
-        /* Fallback: if DISCONNECTING for >1.5 seconds, the remote is dead.
-         * Force cleanup to return to IDLE. */
-        if (bt_hid_host_get_state() == BT_HID_STATE_DISCONNECTING) {
-            if (disconnecting_since == 0)
-                disconnecting_since = bflb_mtimer_get_time_us();
-            else if ((bflb_mtimer_get_time_us() - disconnecting_since)
-                     > 1500000ULL) {
-                LOG_WRN("[BT_TASK] DISCONNECTING stuck >1.5s, forcing cleanup\n");
-                bt_hid_host_force_disconnect();
-                disconnecting_since = 0;
-            }
-        } else {
-            disconnecting_since = 0;
-        }
+        bt_hid_host_poll_disconnect();
 
         /* Deferred USB soft-disconnect: if BT disconnected and no reconnection
          * within the timeout, pull USB so Windows removes the phantom device. */
@@ -752,22 +733,18 @@ static void bt_task(void *arg)
         }
 
         if (bt_hid_host_poll_scan_early()) {
-            idle_ticks = 0;
             continue;
         }
 
         if (bt_hid_host_poll_connect()) {
-            idle_ticks = 0;
             continue;
         }
 
         if (bt_hid_host_poll_security()) {
-            idle_ticks = 0;
             continue;
         }
 
         if (bt_hid_host_poll_sdp()) {
-            idle_ticks = 0;
             continue;
         }
 
@@ -889,10 +866,8 @@ static void bt_task(void *arg)
                 bt_hid_host_send_output(bt_out, DS5_BT_OUTPUT_REPORT_SIZE);
 next_output_iter:;
             }
-            idle_ticks = 0;
         } else {
             vTaskDelay(pdMS_TO_TICKS(100));
-            idle_ticks++;
 
             /* CONNECTING timeout: L2CAP channels didn't complete in time */
             {
@@ -935,32 +910,7 @@ next_output_iter:;
                 }
             }
 
-            {
-                enum bt_hid_host_state s = bt_hid_host_get_state();
-                if (s != BT_HID_STATE_IDLE) {
-                    stale_conn_since = 0;
-                }
-            }
 
-            if (bt_hid_host_get_state() == BT_HID_STATE_IDLE &&
-                idle_ticks >= 20 && !usb_wake_host_suspended()) {
-                if (bt_hid_host_has_pending_conn()) {
-                    if (stale_conn_since == 0)
-                        stale_conn_since = bflb_mtimer_get_time_us();
-                    else if ((bflb_mtimer_get_time_us() - stale_conn_since)
-                             > 15ULL * 1000000ULL) {
-                        LOG_WRN("[MAIN] conn_disconnected never fired, "
-                               "dropping stale conn\n");
-                        bt_hid_host_drop_stale_conn();
-                        stale_conn_since = 0;
-                    }
-                } else {
-                    /* DS5Dongle waits for the next controller-initiated ACL.
-                     * Inquiry is started at boot without bonds or by BOOT. */
-                    stale_conn_since = 0;
-                }
-                idle_ticks = 0;
-            }
         }
     }
 }
@@ -1024,7 +974,7 @@ static void usb_task(void *arg)
     bool inactive_disconnected = false;
     uint32_t usb_check_cnt = 0;
 
-#define CONN_WATCHDOG_US (3ULL * 1000000ULL)  /* 3 seconds without input → force disconnect */
+#define CONN_WATCHDOG_US (3ULL * 1000000ULL)  /* Request disconnect after input stops. */
 
     /* PS shortcut state (short press → Win+G, with debounce) */
     bool     ps_debounced    = false;
@@ -1073,13 +1023,12 @@ static void usb_task(void *arg)
 
         /* Connection watchdog: if connected and we've received at least one
          * report, but then nothing for 3s → controller likely powered off.
-         * Use force_disconnect to bypass HCI ACK (dead controller can't ACK). */
-        if (ds5_connected && usb_fwd_count > 0 &&
+         * Request disconnect; wait for the real ACL/L2CAP teardown events. */
+        if (ds5_connected && bt_hid_host_get_state() == BT_HID_STATE_CONNECTED &&
+            usb_fwd_count > 0 &&
             (bflb_mtimer_get_time_us() - last_input_us) > CONN_WATCHDOG_US) {
-            LOG_WRN("[MAIN] Watchdog: no input for 3s, force disconnect\n");
-            bt_hid_host_force_disconnect();
-            last_input_us = bflb_mtimer_get_time_us();
-            usb_fwd_count = 0;
+            LOG_WRN("[MAIN] Watchdog: no input for 3s, requesting disconnect\n");
+            bt_hid_host_disconnect();
         }
 
         TickType_t wait = pdMS_TO_TICKS(10);

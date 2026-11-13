@@ -87,15 +87,15 @@ void bt_hid_host_scan_stop(void);
 int bt_hid_host_connect(const uint8_t *addr);
 
 /**
- * Disconnect the current device (graceful — waits for HCI ACK).
+ * Request disconnect; retain the connection until real teardown completes.
  */
 void bt_hid_host_disconnect(void);
 
 /**
- * Force disconnect — immediately cleans up state without waiting for
- * HCI ACK. Use when the remote device is unresponsive (powered off).
+ * Finalize cleanup after ACL disconnection and SDK L2CAP release.
+ * Call from the BT task. Returns true when a session was cleaned up.
  */
-void bt_hid_host_force_disconnect(void);
+bool bt_hid_host_poll_disconnect(void);
 
 /**
  * Send an output report (e.g. LED, rumble) to the connected device.
@@ -250,19 +250,6 @@ bool bt_hid_host_poll_sdp(void);
  * @return true if watchdog triggered
  */
 bool bt_hid_host_poll_security_watchdog(void);
-
-/**
- * Check if a stale ACL connection object exists (e.g. after force
- * disconnect, waiting for conn_disconnected callback).
- * @return true if hid_ctx.conn != NULL
- */
-bool bt_hid_host_has_pending_conn(void);
-
-/**
- * Force-release a stale ACL connection object that conn_disconnected
- * never cleaned up. Call only as a last-resort fallback.
- */
-void bt_hid_host_drop_stale_conn(void);
 
 /**
  * Read RSSI from the connected device via HCI.
