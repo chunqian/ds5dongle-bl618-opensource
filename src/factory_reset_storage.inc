@@ -8,47 +8,69 @@
 
 #define RESET_REQUEST_KEY "dongle_factory_reset"
 #define RESET_REQUEST_PATH LFS_EF_NAMESPACE "/" RESET_REQUEST_KEY
+#define RESET_STAGING_KEY "dongle_factory_reset_tmp"
+#define RESET_STAGING_PATH LFS_EF_NAMESPACE "/" RESET_STAGING_KEY
 
-static volatile bool factory_reset_pending;
+static volatile enum factory_reset_request_result reset_request_state;
 
 bool factory_reset_is_pending(void)
 {
-    return factory_reset_pending;
+    return reset_request_state != FACTORY_RESET_REQUEST_CANCELLED;
 }
 
-bool factory_reset_request(void)
+enum factory_reset_request_result factory_reset_request(void)
 {
     const uint8_t requested = 1;
     uint8_t saved = 0;
     lfs_file_t file = {0};
     if (lfs == NULL)
-        return false;
+        return FACTORY_RESET_REQUEST_CANCELLED;
+    if (factory_reset_is_pending())
+        return reset_request_state;
 
+    /* Other tasks must not reset while BOOT is held, including while we wait
+     * for the settings mutex or commit to flash. Only the BT task calls us. */
+    reset_request_state = FACTORY_RESET_REQUEST_UNCERTAIN;
     EF_GIANT_LOCK();
-    int ret = lfs_file_open(lfs, &file, RESET_REQUEST_PATH, LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
+    /* Never create the authoritative marker until the staged write is fully
+     * verified. An abandoned staging file cannot trigger cleanup on boot. */
+    int ret = lfs_file_open(lfs, &file, RESET_STAGING_PATH, LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
     if (ret != LFS_ERR_OK) {
-        EF_GIANT_UNLOCK(false);
+        goto cancel_staging;
     }
     lfs_ssize_t written = lfs_file_write(lfs, &file, &requested, sizeof(requested));
     /* The stock ef_set_env_blob() ignores close errors. Check the metadata
      * commit explicitly before promising that the reset request survived. */
     ret = lfs_file_close(lfs, &file);
     if (written != sizeof(requested) || ret != LFS_ERR_OK) {
-        EF_GIANT_UNLOCK(false);
+        goto cancel_staging;
     }
 
-    ret = lfs_file_open(lfs, &file, RESET_REQUEST_PATH, LFS_O_RDONLY);
+    ret = lfs_file_open(lfs, &file, RESET_STAGING_PATH, LFS_O_RDONLY);
     if (ret != LFS_ERR_OK) {
-        EF_GIANT_UNLOCK(false);
+        goto cancel_staging;
     }
     lfs_ssize_t read_len = lfs_file_read(lfs, &file, &saved, sizeof(saved));
     ret = lfs_file_close(lfs, &file);
     if (read_len != sizeof(saved) || saved != requested || ret != LFS_ERR_OK) {
-        EF_GIANT_UNLOCK(false);
+        goto cancel_staging;
     }
 
-    factory_reset_pending = true;
-    EF_GIANT_UNLOCK(true);
+    ret = lfs_rename(lfs, RESET_STAGING_PATH, RESET_REQUEST_PATH);
+    if (ret != LFS_ERR_OK) {
+        /* A failed commit can still reach flash. Do not cancel or continue
+         * ordinary use; leave pending set and resolve after BOOT is released. */
+        EF_GIANT_UNLOCK(FACTORY_RESET_REQUEST_UNCERTAIN);
+    }
+    reset_request_state = FACTORY_RESET_REQUEST_ARMED;
+    EF_GIANT_UNLOCK(FACTORY_RESET_REQUEST_ARMED);
+
+cancel_staging:
+    /* Best effort only: even if deletion fails, this filename is never intent.
+     * A later request can overwrite it; a committed reset deletes it too. */
+    (void)lfs_remove(lfs, RESET_STAGING_PATH);
+    reset_request_state = FACTORY_RESET_REQUEST_CANCELLED;
+    EF_GIANT_UNLOCK(FACTORY_RESET_REQUEST_CANCELLED);
 }
 
 enum factory_reset_result factory_reset_apply_on_boot(void)
@@ -105,6 +127,6 @@ enum factory_reset_result factory_reset_apply_on_boot(void)
     if (ret != LFS_ERR_OK) {
         EF_GIANT_UNLOCK(FACTORY_RESET_FAILED);
     }
-    factory_reset_pending = false;
+    reset_request_state = FACTORY_RESET_REQUEST_CANCELLED;
     EF_GIANT_UNLOCK(FACTORY_RESET_DONE);
 }

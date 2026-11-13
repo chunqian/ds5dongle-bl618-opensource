@@ -197,7 +197,10 @@ polling returns to the source default of real-time mode. Firmware, partition tab
 unchanged. R6 and earlier only clear bonds on a long press.
 The durable request is processed before configuration loads or BT/USB tasks start. Its marker is
 deleted last, so interrupted cleanup resumes at the next boot. Storage errors stop normal startup
-with a blinking LED; replug to retry. A failed request write does not reboot; release and hold again.
+with a blinking LED; replug to retry. Since R8, a temporary record is verified before atomically
+publishing the reset marker. Failed staging/readback cannot reset settings on a later boot;
+release and hold again to retry. An uncertain final commit stays pending (triple blink): release
+BOOT to reboot and resolve it. Abandoned staging files never trigger cleanup.
 
 ## Features
 

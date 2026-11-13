@@ -679,11 +679,15 @@ static void bt_task(void *arg)
                     if (btn_press_samples >= BOOT_HOLD_TICKS) {
                         btn_click_count = 0;
                         btn_fsm = BTN_HELD;
-                        if (factory_reset_request()) {
+                        enum factory_reset_request_result reset_request = factory_reset_request();
+                        if (reset_request == FACTORY_RESET_REQUEST_ARMED) {
                             LOG_INF("[BTN] IO2 held 3s — factory reset requested; release to reboot\n");
                             led_status_set(LED_BLINK_TRIPLE);
+                        } else if (reset_request == FACTORY_RESET_REQUEST_UNCERTAIN) {
+                            LOG_ERR("[BTN] Reset commit uncertain; release to reboot and resolve\n");
+                            led_status_set(LED_BLINK_TRIPLE);
                         } else {
-                            LOG_ERR("[BTN] Cannot save factory reset request; release and retry\n");
+                            LOG_ERR("[BTN] Reset request not committed; settings retained, release and retry\n");
                             led_status_set(LED_RED_BLINK);
                         }
                         idle_ticks = 0;
@@ -706,7 +710,7 @@ static void bt_task(void *arg)
                     btn_fsm = BTN_IDLE;
                     btn_press_samples = 0;
                     if (factory_reset_is_pending()) {
-                        LOG_INF("[BTN] IO2 released — rebooting to clear all settings\n");
+                        LOG_INF("[BTN] IO2 released — rebooting to resolve factory reset\n");
                         vTaskDelay(pdMS_TO_TICKS(300));
                         GLB_SW_System_Reset();
                     }
