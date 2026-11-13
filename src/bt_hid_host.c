@@ -244,11 +244,8 @@ static struct {
     struct {
         TickType_t last_attempt, probe_tick;
         bool attempted;
-        volatile uint8_t sent, received;
+        volatile uint8_t sent;
         uint8_t attempts[4], probe_attempts;
-        volatile bool probe_pending;
-        bool probe_confirm_needed;
-        volatile uint8_t probe_rejections;
     } handshake;
 
     bt_hid_input_cb_t  input_cb;
@@ -478,7 +475,7 @@ static const uint8_t handshake_ids[] = {
 static void handshake_begin(void)
 {
     memset(&hid_ctx.handshake, 0, sizeof(hid_ctx.handshake));
-    hid_ctx.check_dse = true;
+    hid_ctx.check_dse = false; /* Enable immediately before GET 0x70, as DS5Dongle does. */
     set_state(BT_HID_STATE_HANDSHAKE);
 }
 
@@ -516,23 +513,19 @@ static void handshake_send_pending(void)
     }
     /* Start the first Edge probe in the same pass, even if an earlier GET
      * failed to submit or has not replied. Only repeated probes are paced. */
-    uint8_t pending = hid_ctx.handshake.sent & ~hid_ctx.handshake.received;
     if (hid_ctx.handshake.probe_attempts &&
         (TickType_t)(now - hid_ctx.handshake.probe_tick) < HANDSHAKE_PROBE_TICKS)
         return;
     if (hid_ctx.handshake.probe_attempts >= 6)
         return; /* Main handshake deadline disconnects; never guess the type. */
 
-    if (!hid_ctx.handshake.probe_attempts)
-        hid_ctx.handshake.probe_confirm_needed = pending != 0;
     hid_ctx.handshake.probe_tick = now;
     ++hid_ctx.handshake.probe_attempts;
-    hid_ctx.handshake.probe_pending = true;
+    hid_ctx.check_dse = true;
     int err = bt_hid_host_get_feature(0x70);
     if (generation != app_tx_generation || hid_ctx.state != BT_HID_STATE_HANDSHAKE)
         return;
     if (err) {
-        hid_ctx.handshake.probe_pending = false;
         LOG_WRN("[HID] Edge probe send failed (%d), attempt %u\n",
                 err, hid_ctx.handshake.probe_attempts);
     }
@@ -557,18 +550,12 @@ static int l2cap_ctrl_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
     case HID_TRANS_HANDSHAKE:
         LOG_INF("[HID] Handshake: 0x%02x\n", param);
         if (hid_ctx.state == BT_HID_STATE_HANDSHAKE && hid_ctx.check_dse &&
-            hid_ctx.handshake.probe_pending &&
             param == HID_HANDSHAKE_INVALID_ID) {
-            hid_ctx.handshake.probe_pending = false;
-            /* If initialization replies were missing, this untagged error
-             * could belong to an old GET. Confirm with a separate probe. */
-            unsigned required = hid_ctx.handshake.probe_confirm_needed ? 2 : 1;
-            if (++hid_ctx.handshake.probe_rejections >= required) {
-                hid_ctx.check_dse = false;
-                hid_ctx.is_dse = false;
-                LOG_INF("[HID] DualSense (non-Edge) confirmed\n");
-                set_state(BT_HID_STATE_CONNECTED);
-            }
+            /* Match DS5Dongle: one INVALID_ID while probing means DS5. */
+            hid_ctx.check_dse = false;
+            hid_ctx.is_dse = false;
+            LOG_INF("[HID] DualSense (non-Edge) confirmed\n");
+            set_state(BT_HID_STATE_CONNECTED);
         }
         break;
 
@@ -580,14 +567,8 @@ static int l2cap_ctrl_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
                        rid, len - 2);
 
                 feature_cache_store(rid, data + 2, len - 2);
-                for (unsigned i = 0; i < sizeof(handshake_ids); ++i) {
-                    if (rid == handshake_ids[i])
-                        hid_ctx.handshake.received |= 1u << i;
-                }
-
                 if (rid == 0x70 && hid_ctx.state == BT_HID_STATE_HANDSHAKE &&
-                    hid_ctx.check_dse &&
-                    hid_ctx.handshake.probe_attempts > 0) {
+                    hid_ctx.check_dse) {
                     uint32_t generation = app_tx_generation;
                     hid_ctx.check_dse = false;
                     hid_ctx.is_dse    = true;

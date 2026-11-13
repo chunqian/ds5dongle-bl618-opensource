@@ -84,6 +84,7 @@ static uint32_t app_tx_generation=1;
 static unsigned sent[256], sent_count, fail_count[256], cached[256];
 static unsigned deleted_keys, disconnected, edge_unlocks, notifications, encryptions;
 static bool immediate_response, optional_response, reset_on_send, disconnect_on_unlock;
+static bool reject_initialization, reject_probe;
 static TickType_t xTaskGetTickCount(void) { return tick; }
 static void set_state(enum bt_hid_host_state s) { hid_ctx.state=s; }
 static void feature_cache_store(uint8_t id, const uint8_t *data, uint16_t len) { ++cached[id]; }
@@ -115,6 +116,9 @@ int bt_hid_host_get_feature(uint8_t id) {
         reset_on_send=false; ++app_tx_generation; handshake_begin(); return -1;
     }
     if (fail_count[id]) { --fail_count[id]; return -1; }
+    if ((id!=0x70 && reject_initialization) || (id==0x70 && reject_probe)) {
+        reject(); return 0;
+    }
     if (immediate_response || (optional_response && id!=0x70)) reply(id);
     return 0;
 }
@@ -159,6 +163,7 @@ static void setup(void) {
     hid_ctx.ctrl_connected=hid_ctx.intr_connected=true;
     tick=0; sent_count=deleted_keys=disconnected=edge_unlocks=notifications=encryptions=0;
     immediate_response=optional_response=reset_on_send=disconnect_on_unlock=false; ++app_tx_generation;
+    reject_initialization=reject_probe=false;
     handshake_begin();
 }
 '''
@@ -188,14 +193,21 @@ int main(void) {
     for(tick=0;tick<=1000;tick+=100) bt_hid_host_handshake_tick();
     assert(hid_ctx.handshake.attempts[0]==3 && sent[sent_count-1]==0x70);
 
-    /* An unrelated INVALID_ID cannot classify Edge as DS5 before probing. */
+    /* Match DS5Dongle's check_dse window: enable it immediately before GET
+     * 0x70 and classify DS5 on its first INVALID_ID, without another probe. */
     setup(); reject();
-    assert(hid_ctx.state==BT_HID_STATE_HANDSHAKE && hid_ctx.check_dse);
+    assert(hid_ctx.state==BT_HID_STATE_HANDSHAKE && !hid_ctx.check_dse);
     bt_hid_host_handshake_tick(); reject();
-    assert(hid_ctx.state==BT_HID_STATE_HANDSHAKE);
-    reject(); assert(hid_ctx.handshake.probe_rejections==1); /* duplicate is ignored */
-    tick=1000; bt_hid_host_handshake_tick(); reject();
     assert(hid_ctx.state==BT_HID_STATE_CONNECTED && !hid_ctx.is_dse && !edge_unlocks);
+    assert(!hid_ctx.check_dse && hid_ctx.handshake.probe_attempts==1);
+    reject(); reply(0x70); tick=1000; bt_hid_host_handshake_tick();
+    assert(!hid_ctx.is_dse && !edge_unlocks && sent_count==5);
+
+    setup(); reject_initialization=reject_probe=true; bt_hid_host_handshake_tick();
+    assert(sent_count==5 && hid_ctx.state==BT_HID_STATE_CONNECTED && !hid_ctx.is_dse);
+
+    setup(); reject_initialization=immediate_response=true; bt_hid_host_handshake_tick();
+    assert(sent_count==5 && hid_ctx.state==BT_HID_STATE_CONNECTED && hid_ctx.is_dse);
 
     setup(); optional_response=true; bt_hid_host_handshake_tick(); reject();
     assert(hid_ctx.state==BT_HID_STATE_CONNECTED && !hid_ctx.is_dse);
@@ -205,8 +217,7 @@ int main(void) {
     setup(); immediate_response=disconnect_on_unlock=true; bt_hid_host_handshake_tick();
     assert(edge_unlocks==1 && hid_ctx.state==BT_HID_STATE_IDLE && !hid_ctx.conn);
     setup(); bt_hid_host_handshake_tick(); tick=1000; fail_count[0x70]=1;
-    bt_hid_host_handshake_tick(); assert(!hid_ctx.handshake.probe_pending);
-    reject(); assert(!hid_ctx.handshake.probe_rejections);
+    bt_hid_host_handshake_tick(); assert(hid_ctx.check_dse);
     tick=2000; bt_hid_host_handshake_tick(); reply(0x70);
     assert(hid_ctx.state==BT_HID_STATE_CONNECTED && hid_ctx.is_dse);
 
@@ -217,7 +228,7 @@ int main(void) {
     assert(sent_count==1 && hid_ctx.handshake.sent==0);
     bt_hid_host_handshake_tick(); assert(sent_count==6);
     control.conn=&other; reply(0x70); reject();
-    assert(!edge_unlocks && !hid_ctx.handshake.probe_rejections);
+    assert(!edge_unlocks && hid_ctx.state==BT_HID_STATE_HANDSHAKE && hid_ctx.check_dse);
 
     setup(); hid_ctx.state=BT_HID_STATE_CONNECTING;
     tick=7999; assert(!bt_hid_host_poll_security_watchdog() && !deleted_keys);
