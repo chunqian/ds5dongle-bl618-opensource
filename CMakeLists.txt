@@ -9,6 +9,9 @@ endif()
 
 find_package(bouffalo_sdk REQUIRED HINTS $ENV{BL_SDK_BASE})
 
+# Notify the application of failed authentication with an existing BR/EDR key.
+include(cmake/bt_auth_notify.cmake)
+
 # Incoming Bluetooth HCI/L2CAP reports must preempt audio encoding.
 sdk_add_compile_definitions(-DCONFIG_BT_RX_PRIO=5)
 

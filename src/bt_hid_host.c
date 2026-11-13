@@ -233,6 +233,17 @@ static struct {
 
     volatile bool fallback_retry;
 
+    /* Keep the owning reference and channel storage until the SDK has
+     * finished BOTH ACL notification and deferred L2CAP/work cleanup.
+     * Only bt_hid_host_poll_disconnect() may release this reference. */
+    volatile bool teardown_pending;
+    volatile TickType_t teardown_started;
+    bool disconnect_sent;
+    TickType_t disconnect_attempted;
+    bool disconnect_attempt_valid;
+    volatile bool clear_key_pending;
+    uint8_t connect_retries;
+
     volatile bool sdp_pending;
 
     /* Security establishment deferred to task context */
@@ -265,6 +276,61 @@ struct net_buf_pool hid_rx_pool;
 
 static bool first_intr_logged = false;
 static bool first_output_logged = false;
+static volatile int8_t cached_rssi = 1; /* positive = unknown */
+static volatile bool switch_pending = false;
+
+static bool channel_is_current(const struct bt_l2cap_chan *chan)
+{
+    return chan->conn && chan->conn == hid_ctx.conn &&
+           !hid_ctx.teardown_pending;
+}
+
+/* Task callers retain a local reference across SDK operations which may
+ * block. This also prevents the cleanup poll from recycling their channels. */
+static struct bt_conn *active_conn_ref(void)
+{
+    struct bt_conn *conn = NULL;
+    taskENTER_CRITICAL();
+    if (hid_ctx.conn && !hid_ctx.teardown_pending)
+        conn = bt_conn_ref(hid_ctx.conn);
+    taskEXIT_CRITICAL();
+    return conn;
+}
+
+/* Consume buf on every path, matching bt_l2cap_send_cb/ bt_conn_send_cb.
+ * Snapshot the ACL and CID before calling the SDK: channel cleanup can clear
+ * chan->conn while a task is sending. A local ref keeps that ACL alive and
+ * prevents our poll from reusing the channel for a new session. */
+static int send_hid_buf(struct bt_l2cap_br_chan *chan, struct net_buf *buf,
+                        bt_conn_tx_cb_t cb)
+{
+    struct bt_conn *conn = NULL;
+    uint16_t cid = 0, mtu = 0;
+    taskENTER_CRITICAL();
+    if (channel_is_current(&chan->chan)) {
+        conn = bt_conn_ref(chan->chan.conn);
+        cid = chan->tx.cid;
+        mtu = chan->tx.mtu;
+    }
+    taskEXIT_CRITICAL();
+
+    if (!conn) {
+        net_buf_unref(buf);
+        return -ENOTCONN;
+    }
+    if (buf->len > mtu) {
+        net_buf_unref(buf);
+        bt_conn_unref(conn);
+        return -EMSGSIZE;
+    }
+
+    extern int bt_l2cap_send_cb(struct bt_conn *conn, uint16_t cid,
+                                struct net_buf *buf, bt_conn_tx_cb_t cb,
+                                void *user_data);
+    int err = bt_l2cap_send_cb(conn, cid, buf, cb, NULL);
+    bt_conn_unref(conn);
+    return err;
+}
 
 /* ---------- Application-level TX FIFO (CAN_SEND_NOW equivalent) ----------
  *
@@ -293,6 +359,8 @@ static void hid_tx_drain_one(void);  /* forward declaration */
 
 static void on_hid_output_sent(struct bt_conn *conn, void *user_data)
 {
+    if (conn != hid_ctx.conn || hid_ctx.teardown_pending)
+        return;
     /* HCI controller acknowledged the previous packet — equivalent to
      * BTstack's L2CAP_EVENT_CAN_SEND_NOW: mark idle then drain next. */
     app_tx_busy = false;
@@ -305,7 +373,7 @@ static void hid_tx_drain_one(void)
         return;
     if (app_tx_head == app_tx_tail)
         return;  /* FIFO empty */
-    if (!hid_ctx.intr_connected || !hid_ctx.conn)
+    if (!hid_ctx.intr_connected)
         return;
 
     app_tx_busy = true;
@@ -324,16 +392,9 @@ static void hid_tx_drain_one(void)
     net_buf_reserve(buf, BT_L2CAP_CHAN_SEND_RESERVE);
     net_buf_add_mem(buf, app_tx_buf[idx], app_tx_len[idx]);
 
-    /* bt_l2cap_br_chan_send_cb added to SDK l2cap_br.c */
-    extern int bt_l2cap_br_chan_send_cb(struct bt_l2cap_chan *chan,
-                                        struct net_buf *buf,
-                                        bt_conn_tx_cb_t cb, void *user_data);
-
-    int err = bt_l2cap_br_chan_send_cb(&hid_ctx.intr_chan.chan, buf,
-                                        on_hid_output_sent, NULL);
+    int err = send_hid_buf(&hid_ctx.intr_chan, buf, on_hid_output_sent);
     if (err < 0) {
         LOG_ERR("[HID] drain: send err=%d\n", err);
-        net_buf_unref(buf);
         app_tx_busy = false;
     }
     /* On success: app_tx_busy stays true until on_hid_output_sent fires */
@@ -393,7 +454,42 @@ static void set_state(enum bt_hid_host_state new_state)
         hid_ctx.state_cb(new_state);
 }
 
+/* No HCI calls or unrefs here: this can run in an SDK callback or the USB
+ * task. The BT task alone sends Disconnect and eventually releases conn. */
+static void request_disconnect(struct bt_conn *conn)
+{
+    bool started = false;
+    taskENTER_CRITICAL();
+    if (conn && conn == hid_ctx.conn && !hid_ctx.teardown_pending) {
+        hid_ctx.teardown_pending = true;
+        hid_ctx.teardown_started = xTaskGetTickCount();
+        hid_ctx.disconnect_sent = false;
+        hid_ctx.disconnect_attempt_valid = false;
+        hid_ctx.ctrl_connected = false;
+        hid_ctx.intr_connected = false;
+        hid_ctx.security_pending = false;
+        hid_ctx.sdp_pending = false;
+        hid_ctx.connect_pending = false;
+        started = true;
+    }
+    taskEXIT_CRITICAL();
+    if (started)
+        set_state(BT_HID_STATE_DISCONNECTING);
+}
+
+static void record_security_failure(struct bt_conn *conn,
+                                    enum bt_security_err err)
+{
+    /* A timeout/transport failure is not evidence of a rejected key. */
+    if (conn == hid_ctx.conn &&
+        (err == BT_SECURITY_ERR_AUTH_FAIL ||
+         err == BT_SECURITY_ERR_PIN_OR_KEY_MISSING))
+        hid_ctx.clear_key_pending = true;
+}
+
 /* ---------- L2CAP callbacks ---------- */
+
+static struct bt_l2cap_chan_ops intr_ops;
 
 static struct net_buf *l2cap_alloc_buf(struct bt_l2cap_chan *chan)
 {
@@ -425,6 +521,8 @@ static void handshake_send_next(void)
 
 static int l2cap_ctrl_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 {
+    if (!channel_is_current(chan))
+        return 0;
     uint8_t *data = buf->data;
     uint16_t len  = buf->len;
 
@@ -484,6 +582,8 @@ static int l2cap_ctrl_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 
 static int l2cap_intr_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 {
+    if (!channel_is_current(chan))
+        return 0;
     uint8_t *data = buf->data;
     uint16_t len  = buf->len;
 
@@ -513,6 +613,8 @@ static int l2cap_intr_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 
 static void l2cap_ctrl_connected(struct bt_l2cap_chan *chan)
 {
+    if (!channel_is_current(chan))
+        return;
     LOG_DBG("[HID-CB] l2cap_ctrl_connected ENTER chan=%p state=%d\n",
            chan, hid_ctx.state);
     hid_ctx.ctrl_accepting = false;
@@ -521,7 +623,12 @@ static void l2cap_ctrl_connected(struct bt_l2cap_chan *chan)
     /* Only create outgoing interrupt channel if WE initiated the connection
      * (via inquiry → connect). For controller-initiated reconnects, the
      * controller will open the interrupt channel via the L2CAP server. */
-    if (hid_ctx.outgoing) {
+    if (hid_ctx.outgoing && !hid_ctx.intr_chan.chan.conn &&
+        !hid_ctx.intr_accepting && !hid_ctx.intr_connected) {
+        hid_ctx.intr_accepting = true;
+        memset(&hid_ctx.intr_chan, 0, sizeof(hid_ctx.intr_chan));
+        hid_ctx.intr_chan.chan.ops = &intr_ops;
+        hid_ctx.intr_chan.rx.mtu = L2CAP_BR_MTU;
         set_state(BT_HID_STATE_L2CAP_INTERRUPT);
 
         int err = bt_l2cap_chan_connect(hid_ctx.conn,
@@ -529,13 +636,15 @@ static void l2cap_ctrl_connected(struct bt_l2cap_chan *chan)
                                         HID_PSM_INTERRUPT);
         if (err) {
             LOG_ERR("[HID] Failed to connect interrupt channel: %d\n", err);
-            bt_conn_disconnect(hid_ctx.conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+            request_disconnect(hid_ctx.conn);
         }
     }
 }
 
 static void l2cap_intr_connected(struct bt_l2cap_chan *chan)
 {
+    if (!channel_is_current(chan))
+        return;
     LOG_DBG("[HID-CB] l2cap_intr_connected ENTER chan=%p state=%d\n",
            chan, hid_ctx.state);
     hid_ctx.intr_accepting = false;
@@ -581,6 +690,8 @@ static void l2cap_intr_connected(struct bt_l2cap_chan *chan)
         }
     }
 
+    if (!channel_is_current(chan))
+        return;
     set_state(BT_HID_STATE_HANDSHAKE);
 
     /* Request feature reports in the same order as DS5Dongle:
@@ -602,25 +713,23 @@ static void l2cap_intr_connected(struct bt_l2cap_chan *chan)
 
 static void l2cap_ctrl_disconnected(struct bt_l2cap_chan *chan)
 {
+    if (!channel_is_current(chan))
+        return;
     LOG_INF("[HID] Control channel disconnected (fallback_retry=%d conn=%p)\n",
            hid_ctx.fallback_retry, hid_ctx.conn);
     hid_ctx.ctrl_accepting = false;
     hid_ctx.ctrl_connected = false;
-    if (!hid_ctx.intr_connected && hid_ctx.conn) {
-        set_state(BT_HID_STATE_DISCONNECTING);
-        bt_conn_disconnect(hid_ctx.conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-    }
+    request_disconnect(chan->conn);
 }
 
 static void l2cap_intr_disconnected(struct bt_l2cap_chan *chan)
 {
+    if (!channel_is_current(chan))
+        return;
     LOG_INF("[HID] Interrupt channel disconnected\n");
     hid_ctx.intr_accepting = false;
     hid_ctx.intr_connected = false;
-    if (!hid_ctx.ctrl_connected && hid_ctx.conn) {
-        set_state(BT_HID_STATE_DISCONNECTING);
-        bt_conn_disconnect(hid_ctx.conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-    }
+    request_disconnect(chan->conn);
 }
 
 static struct bt_l2cap_chan_ops ctrl_ops = {
@@ -642,7 +751,7 @@ static struct bt_l2cap_chan_ops intr_ops = {
 static uint8_t sdp_discover_cb(struct bt_conn *conn,
                                 struct bt_sdp_client_result *result)
 {
-    if (conn != hid_ctx.conn)
+    if (conn != hid_ctx.conn || hid_ctx.teardown_pending)
         return BT_SDP_DISCOVER_UUID_STOP;
 
     if (!result) {
@@ -651,26 +760,12 @@ static uint8_t sdp_discover_cb(struct bt_conn *conn,
 
         if (!hid_ctx.hid_service_found) {
             LOG_INF("[SDP] No HID service, disconnecting\n");
-            bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+            request_disconnect(conn);
             return BT_SDP_DISCOVER_UUID_STOP;
         }
 
-        set_state(BT_HID_STATE_L2CAP_CONTROL);
-
-        memset(&hid_ctx.ctrl_chan, 0, sizeof(hid_ctx.ctrl_chan));
-        memset(&hid_ctx.intr_chan, 0, sizeof(hid_ctx.intr_chan));
-
-        hid_ctx.ctrl_chan.chan.ops = &ctrl_ops;
-        hid_ctx.ctrl_chan.rx.mtu  = L2CAP_BR_MTU;
-        hid_ctx.intr_chan.chan.ops = &intr_ops;
-        hid_ctx.intr_chan.rx.mtu  = L2CAP_BR_MTU;
-
-        int err = bt_l2cap_chan_connect(conn, &hid_ctx.ctrl_chan.chan,
-                                           HID_PSM_CONTROL);
-        if (err) {
-            LOG_ERR("[SDP] Failed to connect control channel: %d\n", err);
-            bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-        }
+        set_state(BT_HID_STATE_CONNECTING);
+        hid_ctx.sdp_pending = true;
         return BT_SDP_DISCOVER_UUID_STOP;
     }
 
@@ -731,6 +826,8 @@ static void auth_pairing_failed(struct bt_conn *conn,
                                  enum bt_security_err reason)
 {
     LOG_ERR("[BT] Pairing failed, reason=%d\n", reason);
+    record_security_failure(conn, reason);
+    request_disconnect(conn);
 }
 
 static struct bt_conn_auth_cb auth_callbacks = {
@@ -758,7 +855,7 @@ static void start_sdp_discovery(struct bt_conn *conn)
     int err = bt_sdp_discover(conn, &params);
     if (err) {
         LOG_ERR("[SDP] Failed to start discovery: %d\n", err);
-        bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+        request_disconnect(conn);
     }
 }
 
@@ -775,19 +872,16 @@ static void security_changed(struct bt_conn *conn, bt_security_t level,
         return;
     }
 
+    /* Authentication failure may first close a pending L2CAP channel, whose
+     * callback starts teardown. Still record the explicit key error then. */
     if (err) {
         LOG_ERR("[BT] Security elevation failed: level=%d err=%d\n", level, err);
-        /* Clear stale link key so next reconnect triggers fresh SSP pairing
-         * (mirrors DS5Dongle's gap_drop_link_key on AUTHENTICATION_COMPLETE fail) */
-        const bt_addr_t *remote = conn_get_br_addr(conn);
-        if (remote) {
-            extern void bt_keys_link_key_clear_addr(const bt_addr_t *addr);
-            bt_keys_link_key_clear_addr(remote);
-            LOG_WRN("[BT] Cleared stale link key for re-pairing\n");
-        }
-        bt_conn_disconnect(conn, BT_HCI_ERR_AUTH_FAIL);
+        record_security_failure(conn, err);
+        request_disconnect(conn);
         return;
     }
+    if (hid_ctx.teardown_pending)
+        return;
 
     LOG_INF("[BT] Security level raised to %d (outgoing=%d state=%s)\n",
            level, hid_ctx.outgoing, state_name(hid_ctx.state));
@@ -820,12 +914,17 @@ static void conn_connected(struct bt_conn *conn, uint8_t err)
         LOG_ERR("[BT] Connection failed: 0x%02x\n", err);
         if (hid_ctx.conn != NULL && conn != hid_ctx.conn)
             return;
-        hid_ctx.conn = NULL;
-        hid_ctx.outgoing = false;
-        bt_br_set_connectable(true);
-        bt_br_set_discoverable(true);
-        LOG_INF("[BT] Re-enabled page scan after failed connection\n");
-        set_state(BT_HID_STATE_IDLE);
+        if (!hid_ctx.conn && !hid_ctx.teardown_pending)
+            hid_ctx.conn = bt_conn_ref(conn);
+        request_disconnect(conn);
+        return;
+    }
+
+    if (hid_ctx.teardown_pending) {
+        /* The owning ACL is already scheduled for disconnect. Reject any
+         * second ACL without letting it reset the teardown state. */
+        if (conn != hid_ctx.conn)
+            bt_conn_disconnect(conn, BT_HCI_ERR_CONN_LIMIT_EXCEEDED);
         return;
     }
 
@@ -862,6 +961,7 @@ static void conn_connected(struct bt_conn *conn, uint8_t err)
     hid_ctx.fallback_retry = false;
     hid_ctx.connect_pending = false;
     hid_ctx.connect_pending_tick = 0;
+    hid_ctx.connect_retries = 0;
     LOG_INF("[BT] conn_connected: fallback_retry CLEARED (incoming conn)\n");
 
     set_state(BT_HID_STATE_CONNECTING);
@@ -884,6 +984,7 @@ static void conn_connected(struct bt_conn *conn, uint8_t err)
      * from this callback (deadlock risk), so deferring is the safe approach. */
     hid_ctx.security_pending = true;
     hid_ctx.security_done = false;
+    hid_ctx.security_done_tick = 0;
     hid_ctx.acl_connect_tick = xTaskGetTickCount();
 
     LOG_DBG("[BT] %s connection — security deferred to task context\n",
@@ -891,81 +992,16 @@ static void conn_connected(struct bt_conn *conn, uint8_t err)
     LOG_DBG("[BT-CB] conn_connected EXIT\n");
 }
 
-static volatile int8_t cached_rssi = 1; /* 1 = unknown (positive → web shows "Unknown") */
-static volatile bool switch_pending = false;
-
 static void conn_disconnected(struct bt_conn *conn, uint8_t reason)
 {
-    LOG_INF("[BT-CB] conn_disconnected: conn=%p hid_ctx.conn=%p reason=0x%02x "
-           "state=%d fallback_retry=%d\n",
-           conn, hid_ctx.conn, reason, hid_ctx.state, hid_ctx.fallback_retry);
-
-    if (conn != hid_ctx.conn) {
-        LOG_INF("[BT] Old ACL teardown complete (unowned conn, reason 0x%02x, "
-               "state=%d)\n", reason, hid_ctx.state);
-        /* If a fallback outgoing connect is waiting for ACL teardown, fire it now */
-        if (hid_ctx.connect_pending && hid_ctx.connect_pending_tick != 0 &&
-            hid_ctx.state == BT_HID_STATE_IDLE) {
-            hid_ctx.connect_pending_tick = xTaskGetTickCount();
-            LOG_INF("[BT] ACL clear — fallback connect ready\n");
-        }
+    LOG_INF("[BT] ACL disconnected: conn=%p owner=%p reason=0x%02x\n",
+            conn, hid_ctx.conn, reason);
+    if (conn != hid_ctx.conn)
         return;
-    }
 
-    const char *r_str = reason == 0x08 ? "CONN_TIMEOUT" :
-                        reason == 0x13 ? "REMOTE_USER" :
-                        reason == 0x16 ? "LOCAL_HOST" : "OTHER";
-    LOG_INF("[BT] Disconnected reason=0x%02x (%s)\n", reason, r_str);
-
-    bt_conn_unref(hid_ctx.conn);
-    hid_ctx.conn = NULL;
-
-    hid_ctx.ctrl_connected = false;
-    hid_ctx.intr_connected = false;
-    hid_ctx.ctrl_accepting = false;
-    hid_ctx.intr_accepting = false;
-    hid_ctx.outgoing = false;
-    hid_ctx.is_dse = false;
-    hid_ctx.check_dse = false;
-    hid_ctx.handshake_next  = 0;
-    hid_ctx.handshake_count = 0;
-    hid_ctx.handshake_send_failed = false;
-    hid_ctx.security_pending = false;
-    hid_ctx.security_done = false;
-    hid_ctx.sdp_pending = false;
-    hid_ctx.connect_pending = false;
-
-    first_intr_logged  = false;
-    first_output_logged = false;
-
-    app_tx_fifo_reset();
-
-    feature_cache_clear();
-    dse_reset();
-    cached_rssi = 1;
-
-    bt_br_set_connectable(true);
-    bt_br_set_discoverable(true);
-
-    LOG_INF("[BT] Re-enabled connectable+discoverable, ready for new connection\n");
-    set_state(BT_HID_STATE_IDLE);
-
-    if (switch_pending) {
-        switch_pending = false;
-        LOG_INF("[BT] Switch: old ACL teardown complete, waiting for "
-               "controller [%d/%d] to reconnect\n", active_idx, bonded_count);
-        return;
-    }
-
-    LOG_INF("[BT] conn_disconnected: fallback_retry=%d bonded_count=%d\n",
-           hid_ctx.fallback_retry, bonded_count);
-    if (hid_ctx.fallback_retry && bonded_count > 0) {
-        hid_ctx.fallback_retry = false;
-        memcpy(hid_ctx.pending_addr.val, bonded_list[active_idx].val, 6);
-        hid_ctx.connect_pending = true;
-        hid_ctx.connect_pending_tick = xTaskGetTickCount();
-        LOG_INF("[BT] Fallback: outgoing connect scheduled (ACL already down)\n");
-    }
+    /* The SDK invokes this before its worker deletes L2CAP channels. Do not
+     * release the owner, reuse channels, or accept another ACL here. */
+    request_disconnect(conn);
 }
 
 static struct bt_conn_cb conn_callbacks = {
@@ -1047,6 +1083,8 @@ static void l2cap_server_ensure_conn(struct bt_conn *conn)
 static int l2cap_ctrl_server_accept(struct bt_conn *conn,
                                      struct bt_l2cap_chan **chan)
 {
+    if (hid_ctx.teardown_pending)
+        return -EBUSY;
     char addr_str[BT_ADDR_STR_LEN] = "??";
     const bt_addr_t *remote = conn_get_br_addr(conn);
     if (remote)
@@ -1068,7 +1106,7 @@ static int l2cap_ctrl_server_accept(struct bt_conn *conn,
         return -EACCES;
     }
 
-    if (hid_ctx.ctrl_connected || hid_ctx.ctrl_accepting) {
+    if (hid_ctx.ctrl_connected || hid_ctx.ctrl_accepting || hid_ctx.ctrl_chan.chan.conn) {
         LOG_WRN("[HID] Control channel already connected/accepting\n");
         return -ENOMEM;
     }
@@ -1087,6 +1125,8 @@ static int l2cap_ctrl_server_accept(struct bt_conn *conn,
 static int l2cap_intr_server_accept(struct bt_conn *conn,
                                      struct bt_l2cap_chan **chan)
 {
+    if (hid_ctx.teardown_pending)
+        return -EBUSY;
     char addr_str[BT_ADDR_STR_LEN] = "??";
     const bt_addr_t *remote = conn_get_br_addr(conn);
     if (remote)
@@ -1107,7 +1147,7 @@ static int l2cap_intr_server_accept(struct bt_conn *conn,
         return -EACCES;
     }
 
-    if (hid_ctx.intr_connected || hid_ctx.intr_accepting) {
+    if (hid_ctx.intr_connected || hid_ctx.intr_accepting || hid_ctx.intr_chan.chan.conn) {
         LOG_WRN("[HID] Interrupt channel already connected/accepting\n");
         return -ENOMEM;
     }
@@ -1426,7 +1466,7 @@ bool bt_hid_host_poll_scan_early(void)
 
 bool bt_hid_host_poll_connect(void)
 {
-    if (!hid_ctx.connect_pending)
+    if (!hid_ctx.connect_pending || hid_ctx.teardown_pending)
         return false;
 
     /* If controller already reconnected (incoming), cancel outgoing */
@@ -1437,10 +1477,6 @@ bool bt_hid_host_poll_connect(void)
         hid_ctx.connect_pending_tick = 0;
         return false;
     }
-
-    /* connect_pending_tick == UINT32_MAX means "waiting for ACL teardown" */
-    if (hid_ctx.connect_pending_tick == (TickType_t)UINT32_MAX)
-        return false;
 
     /* After ACL teardown event fires, wait before connecting */
     if (hid_ctx.connect_pending_tick != 0) {
@@ -1473,19 +1509,19 @@ bool bt_hid_host_poll_connect(void)
            hid_ctx.state, hid_ctx.conn);
     int rc = bt_hid_host_connect(hid_ctx.pending_addr.val);
     if (rc != 0) {
-        static uint8_t retry_count = 0;
-        retry_count++;
-        if (retry_count >= 3) {
-            LOG_WRN("[BT] Fallback: gave up after %d attempts\n", retry_count);
-            retry_count = 0;
+        hid_ctx.connect_retries++;
+        if (hid_ctx.connect_retries >= 3) {
+            LOG_WRN("[BT] Fallback: gave up after %d attempts\n", hid_ctx.connect_retries);
+            hid_ctx.connect_retries = 0;
             hid_ctx.connect_pending = false;
             hid_ctx.connect_pending_tick = 0;
         } else {
             LOG_WRN("[BT] Fallback: attempt %d failed (%d), retry in 500ms\n",
-                   retry_count, rc);
+                   hid_ctx.connect_retries, rc);
             hid_ctx.connect_pending_tick = xTaskGetTickCount();
         }
     } else {
+        hid_ctx.connect_retries = 0;
         hid_ctx.connect_pending = false;
         hid_ctx.connect_pending_tick = 0;
     }
@@ -1494,7 +1530,7 @@ bool bt_hid_host_poll_connect(void)
 
 bool bt_hid_host_poll_security(void)
 {
-    if (!hid_ctx.security_pending || !hid_ctx.conn)
+    if (!hid_ctx.security_pending || !hid_ctx.conn || hid_ctx.teardown_pending)
         return false;
 
     hid_ctx.security_pending = false;
@@ -1542,7 +1578,7 @@ bool bt_hid_host_poll_security(void)
 
 bool bt_hid_host_poll_sdp(void)
 {
-    if (!hid_ctx.sdp_pending || !hid_ctx.conn)
+    if (!hid_ctx.sdp_pending || !hid_ctx.conn || hid_ctx.teardown_pending)
         return false;
 
     hid_ctx.sdp_pending = false;
@@ -1553,26 +1589,33 @@ bool bt_hid_host_poll_sdp(void)
         return false;
     }
 
+    /* A controller may start its channels before this deferred poll runs.
+     * Never memset a channel already linked into the SDK connection list. */
+    taskENTER_CRITICAL();
+    if (hid_ctx.teardown_pending || hid_ctx.ctrl_accepting ||
+        hid_ctx.intr_accepting || hid_ctx.ctrl_chan.chan.conn ||
+        hid_ctx.intr_chan.chan.conn) {
+        taskEXIT_CRITICAL();
+        return false;
+    }
+    hid_ctx.ctrl_accepting = true; /* Reserve before an incoming accept can run. */
+    memset(&hid_ctx.ctrl_chan, 0, sizeof(hid_ctx.ctrl_chan));
+    hid_ctx.ctrl_chan.chan.ops = &ctrl_ops;
+    hid_ctx.ctrl_chan.rx.mtu = L2CAP_BR_MTU;
+    taskEXIT_CRITICAL();
+
     /* Skip SDP for bonded devices — directly create L2CAP channels.
      * This matches DS5Dongle behavior where reconnection never does SDP. */
     LOG_DBG("[BT] poll_sdp: creating outgoing L2CAP channels\n");
 
     set_state(BT_HID_STATE_L2CAP_CONTROL);
 
-    memset(&hid_ctx.ctrl_chan, 0, sizeof(hid_ctx.ctrl_chan));
-    memset(&hid_ctx.intr_chan, 0, sizeof(hid_ctx.intr_chan));
-
-    hid_ctx.ctrl_chan.chan.ops = &ctrl_ops;
-    hid_ctx.ctrl_chan.rx.mtu  = L2CAP_BR_MTU;
-    hid_ctx.intr_chan.chan.ops = &intr_ops;
-    hid_ctx.intr_chan.rx.mtu  = L2CAP_BR_MTU;
-
     int err = bt_l2cap_chan_connect(hid_ctx.conn,
                                     &hid_ctx.ctrl_chan.chan,
                                     HID_PSM_CONTROL);
     if (err) {
         LOG_DBG("[BT] poll_sdp: L2CAP control connect failed: %d\n", err);
-        bt_conn_disconnect(hid_ctx.conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+        request_disconnect(hid_ctx.conn);
     }
     return true;
 }
@@ -1581,7 +1624,7 @@ bool bt_hid_host_poll_sdp(void)
 
 bool bt_hid_host_poll_security_watchdog(void)
 {
-    if (hid_ctx.security_done || !hid_ctx.conn)
+    if (hid_ctx.security_done || !hid_ctx.conn || hid_ctx.teardown_pending)
         return false;
 
     if (hid_ctx.state != BT_HID_STATE_CONNECTING)
@@ -1600,28 +1643,16 @@ bool bt_hid_host_poll_security_watchdog(void)
     if (conn->encrypt && conn->sec_level >= BT_SECURITY_L2) {
         LOG_WRN("[BT] WATCHDOG: encryption active, forcing L2CAP path\n");
         hid_ctx.security_done = true;
+        hid_ctx.security_done_tick = xTaskGetTickCount();
         if (hid_ctx.outgoing) {
             hid_ctx.sdp_pending = true;
         }
         return true;
     }
 
-    /* Auth failed: required_sec_level was reset by reset_pairing() in the
-     * SDK, meaning the controller rejected our link key.  Delete the stale
-     * key so the next connection attempt triggers fresh SSP pairing. */
-    const bt_addr_t *remote = conn_get_br_addr(conn);
-    if (remote) {
-        LOG_WRN("[BT] WATCHDOG: clearing stale link key for "
-               "%02X:%02X:%02X:%02X:%02X:%02X\n",
-               remote->val[5], remote->val[4], remote->val[3],
-               remote->val[2], remote->val[1], remote->val[0]);
-        extern void bt_keys_link_key_clear_addr(const bt_addr_t *addr);
-        bt_keys_link_key_clear_addr(remote);
-    }
-
-    LOG_WRN("[BT] WATCHDOG: disconnecting to retry with fresh pairing\n");
-    bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-    return false;
+    LOG_WRN("[BT] Security timeout: preserving bond, disconnecting\n");
+    request_disconnect(conn);
+    return true;
 }
 
 #define INCOMING_L2CAP_FALLBACK_MS 3000
@@ -1630,7 +1661,8 @@ bool bt_hid_host_poll_incoming_l2cap_fallback(void)
 {
     if (hid_ctx.state != BT_HID_STATE_CONNECTING)
         return false;
-    if (!hid_ctx.security_done || hid_ctx.outgoing || !hid_ctx.conn)
+    if (!hid_ctx.security_done || hid_ctx.outgoing || !hid_ctx.conn ||
+        hid_ctx.teardown_pending)
         return false;
 
     TickType_t elapsed = xTaskGetTickCount() - hid_ctx.security_done_tick;
@@ -1642,9 +1674,7 @@ bool bt_hid_host_poll_incoming_l2cap_fallback(void)
         LOG_INF("[BT] L2CAP fallback: Control handshake stuck, disconnecting "
                "(ctrl_accept=%d ctrl_conn=%d intr_conn=%d)\n",
                hid_ctx.ctrl_accepting, hid_ctx.ctrl_connected, hid_ctx.intr_connected);
-        /* Explicitly disconnect the stuck L2CAP channel to cancel RTX timer
-         * before tearing down the ACL — speeds up ACL teardown significantly */
-        bt_l2cap_chan_disconnect(&hid_ctx.ctrl_chan.chan);
+        /* Let SDK ACL cleanup cancel the channel timer before reuse. */
         hid_ctx.fallback_retry = true;
         LOG_INF("[BT] fallback_retry SET=1 (stuck path)\n");
         bt_hid_host_disconnect();
@@ -1653,18 +1683,28 @@ bool bt_hid_host_poll_incoming_l2cap_fallback(void)
 
     if (hid_ctx.ctrl_connected) {
         /* Control is up but Interrupt isn't — open Interrupt only */
-        if (!hid_ctx.intr_connected && !hid_ctx.intr_accepting) {
+        bool open_interrupt = false;
+        taskENTER_CRITICAL();
+        if (!hid_ctx.teardown_pending && !hid_ctx.intr_connected &&
+            !hid_ctx.intr_accepting && !hid_ctx.intr_chan.chan.conn) {
+            hid_ctx.intr_accepting = true;
+            memset(&hid_ctx.intr_chan, 0, sizeof(hid_ctx.intr_chan));
+            hid_ctx.intr_chan.chan.ops = &intr_ops;
+            hid_ctx.intr_chan.rx.mtu = L2CAP_BR_MTU;
+            open_interrupt = true;
+        }
+        taskEXIT_CRITICAL();
+        if (open_interrupt) {
             LOG_INF("[BT] L2CAP fallback: Control connected, opening Interrupt\n");
             hid_ctx.outgoing = true;
             set_state(BT_HID_STATE_L2CAP_INTERRUPT);
-            memset(&hid_ctx.intr_chan, 0, sizeof(hid_ctx.intr_chan));
-            hid_ctx.intr_chan.chan.ops = &intr_ops;
-            hid_ctx.intr_chan.rx.mtu  = L2CAP_BR_MTU;
             int err = bt_l2cap_chan_connect(hid_ctx.conn,
                                             &hid_ctx.intr_chan.chan,
                                             HID_PSM_INTERRUPT);
-            if (err)
+            if (err) {
                 LOG_ERR("[BT] Interrupt connect failed: %d\n", err);
+                request_disconnect(hid_ctx.conn);
+            }
             return true;
         }
         return false;
@@ -1696,12 +1736,8 @@ int bt_hid_host_connect(const uint8_t *addr)
         LOG_DBG("[BT] connect [2] scan stop rc=%d\n", stop_err);
     }
 
-    if (hid_ctx.conn) {
-        LOG_DBG("[BT] connect: already have conn=%p, skip create\n", hid_ctx.conn);
-        hid_ctx.outgoing = true;
-        set_state(BT_HID_STATE_CONNECTING);
-        return 0;
-    }
+    if (hid_ctx.conn || hid_ctx.teardown_pending)
+        return -EBUSY;
 
     hid_ctx.outgoing = true;
     set_state(BT_HID_STATE_CONNECTING);
@@ -1741,72 +1777,126 @@ int bt_hid_host_connect(const uint8_t *addr)
         return -1;
     }
 
-    /* Bouffalo SDK's bt_conn_create_br does NOT return a caller
-     * reference (unlike standard Zephyr). SDK examples never call
-     * bt_conn_unref after bt_conn_create_br. */
+    /* Track paging too, so a connect timeout can cancel it. Bouffalo returns
+     * no caller reference; acquire our own unless the callback already did. */
+    taskENTER_CRITICAL();
+    if (!hid_ctx.conn)
+        hid_ctx.conn = bt_conn_ref(conn);
+    taskEXIT_CRITICAL();
     LOG_DBG("[BT] connect EXIT OK\n");
     return 0;
 }
 
 void bt_hid_host_disconnect(void)
 {
-    LOG_INF("[BT] bt_hid_host_disconnect called (state=%d fallback_retry=%d)\n",
-           hid_ctx.state, hid_ctx.fallback_retry);
-    if (hid_ctx.conn) {
-        set_state(BT_HID_STATE_DISCONNECTING);
-        bt_conn_disconnect(hid_ctx.conn,
-                           BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-    }
+    request_disconnect(hid_ctx.conn);
 }
 
 void bt_hid_host_force_disconnect(void)
 {
-    LOG_WRN("[BT] Force disconnect — HID cleanup, conn=%p\n", hid_ctx.conn);
+    /* Repeated watchdog calls must not restart the teardown deadline. */
+    request_disconnect(hid_ctx.conn);
+}
 
-    hid_ctx.ctrl_connected = false;
-    hid_ctx.intr_connected = false;
-    hid_ctx.ctrl_accepting = false;
-    hid_ctx.intr_accepting = false;
-    hid_ctx.outgoing = false;
-    hid_ctx.is_dse = false;
-    hid_ctx.check_dse = false;
-    hid_ctx.handshake_next  = 0;
-    hid_ctx.handshake_count = 0;
-    hid_ctx.handshake_send_failed = false;
-    hid_ctx.connect_pending = false;
-    hid_ctx.sdp_pending = false;
-    hid_ctx.security_pending = false;
-    hid_ctx.security_done = false;
+#define DISCONNECT_TIMEOUT_TICKS pdMS_TO_TICKS(12000)
+#define DISCONNECT_RETRY_TICKS   pdMS_TO_TICKS(1000)
 
-    first_intr_logged  = false;
-    first_output_logged = false;
+bool bt_hid_host_poll_disconnect(void)
+{
+    if (!hid_ctx.teardown_pending || !hid_ctx.conn)
+        return false;
 
-    app_tx_fifo_reset();
+    struct bt_conn *conn = hid_ctx.conn; /* owning ref, released only below */
+    TickType_t now = xTaskGetTickCount();
 
-    feature_cache_clear();
-    dse_reset();
-
-    if (hid_ctx.conn) {
-        LOG_INF("[BT] Sending HCI Disconnect for ACL cleanup\n");
-        bt_conn_disconnect(hid_ctx.conn, 0x13);
-        bt_conn_unref(hid_ctx.conn);
-        hid_ctx.conn = NULL;
+    if (hid_ctx.clear_key_pending) {
+        hid_ctx.clear_key_pending = false;
+        const bt_addr_t *remote = conn_get_br_addr(conn);
+        if (remote) {
+            LOG_WRN("[BT] Explicit authentication failure: clearing rejected key\n");
+            bt_keys_link_key_clear_addr(remote);
+        }
     }
 
-    bt_br_set_connectable(true);
-    bt_br_set_discoverable(true);
+    /* Bouffalo releases the state/work reference after bt_l2cap_disconnected
+     * and all channel destroy/timer cleanup. Ref==1 means only our owner is
+     * left; merely observing the ACL callback or chan->conn==NULL is too early.
+     * Extra refs held by in-flight task sends also delay this boundary. */
+    bool drained;
+    taskENTER_CRITICAL();
+    drained = conn->state == BT_CONN_DISCONNECTED &&
+              atomic_get(&conn->ref) == 1 &&
+              !hid_ctx.ctrl_chan.chan.conn && !hid_ctx.intr_chan.chan.conn;
+    taskEXIT_CRITICAL();
+    if (drained) {
+        const bt_addr_t *remote = conn_get_br_addr(conn);
+        bool retry = hid_ctx.fallback_retry && !switch_pending &&
+                     bonded_count > 0 && remote;
+        if (retry)
+            bt_addr_copy(&hid_ctx.pending_addr, remote);
 
-    set_state(BT_HID_STATE_IDLE);
-
-    LOG_INF("[BT] force_disconnect: fallback_retry=%d bonded_count=%d\n",
-           hid_ctx.fallback_retry, bonded_count);
-    if (hid_ctx.fallback_retry && bonded_count > 0) {
+        hid_ctx.ctrl_connected = false;
+        hid_ctx.intr_connected = false;
+        hid_ctx.ctrl_accepting = false;
+        hid_ctx.intr_accepting = false;
+        hid_ctx.outgoing = false;
+        hid_ctx.is_dse = false;
+        hid_ctx.check_dse = false;
+        hid_ctx.handshake_next = 0;
+        hid_ctx.handshake_count = 0;
+        hid_ctx.handshake_send_failed = false;
+        hid_ctx.security_pending = false;
+        hid_ctx.security_done = false;
+        hid_ctx.security_done_tick = 0;
+        hid_ctx.sdp_pending = false;
         hid_ctx.fallback_retry = false;
-        memcpy(hid_ctx.pending_addr.val, bonded_list[active_idx].val, 6);
-        hid_ctx.connect_pending = true;
-        hid_ctx.connect_pending_tick = (TickType_t)UINT32_MAX;
-        LOG_INF("[BT] Fallback: outgoing connect pending (waiting for ACL teardown)\n");
+        hid_ctx.connect_retries = 0;
+        hid_ctx.connect_pending = retry;
+        hid_ctx.connect_pending_tick = retry ? now : 0;
+        first_intr_logged = false;
+        first_output_logged = false;
+        app_tx_fifo_reset();
+        feature_cache_clear();
+        dse_reset();
+        cached_rssi = 1;
+
+        /* Keep incoming callbacks gated until session cleanup is complete. */
+        taskENTER_CRITICAL();
+        hid_ctx.conn = NULL;
+        bt_conn_unref(conn);
+        taskEXIT_CRITICAL();
+        /* on_hid_state(IDLE) may start a user-requested scan. */
+        set_state(BT_HID_STATE_IDLE);
+        hid_ctx.teardown_pending = false;
+        switch_pending = false;
+        bt_br_set_connectable(true);
+        bt_br_set_discoverable(true);
+        LOG_INF("[BT] ACL + channel cleanup complete, retry=%d\n", retry);
+        return true;
     }
+
+    if ((TickType_t)(now - hid_ctx.teardown_started) >= DISCONNECT_TIMEOUT_TICKS) {
+        /* Lost SDK events/refs cannot be repaired by recycling live channel
+         * structs. Reset only after a bounded wait; pairing stays in flash. */
+        LOG_ERR("[BT] Teardown timeout: state=%d refs=%ld; resetting adapter\n",
+                conn->state, (long)atomic_get(&conn->ref));
+        GLB_SW_System_Reset();
+        return true;
+    }
+
+    if (!hid_ctx.disconnect_sent && conn->state != BT_CONN_DISCONNECTED &&
+        (!hid_ctx.disconnect_attempt_valid ||
+         (TickType_t)(now - hid_ctx.disconnect_attempted) >= DISCONNECT_RETRY_TICKS)) {
+        hid_ctx.disconnect_attempt_valid = true;
+        hid_ctx.disconnect_attempted = now;
+        /* Callbacks can run during this call. They never release our owner. */
+        int err = bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+        if (!err)
+            hid_ctx.disconnect_sent = true;
+        else
+            LOG_WRN("[BT] Disconnect request failed (%d), retrying\n", err);
+    }
+    return true;
 }
 
 bool bt_hid_host_has_pending_conn(void)
@@ -1816,49 +1906,20 @@ bool bt_hid_host_has_pending_conn(void)
 
 void bt_hid_host_drop_stale_conn(void)
 {
-    if (!hid_ctx.conn)
-        return;
-
-    LOG_WRN("[BT] conn_disconnected never arrived — force cleanup\n");
-
-    bt_conn_unref(hid_ctx.conn);
-    hid_ctx.conn = NULL;
-
-    hid_ctx.ctrl_connected = false;
-    hid_ctx.intr_connected = false;
-    hid_ctx.ctrl_accepting = false;
-    hid_ctx.intr_accepting = false;
-    hid_ctx.outgoing = false;
-    hid_ctx.is_dse = false;
-    hid_ctx.check_dse = false;
-    hid_ctx.connect_pending = false;
-    hid_ctx.sdp_pending = false;
-    hid_ctx.security_pending = false;
-    hid_ctx.security_done = false;
-
-    app_tx_fifo_reset();
-
-    feature_cache_clear();
-
-    set_state(BT_HID_STATE_IDLE);
-
-    if (switch_pending) {
-        switch_pending = false;
-        LOG_INF("[BT] Switch: stale conn cleared, waiting for "
-               "controller [%d/%d] to reconnect\n", active_idx, bonded_count);
-    }
-
-    bt_br_set_connectable(true);
-    bt_br_set_discoverable(true);
-    LOG_INF("[BT] Re-enabled connectable+discoverable after stale cleanup\n");
+    /* Never unref storage still owned by SDK channel/timer callbacks. */
+    request_disconnect(hid_ctx.conn);
 }
 
 int bt_hid_host_read_rssi(int8_t *rssi)
 {
     if (!hid_ctx.conn || hid_ctx.state != BT_HID_STATE_CONNECTED)
         return -1;
+    struct bt_conn *conn = active_conn_ref();
+    if (!conn)
+        return -ENOTCONN;
     int8_t val = 0;
-    int ret = bt_le_read_rssi(hid_ctx.conn->handle, &val);
+    int ret = bt_le_read_rssi(conn->handle, &val);
+    bt_conn_unref(conn);
     if (ret == 0) {
         cached_rssi = val;
         if (rssi) *rssi = val;
@@ -1898,9 +1959,8 @@ int bt_hid_host_send_output(const uint8_t *data, uint16_t len)
         net_buf_reserve(buf, BT_L2CAP_CHAN_SEND_RESERVE);
         net_buf_add_u8(buf, HID_HEADER(HID_TRANS_DATA, HID_REPORT_OUTPUT));
         net_buf_add_mem(buf, data, len);
-        int err = bt_l2cap_chan_send(&hid_ctx.intr_chan.chan, buf);
+        int err = send_hid_buf(&hid_ctx.intr_chan, buf, NULL);
         if (err < 0) {
-            net_buf_unref(buf);
             LOG_ERR("[HID] send_output direct: l2cap err=%d\n", err);
             return err;
         }
@@ -1950,11 +2010,9 @@ int bt_hid_host_set_feature(uint8_t report_id, const uint8_t *data,
     if (data && len > 0)
         net_buf_add_mem(buf, data, len);
 
-    int err = bt_l2cap_chan_send(&hid_ctx.ctrl_chan.chan, buf);
-    if (err < 0) {
-        net_buf_unref(buf);
+    int err = send_hid_buf(&hid_ctx.ctrl_chan, buf, NULL);
+    if (err < 0)
         return err;
-    }
 
     return 0;
 }
@@ -1972,11 +2030,9 @@ int bt_hid_host_get_feature(uint8_t report_id)
     net_buf_add_u8(buf, HID_HEADER(HID_TRANS_GET_REPORT, HID_REPORT_FEATURE));
     net_buf_add_u8(buf, report_id);
 
-    int err = bt_l2cap_chan_send(&hid_ctx.ctrl_chan.chan, buf);
-    if (err < 0) {
-        net_buf_unref(buf);
+    int err = send_hid_buf(&hid_ctx.ctrl_chan, buf, NULL);
+    if (err < 0)
         return err;
-    }
 
     LOG_DBG("[HID] GET_REPORT(Feature, 0x%02x) sent\n", report_id);
     return 0;
@@ -2053,12 +2109,12 @@ int bt_hid_host_switch_next(void)
         hid_ctx.ctrl_connected = false;
         hid_ctx.intr_connected = false;
         switch_pending = true;
+        hid_ctx.fallback_retry = false;
 
         LOG_INF("[BT] Switching: disconnect current → wait ACL teardown → "
                "reconnect [%d/%d] %s\n", active_idx, bonded_count, addr_str);
-        bt_conn_disconnect(hid_ctx.conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-        /* conn_disconnected callback will handle full cleanup and
-         * enable connectable only after old ACL is fully torn down. */
+        request_disconnect(hid_ctx.conn);
+        /* The BT task reopens scanning after SDK channel cleanup. */
     } else {
         if (hid_ctx.state == BT_HID_STATE_SCANNING)
             bt_br_discovery_stop();
@@ -2110,56 +2166,34 @@ uint8_t bt_hid_host_get_active_idx(void)
 void bt_hid_host_clear_bonds(void)
 {
     LOG_INF("[BT] Clearing all bonding info\n");
-
     if (hid_ctx.state == BT_HID_STATE_SCANNING)
         bt_br_discovery_stop();
 
-    /* Disconnect the current controller if connected */
-    if (hid_ctx.conn) {
-        bt_conn_disconnect(hid_ctx.conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-        bt_conn_unref(hid_ctx.conn);
-        hid_ctx.conn = NULL;
-    }
-
-    /* Clear the blacklist too — we want the controller to reconnect freely
-     * after a manual bond clear. The security watchdog handles stale keys. */
-    blacklist_count = 0;
-
-    hid_ctx.ctrl_connected = false;
-    hid_ctx.intr_connected = false;
-    hid_ctx.ctrl_accepting = false;
-    hid_ctx.intr_accepting = false;
-    hid_ctx.outgoing = false;
-    hid_ctx.is_dse = false;
-    hid_ctx.check_dse = false;
-    hid_ctx.handshake_next  = 0;
-    hid_ctx.handshake_count = 0;
-    hid_ctx.handshake_send_failed = false;
-    hid_ctx.security_pending = false;
-    hid_ctx.security_done = false;
-    hid_ctx.sdp_pending = false;
+    hid_ctx.fallback_retry = false;
     hid_ctx.connect_pending = false;
+    hid_ctx.clear_key_pending = false;
+    request_disconnect(hid_ctx.conn);
 
+    /* Manual clearing is explicit authorization to delete all stored keys.
+     * Leave the active owner/channels intact until the SDK drains them. */
+    blacklist_count = 0;
     bt_keys_link_key_clear_addr(NULL);
-
     blacklist_persist();
     blacklist_dirty = false;
-    LOG_INF("[BT] All link keys and blacklist cleared\n");
-
     bonded_count = 0;
     active_idx = 0;
     bonded_list_persist_idx();
-
     hid_ctx.has_target = false;
     memset(&hid_ctx.target_addr, 0, sizeof(hid_ctx.target_addr));
 
-    bt_br_set_connectable(true);
-    bt_br_set_discoverable(true);
-
-    feature_cache_clear();
-    dse_reset();
-
-    set_state(BT_HID_STATE_IDLE);
+    if (!hid_ctx.conn) {
+        feature_cache_clear();
+        dse_reset();
+        set_state(BT_HID_STATE_IDLE);
+        bt_br_set_connectable(true);
+        bt_br_set_discoverable(true);
+    }
+    LOG_INF("[BT] All link keys and blacklist cleared\n");
 }
 
 bool bt_hid_host_get_cached_feature(uint8_t report_id,
@@ -2213,11 +2247,10 @@ int bt_hid_host_set_feature_crc(uint8_t report_id, const uint8_t *data,
         ds5_write_le32(crc_region + crc_data_len, crc);
     }
 
-    int err = bt_l2cap_chan_send(&hid_ctx.ctrl_chan.chan, buf);
+    int err = send_hid_buf(&hid_ctx.ctrl_chan, buf, NULL);
     if (err < 0) {
         LOG_ERR("[HID] SET_FEATURE_CRC(0x%02x): l2cap send failed err=%d\n",
                report_id, err);
-        net_buf_unref(buf);
         return err;
     }
 

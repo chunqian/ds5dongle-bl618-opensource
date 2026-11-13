@@ -54,6 +54,8 @@ git clone https://github.com/sqlCRT/bouffalo_sdk.git bouffalo_sdk
 
 The build script expects the SDK in `../bouffalo_sdk` (a sibling directory of this repository) and builds against the fork's `master` branch. The fork is based on upstream v2.3.28 with targeted DS5Dongle BL618 modifications; see its README for details.
 
+`cmake/bt_auth_notify.cmake` generates a patched SDK `hci_core.c` in the build directory to notify the firmware of existing-key authentication failures. Both Mac and Windows builds use this copy without modifying the shared SDK checkout.
+
 ### 2. Dependencies
 
 ```bash
@@ -200,7 +202,7 @@ LCTech BL616 has a single blue LED (GPIO27); states are distinguished by blink c
 - DualSense Edge full support: auto-detect → unlock handshake → profile prefetch → 437B descriptor, PID auto-switch (0DF2)
 - Multi-controller memory: remembers up to 8 paired controllers, single click to switch
 - Controller-initiated reconnect via L2CAP server registration (passive model)
-- Robust reconnection: periodic scan retry (~30s), connection watchdog (3s no-input detection), Link Supervision Timeout (5s), system reset fallback for stale ACL cleanup
+- Robust reconnection: periodic scan retry (~30s), connection watchdog (3s no-input detection), Link Supervision Timeout (5s); release host input promptly on link loss, reconnect only after SDK ACL/channel cleanup, with a reset fallback if teardown exceeds 12s. Authentication timeouts preserve bonds; keys are deleted only after explicit authentication/key failures or a manual bond clear
 - Idle timeout: configurable 0–60 min auto-disconnect (default 30 min)
 - PS shortcut: short press → Win+G, long press → Win+Tab
 - Configurable polling rate: 250Hz / 500Hz / real-time (~750Hz, follows the BT report rate)

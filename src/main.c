@@ -56,6 +56,8 @@ static volatile bool ds5_connected = false;
 static volatile bool ever_connected = false;
 static volatile bool battery_low = false;
 static volatile bool bt_init_done = false;
+/* Consumed by the USB task, independently of delayed SDK ACL cleanup. */
+static volatile bool input_release_pending = false;
 
 static volatile uint8_t cached_battery_level = 0xFF;
 static volatile uint8_t cached_battery_state = 0;
@@ -312,7 +314,7 @@ static void on_hid_primer(void)
 
 static void on_hid_input(const uint8_t *data, uint16_t len)
 {
-    if (len < 3) return;
+    if (len < 3 || !ds5_connected) return;
 
     /* data[0] = report ID (0x31), data[1] = flags */
     if ((data[1] >> 1) & 1) {
@@ -329,13 +331,39 @@ static void on_hid_input(const uint8_t *data, uint16_t len)
         }
         uint8_t report[DS5_BT_INPUT_REPORT_SIZE];
         memcpy(report, data, DS5_BT_INPUT_REPORT_SIZE);
-        xQueueOverwrite(input_queue, report);
+        /* A higher-priority USB watchdog may start teardown during the copy. */
+        taskENTER_CRITICAL();
+        if (ds5_connected)
+            xQueueOverwrite(input_queue, report);
+        taskEXIT_CRITICAL();
     }
+}
+
+/* Keep report publication and neutral release in the same task. In particular,
+ * a queued/partly processed report must not restore held buttons after release.
+ * send_raw_input retains neutral for retry if the USB endpoint is busy. */
+static bool process_input_release(void)
+{
+    taskENTER_CRITICAL();
+    bool pending = input_release_pending;
+    input_release_pending = false;
+    taskEXIT_CRITICAL();
+    if (!pending)
+        return false;
+
+    xQueueReset(input_queue);
+    uint8_t neutral[DS5_USB_INPUT_PAYLOAD_LEN] = {0};
+    memset(neutral, 0x7F, 4);
+    neutral[7] = DS5_DPAD_NONE;
+    usb_gamepad_send_raw_input(neutral);
+    remap_on_disconnect();
+    return true;
 }
 
 static void on_hid_state(enum bt_hid_host_state state)
 {
     switch (state) {
+    case BT_HID_STATE_DISCONNECTING:
     case BT_HID_STATE_IDLE: {
         handshake_start_us = 0;
         connecting_start_tick = 0;
@@ -348,18 +376,13 @@ static void on_hid_state(enum bt_hid_host_state state)
                                             (since_out < 5000000ULL);
         }
         if (ds5_connected) {
+            taskENTER_CRITICAL();
             ds5_connected = false;
+            input_release_pending = true;
+            taskEXIT_CRITICAL();
             battery_low = false;
             cached_battery_level = 0xFF;
             cached_battery_state = 0;
-            uint8_t neutral[DS5_USB_INPUT_PAYLOAD_LEN];
-            memset(neutral, 0, sizeof(neutral));
-            neutral[0] = 0x7F; /* LX center */
-            neutral[1] = 0x7F; /* LY center */
-            neutral[2] = 0x7F; /* RX center */
-            neutral[3] = 0x7F; /* RY center */
-            neutral[7] = DS5_DPAD_NONE; /* D-pad neutral */
-            usb_gamepad_send_raw_input(neutral);
         }
         ds5_connected = false;
         usb_fwd_count = 0;
@@ -372,19 +395,19 @@ static void on_hid_state(enum bt_hid_host_state state)
         }
         dse_reset();
         audio_reset();
-        remap_on_disconnect();
         if (was_connected) {
             conn_led_start_us = bflb_mtimer_get_time_us();
             conn_led_off = false;
         }
         if (!conn_led_off)
             led_status_set(was_connected ? LED_RED_BLINK : LED_PURPLE_BLINK_SLOW);
-        if (scan_after_disconnect) {
+        if (state == BT_HID_STATE_IDLE && scan_after_disconnect) {
             scan_after_disconnect = false;
             LOG_INF("[MAIN] State: IDLE — button-triggered rescan\n");
             bt_hid_host_scan_start(0);
         } else {
-            LOG_INF("[MAIN] State: IDLE\n");
+            LOG_INF("[MAIN] State: %s\n",
+                    state == BT_HID_STATE_IDLE ? "IDLE" : "DISCONNECTING");
         }
         break;
     }
@@ -584,7 +607,6 @@ static void bt_task(void *arg)
     uint8_t usb_out[USB_OUTPUT_BUF_SZ];
     uint16_t idle_ticks = 0;
     uint16_t loop_count = 0;
-    uint64_t disconnecting_since = 0;
     uint64_t stale_conn_since = 0;
     uint16_t scan_retry_ticks = 0;   /* counts idle ticks since last scan */
     uint8_t  scan_fail_count = 0;    /* consecutive scans with 0 results */
@@ -741,19 +763,12 @@ static void bt_task(void *arg)
             }
         }
 
-        /* Fallback: if DISCONNECTING for >1.5 seconds, the remote is dead.
-         * Force cleanup to return to IDLE. */
-        if (bt_hid_host_get_state() == BT_HID_STATE_DISCONNECTING) {
-            if (disconnecting_since == 0)
-                disconnecting_since = bflb_mtimer_get_time_us();
-            else if ((bflb_mtimer_get_time_us() - disconnecting_since)
-                     > 1500000ULL) {
-                LOG_WRN("[BT_TASK] DISCONNECTING stuck >1.5s, forcing cleanup\n");
-                bt_hid_host_force_disconnect();
-                disconnecting_since = 0;
-            }
-        } else {
-            disconnecting_since = 0;
+        /* The BT task owns disconnect requests and waits for SDK channel
+         * cleanup before reopening the connection. Keep polling even when
+         * USB/audio tasks detect the loss first. */
+        if (bt_hid_host_poll_disconnect()) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
         }
 
         /* Deferred USB soft-disconnect: if BT disconnected and no reconnection
@@ -1098,7 +1113,7 @@ static void usb_task(void *arg)
 
         /* Connection watchdog: if connected and we've received at least one
          * report, but then nothing for 3s → controller likely powered off.
-         * Use force_disconnect to bypass HCI ACK (dead controller can't ACK). */
+         * Queue teardown to the BT task; never recycle live SDK channels here. */
         if (ds5_connected && usb_fwd_count > 0 &&
             (bflb_mtimer_get_time_us() - last_input_us) > CONN_WATCHDOG_US) {
             LOG_WRN("[MAIN] Watchdog: no input for 3s, force disconnect\n");
@@ -1108,7 +1123,11 @@ static void usb_task(void *arg)
         }
 
         TickType_t wait = pdMS_TO_TICKS(10);
-        if (xQueueReceive(input_queue, raw_report, wait) == pdTRUE) {
+        BaseType_t input_ready = xQueueReceive(input_queue, raw_report, wait);
+        /* Also discard a report dequeued just before the disconnect callback.
+         * A quick reconnect cannot cancel the pending neutral frame. */
+        bool released_input = process_input_release();
+        if (input_ready == pdTRUE && !released_input && ds5_connected) {
             last_input_us = bflb_mtimer_get_time_us();
             usb_fwd_count++;
             if (usb_fwd_count == 1)
@@ -1335,6 +1354,9 @@ static void usb_task(void *arg)
             }
         }
 
+        /* Some input actions can yield (e.g. volume repeats). If loss occurred
+         * mid-report, publish neutral after that report, never before it. */
+        process_input_release();
         if (!ds5_connected) {
             last_activity_us = bflb_mtimer_get_time_us();
             inactive_disconnected = false;

@@ -87,15 +87,23 @@ void bt_hid_host_scan_stop(void);
 int bt_hid_host_connect(const uint8_t *addr);
 
 /**
- * Disconnect the current device (graceful — waits for HCI ACK).
+ * Request a disconnect. The BT task sends HCI and owns teardown.
  */
 void bt_hid_host_disconnect(void);
 
 /**
- * Force disconnect — immediately cleans up state without waiting for
- * HCI ACK. Use when the remote device is unresponsive (powered off).
+ * Request teardown when the remote is unresponsive. Repeated calls do not
+ * restart the deadline or release storage still owned by SDK callbacks.
  */
 void bt_hid_host_force_disconnect(void);
+
+/**
+ * Process disconnect requests and deferred SDK cleanup. Call only from the
+ * BT task. Keeps channel storage reserved until the SDK releases its refs;
+ * resets the adapter if teardown cannot finish within the bounded deadline.
+ * @return true if teardown was processed (including final cleanup)
+ */
+bool bt_hid_host_poll_disconnect(void);
 
 /**
  * Send an output report (e.g. LED, rumble) to the connected device.
@@ -263,8 +271,7 @@ bool bt_hid_host_poll_incoming_l2cap_fallback(void);
 bool bt_hid_host_has_pending_conn(void);
 
 /**
- * Force-release a stale ACL connection object that conn_disconnected
- * never cleaned up. Call only as a last-resort fallback.
+ * Request bounded recovery of a stale ACL. Does not release live SDK storage.
  */
 void bt_hid_host_drop_stale_conn(void);
 
