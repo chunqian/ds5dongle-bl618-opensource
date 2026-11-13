@@ -244,6 +244,7 @@ static struct {
     struct {
         TickType_t last_attempt, probe_tick;
         bool attempted;
+        volatile bool primer_done, detection_ready;
         volatile uint8_t sent;
         uint8_t attempts[4], probe_attempts;
     } handshake;
@@ -479,9 +480,34 @@ static void handshake_begin(void)
     set_state(BT_HID_STATE_HANDSHAKE);
 }
 
+/* RX may identify the controller before GET 0x70 returns in the BT task.
+ * Finish the initial GET batch and state/0x32 first, as in DS5Dongle's
+ * channel-open handler, before unlocking Edge or exposing CONNECTED. */
+static void handshake_finish_detection(void)
+{
+    taskENTER_CRITICAL();
+    if (hid_ctx.state != BT_HID_STATE_HANDSHAKE ||
+        !hid_ctx.handshake.primer_done || !hid_ctx.handshake.detection_ready ||
+        !hid_ctx.conn || !hid_ctx.ctrl_connected || !hid_ctx.intr_connected) {
+        taskEXIT_CRITICAL();
+        return;
+    }
+    hid_ctx.handshake.detection_ready = false;
+    uint32_t generation = app_tx_generation;
+    bool is_dse = hid_ctx.is_dse;
+    taskEXIT_CRITICAL();
+
+    if (is_dse)
+        dse_on_edge_detected();
+    if (generation == app_tx_generation &&
+        hid_ctx.state == BT_HID_STATE_HANDSHAKE &&
+        hid_ctx.conn && hid_ctx.ctrl_connected && hid_ctx.intr_connected)
+        set_state(BT_HID_STATE_CONNECTED);
+}
+
 /* Run in the BT task. Like DS5Dongle, issue 0x09/0x20/0x22/0x05/0x70 in order
- * without waiting for earlier replies. Probe retries remain separate because
- * HID HANDSHAKE errors do not carry a report ID. */
+ * without waiting for earlier replies, then initialize state and send 0x32.
+ * Probe retries remain separate because HID HANDSHAKE errors carry no ID. */
 static void handshake_send_pending(void)
 {
     if (hid_ctx.state != BT_HID_STATE_HANDSHAKE || !hid_ctx.conn ||
@@ -529,6 +555,18 @@ static void handshake_send_pending(void)
         LOG_WRN("[HID] Edge probe send failed (%d), attempt %u\n",
                 err, hid_ctx.handshake.probe_attempts);
     }
+    if (!hid_ctx.handshake.primer_done) {
+        if (hid_ctx.primer_cb)
+            hid_ctx.primer_cb();
+        taskENTER_CRITICAL();
+        if (generation != app_tx_generation || hid_ctx.state != BT_HID_STATE_HANDSHAKE) {
+            taskEXIT_CRITICAL();
+            return;
+        }
+        hid_ctx.handshake.primer_done = true;
+        taskEXIT_CRITICAL();
+        handshake_finish_detection();
+    }
 }
 
 static int l2cap_ctrl_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
@@ -555,7 +593,8 @@ static int l2cap_ctrl_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
             hid_ctx.check_dse = false;
             hid_ctx.is_dse = false;
             LOG_INF("[HID] DualSense (non-Edge) confirmed\n");
-            set_state(BT_HID_STATE_CONNECTED);
+            hid_ctx.handshake.detection_ready = true;
+            handshake_finish_detection();
         }
         break;
 
@@ -569,15 +608,11 @@ static int l2cap_ctrl_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
                 feature_cache_store(rid, data + 2, len - 2);
                 if (rid == 0x70 && hid_ctx.state == BT_HID_STATE_HANDSHAKE &&
                     hid_ctx.check_dse) {
-                    uint32_t generation = app_tx_generation;
                     hid_ctx.check_dse = false;
                     hid_ctx.is_dse    = true;
                     LOG_INF("[HID] DualSense Edge detected\n");
-                    dse_on_edge_detected();
-                    if (generation == app_tx_generation &&
-                        hid_ctx.state == BT_HID_STATE_HANDSHAKE &&
-                        chan->conn == hid_ctx.conn)
-                        set_state(BT_HID_STATE_CONNECTED);
+                    hid_ctx.handshake.detection_ready = true;
+                    handshake_finish_detection();
                 }
             } else {
                 LOG_WRN("[HID] Feature DATA too short (len=%d), skipping\n",
@@ -656,13 +691,6 @@ static void l2cap_intr_connected(struct bt_l2cap_chan *chan)
     hid_ctx.intr_accepting = false;
     hid_ctx.intr_connected = true;
 
-
-    /* Fire primer callback immediately — equivalent to DS5Dongle's
-     * L2CAP_EVENT_CHANNEL_OPENED handler calling update_state(yellow).
-     * This is the earliest possible moment to send the 0x32 primer. */
-    if (hid_ctx.primer_cb)
-        hid_ctx.primer_cb();
-
     /* Successful L2CAP HID open removes this MAC from the blacklist,
      * treating it as an explicit user re-pair (PS+Share mode). */
     if (hid_ctx.conn) {
@@ -696,7 +724,7 @@ static void l2cap_intr_connected(struct bt_l2cap_chan *chan)
         }
     }
 
-    /* The BT task issues initialization GETs; RX callbacks only collect data. */
+    /* The BT task sends the initial GET batch followed by the 0x32 primer. */
     handshake_begin();
 
 }

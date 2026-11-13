@@ -47,9 +47,9 @@ enum bt_hid_host_state {
 
 typedef void (*bt_hid_input_cb_t)(const uint8_t *data, uint16_t len);
 typedef void (*bt_hid_state_cb_t)(enum bt_hid_host_state state);
-/* Called immediately when HID interrupt L2CAP channel opens —
- * equivalent to DS5Dongle's L2CAP_EVENT_CHANNEL_OPENED handler.
- * Use this to send the initial 0x32 primer as early as possible. */
+/* Called once in the BT task after the initial GET 09/20/22/05/70 batch.
+ * Initialize state and send 0x32 here, before type detection is finalized,
+ * matching DS5Dongle's init_feature() -> state_init() -> bt_write(0x32). */
 typedef void (*bt_hid_primer_cb_t)(void);
 
 struct bt_hid_host_config {

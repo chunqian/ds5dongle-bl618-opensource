@@ -264,7 +264,7 @@ static void cache_output_state(const uint8_t *set_state_data)
     }
 }
 
-/* Send the 0x32 LED primer — shared by primer_cb and reconnect handler */
+/* Send the 0x32 LED primer — initial state and later USB LED restoration. */
 static void send_led_primer(void)
 {
     state_mgr_init(init_set_state, DS5_USB_OUTPUT_PAYLOAD_LEN);
@@ -303,12 +303,13 @@ static void send_led_primer(void)
     bt_hid_host_send_output(buf, DS5_BT_OUTPUT_EXT_SIZE);
 }
 
-/* Called from l2cap_intr_connected (earliest possible moment, pre-HANDSHAKE).
- * Sends the 0x32 primer to the controller immediately when L2CAP opens. */
+/* Called after the initial Feature GET batch, before completing detection. */
 static void on_hid_primer(void)
 {
     send_led_primer();
-    LOG_INF("[MAIN] Primer sent from l2cap_intr_connected\n");
+    if (usb_audio_is_active())
+        state_mgr_set_spk_active(true);
+    LOG_INF("[MAIN] Initial 0x32 sent after Feature GETs\n");
 }
 
 static void on_hid_input(const uint8_t *data, uint16_t len)
@@ -413,14 +414,8 @@ static void on_hid_state(enum bt_hid_host_state state)
 
     case BT_HID_STATE_HANDSHAKE: {
         connecting_start_tick = 0;
-        /* primer_cb already fired from l2cap_intr_connected (earliest possible).
-         * Re-send here in case the state machine order differs on some reconnects.
-         * Also update audio active state. */
-        send_led_primer();
-        if (usb_audio_is_active())
-            state_mgr_set_spk_active(true);
         handshake_start_us = bflb_mtimer_get_time_us();
-        LOG_INF("[MAIN] State: HANDSHAKE (0x32 sent)\n");
+        LOG_INF("[MAIN] State: HANDSHAKE\n");
         break;
     }
 
@@ -442,7 +437,6 @@ static void on_hid_state(enum bt_hid_host_state state)
             if (usb_deferred_disc_us) {
                 usb_deferred_disc_us = 0;
                 LOG_INF("[MAIN] Deferred disconnect cancelled — USB stayed connected\n");
-                send_led_primer();
             } else {
                 usb_soft_connect();
                 LOG_INF("[MAIN] USB replug (was disconnected)\n");
@@ -454,10 +448,6 @@ static void on_hid_state(enum bt_hid_host_state state)
             stealth_primer_countdown = 5;
             LOG_INF("[MAIN] Stealth: primer pending after 5 USB output frames\n");
             usb_soft_connect();
-        } else {
-            /* First connection, non-stealth: USB already connected & enumerated.
-             * Just send primer directly — game already has its session. */
-            send_led_primer();
         }
 
         ds5_connected = true;
