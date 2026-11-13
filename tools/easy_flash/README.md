@@ -1,6 +1,6 @@
 # LCTech BL616 简易烧录包
 
-为已验证的 `3.18H-HidAudio-R2` HS 固件生成一个离线 ZIP。用户完整解压后，
+为已验证的 `3.18H-HidAudio-R6` HS 固件生成一个离线 ZIP。用户完整解压后，
 双击 `Flash-Mac.command` 或 `Flash-Windows.bat`，按住 BOOT 插入设备并按回车，
 即可自动选择下载端口、烧录和校验。详细使用说明见 `USAGE.txt`。
 
@@ -42,14 +42,47 @@ build/native_flasher_portable_venv/bin/python tools/easy_flash/build_native_maco
 python3 tools/easy_flash/build_package.py
 ```
 
+使用本机 Xcode 配置的签名证书构建签名包：
+
+```sh
+security find-identity -v -p codesigning
+python3 tools/easy_flash/build_package.py --sign-identity '证书的 SHA-1 或完整名称'
+```
+
+签名覆盖 ARM64 程序及全部 Mach-O 运行库、Intel 程序、双架构端口检测程序。
+签名完成后才生成文件哈希清单，避免签名导致启动校验失效。`signing-info.json`
+记录各文件的签名身份、Team ID 和签名后的 SHA-256；产物名称追加 `-Signed`。
+`.command` 和 `.sh` 保持启动脚本形式，未转换为 `.app`。Apple Development
+是开发签名，不等同于 Developer ID 分发签名；构建器不执行苹果公证。
+
+### 在另一台 Mac 上做 Developer ID 签名和公证
+
+运行 `python3 tools/easy_flash/build_signing_kit.py`，生成
+`build/easy_flash/DS5Dongle-R6-Mac-Signing-Kit.zip`。它包含现成的 R6 烧录包、
+`Sign-Mac.command` 和 Python 标准库签名脚本，无需在目标 Mac 安装 SDK 或重编固件。
+目标 Mac 需要 Xcode 14+、Python 3.9+ 和本地 **Developer ID Application 证书及私钥**；
+仅有 Managed 云托管证书不能用于此命令行流程。
+
+完整解压后双击 `Sign-Mac.command`，选择只签名或签名并公证。
+命令行支持 `--check`、`--sign-only`、`--notarize`、`--identity SHA1`、
+`--profile DS5DongleNotary`、`--resume output/release-xxxx`。
+详见 `SIGNING.txt`。原包保持不变；结果、提交编号和日志保存在独立输出目录。
+只在 Apple 返回 Accepted、票据附加完成、Gatekeeper 检查通过后标记 `notarized`。
+重新签名后同步更新运行文件哈希，固件字节保持不变。
+
+Intel 原厂 onefile 内含不同 Team ID 的 Python 库，开启 Hardened Runtime 后需要
+`disable-library-validation`；此例外只用于 Intel 烧录程序。ARM64 外部运行库逐个
+统一签名，不添加这个例外。脚本会做原生架构环境检查与离线镜像校验，不写串口。
+DMG 用户需先复制完整烧录目录到可写位置，再运行 `.command` 启动脚本。
+
 产物位于 `build/easy_flash/`，名称以 `Flash-NativeMac` 结尾，包括 ZIP 和解压目录。
 Intel Mac 和 Windows 保留 SDK 原厂 1.4.2 程序；ARM64 使用上述开源 1.0.0 程序。
 脚本从固定 SDK 提交读取原厂程序及配置；Git 部分克隆缺少对象时，首次生成可能需要联网。既有芯片运行日志、
 生成的 Flash 镜像和本地 loader 配置不会被复制。
 
-脚本固定校验此前实机通过的 R2 固件 SHA-256，避免把普通版或错误版本误装进包。
+脚本固定校验此前实机通过的 R6 固件 SHA-256，避免把普通版或错误版本误装进包。
 新固件发布时须明确更新 `VERSION`、`FIRMWARE_SHA`、`NAME` 和使用说明，并重新验证。
-源码需先提交，生成器会拒绝 `src/`、`CMakeLists.txt` 中与 HEAD 不符的改动。
+固件源码需先提交，生成器会拒绝 `src/`、`CMakeLists.txt`、`cmake/` 中与 HEAD 不符的改动。
 
 解压包里的 `source/firmware-source.tar.gz` 是固件仓库源码快照。
 如需从该快照继续开发，将 `source/easy_flash/` 复制到源码的 `tools/easy_flash/`，
@@ -60,7 +93,7 @@ Intel Mac 和 Windows 保留 SDK 原厂 1.4.2 程序；ARM64 使用上述开源 
 ```sh
 bash -n tools/easy_flash/*.sh tools/easy_flash/Flash-Mac.command
 python3 tools/easy_flash/test_package.py \
-  --package build/easy_flash/DS5Dongle-LCTech616-HS-HidAudio-R2-Flash-NativeMac \
+  --package build/easy_flash/DS5Dongle-LCTech616-HS-HidAudio-R6-Flash-NativeMac-Signed \
   --pwsh /path/to/pwsh
 ```
 
@@ -73,11 +106,8 @@ python3 tools/easy_flash/test_package.py \
 Windows 脚本仅使用 5.1 已有语法和系统命令；安装包的 `package-info.json` 如实记录
 Windows 和 ARM64 硬件验证状态。两个 Mac 程序均可用 `--build` 检查完整固件组合，
 不进行串口写入。发布验证还应对比两者生成的 `whole_flash_data.bin` 是否逐字节一致。
-ARM64 程序本机启动及生成镜像通过，不能替代真实适配器烧录验收。
-
-本次 R2 两种 Mac 程序生成的镜像均为 832000 字节，SHA-256 为
-`7ad2683db7a098ddd2f133e5d4bd61f336cdc51304045fb10f67c225fe69d268`；
-已在中文/空格路径和不含开发工具的 PATH 中验证 ARM64 独立运行。
+R6 固件已使用同版本 ARM64 后端完成真实适配器烧录与回读校验。签名后的
+新工具仍需单独验证启动、签名和离线镜像；这些检查不能替代 Windows 实机验收。
 
 实现要点：只识别 `349B:6160`，多个下载口时不猜选；使用 `erase=1`；文件校验失败
 不调用烧录程序；只有进程成功、三段校验完成且固件主机/设备 SHA-256 一致才报成功。

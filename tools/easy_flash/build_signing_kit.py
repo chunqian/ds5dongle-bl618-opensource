@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Bundle an existing verified R6 ZIP and a portable Mac signing script."""
+import argparse
+import json
+from pathlib import Path
+import shutil
+import tempfile
+import zipfile
+
+from build_package import FIRMWARE_SHA, NAME, VERSION
+from sign_macos_release import extract_package, sha, verify_package
+
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parents[1]
+KIT = 'DS5Dongle-R6-Mac-Signing-Kit'
+# Both the ARM64 and Intel backends produced this exact image in offline validation.
+IMAGE_SHA = 'f096a323dfb8e6f4f2229a6652400b91cd4b7d319e8c8f1ab1d0c34dd5a1ff8e'
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--package', type=Path,
+                        default=REPO / 'build/easy_flash' / (NAME + '-Signed.zip'))
+    parser.add_argument('--output', type=Path, default=REPO / 'build/easy_flash')
+    args = parser.parse_args()
+    archive = args.package.resolve()
+    args.output.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='ds5-sign-kit-') as temporary:
+        base = Path(temporary)
+        package = extract_package(archive, base / 'verify')
+        verify_package(package, FIRMWARE_SHA)
+        if (package / 'firmware/version.txt').read_text().strip() != VERSION:
+            raise SystemExit('R6 version mismatch')
+        kit = base / KIT
+        (kit / 'payload').mkdir(parents=True)
+        shutil.copyfile(archive, kit / 'payload' / archive.name)
+        for name in ('Sign-Mac.command', 'sign_macos_release.py'):
+            shutil.copyfile(HERE / name, kit / name)
+            (kit / name).chmod(0o755)
+        shutil.copyfile(HERE / 'SIGNING.txt', kit / '签名说明.txt')
+        config = {'archive': archive.name, 'archive_sha256': sha(archive),
+                  'version': VERSION, 'firmware_sha256': FIRMWARE_SHA,
+                  'offline_image_sha256': IMAGE_SHA}
+        (kit / 'signing-input.json').write_text(json.dumps(config, indent=2) + '\n')
+        output = args.output / (KIT + '.zip')
+        with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as zipped:
+            for path in sorted(kit.rglob('*')):
+                if path.is_file():
+                    zipped.write(path, path.relative_to(base))
+        (args.output / (KIT + '.zip.sha256')).write_text(f'{sha(output)}  {output.name}\n')
+        print(output.resolve())
+        print(f'SHA-256: {sha(output)}')
+        print(f'Size: {output.stat().st_size / 1024 / 1024:.1f} MiB')
+
+
+if __name__ == '__main__':
+    main()

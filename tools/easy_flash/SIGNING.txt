@@ -1,0 +1,61 @@
+DS5Dongle R6 — 在另一台 Mac 上签名及苹果公证
+
+本目录已带上完整 R6 HS 烧录包，无需重新编译固件、安装 SDK、Homebrew 或 pip 依赖。
+签名电脑需要 Xcode 14 或更新、Xcode 提供的 Python 3.9 或更新，以及联网。
+本脚本不烧录设备；只检查签名、生成离线镜像、打包和公证。
+
+先确认：MacBook Air 钥匙串里必须有本地 Developer ID Application 证书及私钥。
+如果只有 Developer ID Application Managed 云托管证书，本脚本不能使用它；
+换电脑不能绕过这个限制。需要 Account Holder 创建本地证书，或导入含私钥的 .p12。
+Apple Development 和 Apple Distribution 也不能替代 Developer ID Application。
+
+使用
+1. 将整个 ZIP AirDrop 到 MacBook Air，完整解压到“下载”或“桌面”的可写目录。
+2. 双击 Sign-Mac.command。
+3. 自动选择唯一的 Developer ID Application；有多张时按提示选择。
+4. 选择“1. 签名并提交 Apple 公证”（默认），或“2. 只签名”。
+5. 如果提示私钥访问权限，允许本次 codesign 使用该证书私钥。
+6. 公证需要钥匙串凭据 DS5DongleNotary。首次缺失时脚本询问 Apple 账号邮箱，
+   再由 notarytool 安全提示输入 App 专用密码；不会写入脚本或日志。
+   App 专用密码在 https://account.apple.com/ 的“登录与安全”中生成。
+7. 结果和日志在同目录 output/release-xxxx。只有显示“公证通过，票据已附加，
+   Gatekeeper 验证通过”，且 release-result.json 的 status 为 notarized，才算公证完成。
+
+输出 DMG 面向 Mac。打开 DMG 后，把整个 DS5Dongle 文件夹复制到“下载”或“桌面”，
+再运行 Flash-Mac.command；工具需要在其目录下写烧录日志，不能直接在只读 DMG 中烧录。
+Windows 程序不作修改；Windows 用户继续使用原有 R6 ZIP。
+签名脚本保留 .command 启动方式，不会将其变成 .app；macOS 仍可能显示首次打开确认。
+
+终端用法（先 cd 到解压后的签名工具目录）
+  ./Sign-Mac.command --check
+  ./Sign-Mac.command --sign-only
+  ./Sign-Mac.command --notarize
+  ./Sign-Mac.command --notarize --identity "证书SHA-1" --profile "你的公证凭据名"
+
+提前配置公证凭据（在终端交互输入账号、Team ID 和 App 专用密码）
+  xcrun notarytool store-credentials "DS5DongleNotary"
+
+公证等待超时、网络中断，或先只签名后再公证
+  ./Sign-Mac.command --resume "output/release-xxxx"
+已有 submission_id 时会查询同一次提交，不会重复上传；DMG 改变后拒绝沿用旧记录。
+若 Apple 返回 Invalid，请检查输出目录的 notary-log.json，修正原因后重新签名。
+未通过公证的结果不会标为 notarized。Apple 返回 Accepted 后还要附加票据并验证。
+若上传已经完成但因断网未收到 submission_id，可用 notarytool history 找回记录；
+重新提交可能产生重复记录，但不会影响旧证书或已有公证。
+
+处理细节
+- 先核对输入 ZIP、固件及全部运行文件哈希，只在新建的输出目录处理，不修改原包。
+- 逐个签名 Mac 可执行程序和运行库，开启 Hardened Runtime、使用安全时间戳。
+- 原厂 Intel onefile 内含不同 Team ID 的 Python 库，只有这个可执行程序设置
+  com.apple.security.cs.disable-library-validation；不修改其中的上游代码。
+  ARM64 的所有外部运行库会统一签名，不需要这个例外。
+- 重新生成 asset-hashes.txt、native-info.json 和签名元数据，避免重新签名后校验失败。
+- 只在当前 Mac 的原生架构运行环境检查和离线镜像生成，核对已验证的镜像 SHA-256。
+  ARM64/Intel 另一架构的签名会检查，但最终仍应分别实机验证。
+- 公证日志和最终状态放在 DMG 外，公证成功后不会改动 DMG 内的签名材料。
+  包内 signing-info.json 的 notarized=null 表示打包时尚无公证结果，以外部 release-result.json 为准。
+- 签名/公证失败时保留日志；不自动撤销或创建证书，也不关闭 Gatekeeper。
+
+上游文档
+https://developer.apple.com/help/account/certificates/create-developer-id-certificates/
+https://developer.apple.com/documentation/security/customizing-the-notarization-workflow

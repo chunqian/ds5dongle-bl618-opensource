@@ -1,11 +1,12 @@
 """Exercise launchers with a fake flasher; never opens or writes a real device.
 
-python3 tools/easy_flash/test_package.py --package build/easy_flash/DS5Dongle-LCTech616-HS-HidAudio-R2-Flash-NativeMac --pwsh /path/to/pwsh
+python3 tools/easy_flash/test_package.py --package build/easy_flash/DS5Dongle-LCTech616-HS-HidAudio-R6-Flash-NativeMac-Signed --pwsh /path/to/pwsh
 PowerShell on macOS validates script logic, not Windows drivers/native flashing.
 """
 from pathlib import Path
 import argparse
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -125,6 +126,25 @@ def main():
     parser.add_argument('--pwsh', type=Path, required=True)
     args = parser.parse_args()
     package, pwsh = args.package.resolve(), args.pwsh.resolve()
+    if (package / 'signing-info.json').exists():
+        signing = json.loads((package / 'signing-info.json').read_text())
+        actual_macho = set()
+        for folder in ('app', 'tools/macos', 'tools/macos-arm64'):
+            for path in (package / folder).rglob('*'):
+                if path.is_file() and 'Mach-O' in subprocess.check_output(['file', '-b', str(path)], text=True):
+                    actual_macho.add(path.relative_to(package).as_posix())
+        assert actual_macho == {entry['path'] for entry in signing['files']}
+        for entry in signing['files']:
+            path = package / entry['path']
+            assert digest(path) == entry['sha256'], entry['path']
+            subprocess.run(['codesign', '--verify', '--strict', '--all-architectures', str(path)], check=True)
+            details = subprocess.check_output(['codesign', '-d', '--verbose=2', str(path)],
+                                              stderr=subprocess.STDOUT, text=True)
+            assert 'Authority=' + entry['authority'] in details
+            assert 'TeamIdentifier=' + entry['team_identifier'] in details
+        native = json.loads((package / 'tools/macos-arm64/native-info.json').read_text())
+        assert native['executable_sha256'] == digest(package / 'tools/macos-arm64/BLFlashCommand-macos')
+        print('PASS: complete Mac signature coverage, identities and signed-file hashes')
     for hardware, process, expected in [('1','arm64','macos-arm64'), ('1','x86_64','macos-arm64'),
                                         ('0','x86_64','macos'), ('','arm64','macos-arm64')]:
         actual = subprocess.check_output(['/bin/bash','-c','source "$1"; mac_tool_subdir "$2" "$3"',
