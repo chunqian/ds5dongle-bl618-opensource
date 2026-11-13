@@ -71,7 +71,7 @@ def source_snapshot(worktree):
             return subprocess.check_output(['git', '-C', str(REPO), *args], env=env)
         indexed('read-tree', revision)
         indexed('add', '-u', '--', '.')
-        indexed('add', '--', 'src', 'lib', 'tests', 'tools/easy_flash')
+        indexed('add', '--', 'src', 'lib', 'cmake', 'tests', 'tools/easy_flash')
         tree = indexed('write-tree').decode().strip()
     return revision, tree
 
