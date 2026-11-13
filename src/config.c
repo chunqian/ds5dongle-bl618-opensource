@@ -94,7 +94,7 @@ void config_load(void)
         cfg.headset_volume    = 100;
         cfg.speaker_gain      = 2;
         cfg.inactive_time     = 30;
-        cfg.disable_led       = 1;     /* auto-off LED after 1 min */
+        cfg.disable_led       = 0;     /* keep status LED enabled by default */
         cfg.polling_rate_mode = 2;     /* default real-time, new frames only */
         cfg.audio_buffer_length = 64;
         cfg.controller_mode   = 2;     /* Auto */
