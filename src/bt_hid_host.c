@@ -831,9 +831,9 @@ static void auth_pairing_complete(struct bt_conn *conn, bool bonded)
     LOG_INF("[BT] Pairing complete, bonded=%d\n", bonded);
 
     if (bonded) {
-        const bt_addr_le_t *dst = bt_conn_get_dst(conn);
-        if (dst) {
-            const bt_addr_t *addr = &dst->a;
+        /* This is BR/EDR; bt_conn_get_dst() exposes the SDK's LE layout. */
+        const bt_addr_t *addr = conn_get_br_addr(conn);
+        if (addr) {
             int idx = bonded_list_find_addr(addr);
             if (idx >= 0) {
                 active_idx = (uint8_t)idx;
