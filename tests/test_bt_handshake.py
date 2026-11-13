@@ -75,6 +75,8 @@ static unsigned critical_depth;
 #define taskEXIT_CRITICAL() do { assert(critical_depth); --critical_depth; } while (0)
 static struct {
     struct bt_conn *conn;
+    bt_addr_t target_addr;
+    bool has_target;
     enum bt_hid_host_state state;
     bool ctrl_connected, intr_connected, check_dse, is_dse;
     bool security_done, outgoing, sdp_pending;
@@ -113,7 +115,13 @@ static void dse_on_edge_detected(void) {
 }
 static void dse_on_control_packet(const uint8_t *p, uint16_t len) { (void)p; (void)len; }
 static const bt_addr_t *conn_get_br_addr(struct bt_conn *c) { return &c->addr; }
-void bt_keys_link_key_clear_addr(const bt_addr_t *a) { assert(a==&current.addr); ++deleted_keys; }
+/* Key-list synchronization is exercised by test_bt_pairing_address.py. */
+static bool pairing_addr_pending;
+static bt_addr_t pairing_addr;
+static int bt_addr_cmp(const bt_addr_t *a, const bt_addr_t *b) { return memcmp(a,b,sizeof(*a)); }
+static void bonded_list_refresh(void) {}
+static bool bonded_list_copy_active(bt_addr_t *addr) { memset(addr,0,sizeof(*addr)); return false; }
+void bt_keys_link_key_clear_addr(const bt_addr_t *a) { assert(!bt_addr_cmp(a,&current.addr)); ++deleted_keys; }
 static int bt_conn_disconnect(struct bt_conn *c, uint8_t reason) { assert(c==&current); ++disconnected; return 0; }
 void bt_hid_host_disconnect(void);
 static int l2cap_ctrl_recv(struct bt_l2cap_chan *, struct net_buf *);

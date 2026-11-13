@@ -24,7 +24,7 @@ storage = r'''
 #include "config.h"
 struct item { const char *key; uint8_t data[64]; size_t len; } items[] = {
     {"dongle_cfg"}, {"btn_remap"}, {"btn_remap_1"}, {"remap_prof"},
-    {"link_key"}, {"KEY_POOL"}, {"DS5_BLK"}, {"active_ctrl"},
+    {"link_key"}, {"KEY_POOL"}, {"DS5_BLK"}, {"active_ctrl"}, {"active_addr"},
     {"LOCAL_ID_ADDR"}, {"RF_FACTORY"}, {"factory_reset"}
 };
 static const char *fail_delete, *fail_read;
@@ -68,13 +68,13 @@ int main(void) {
     seed();assert(factory_reset_apply_pending());assert(deletes==0);
     fail_write=true;assert(!factory_reset_request());assert(!find("factory_reset")->len);
     fail_write=false;
-    for (unsigned i=0;i<9;i++) {
+    for (unsigned i=0;i<10;i++) {
         seed();assert(factory_reset_request());
-        fail_delete=i==8?"factory_reset":items[i].key;
+        fail_delete=i==9?"factory_reset":items[i].key;
         silent_delete=(i%2)==0;
         assert(!factory_reset_apply_pending());assert(find("factory_reset")->len==1);
         fail_delete=NULL;assert(factory_reset_apply_pending());
-        for(unsigned j=0;j<8;j++) assert(items[j].len==0);
+        for(unsigned j=0;j<9;j++) assert(items[j].len==0);
         assert(find("LOCAL_ID_ADDR")->len==1 && find("RF_FACTORY")->len==1);
         assert(!find("factory_reset")->len);
     }

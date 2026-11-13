@@ -153,50 +153,17 @@ static void blacklist_remove(const bt_addr_t *addr)
 /* ---------- multi-controller memory ---------- */
 
 #define MAX_BONDED_CONTROLLERS 8
-#define NV_ACTIVE_CTRL_KEY     "active_ctrl"
+#define NV_ACTIVE_CTRL_KEY     "active_ctrl" /* Legacy one-byte index. */
+#define NV_ACTIVE_ADDR_KEY     "active_addr"
 
 static bt_addr_t bonded_list[MAX_BONDED_CONTROLLERS];
 static uint8_t   bonded_count = 0;
 static uint8_t   active_idx   = 0;
-
-static void bonded_list_collect_cb(const struct bt_br_bond_info *info,
-                                   void *user_data)
-{
-    (void)user_data;
-    if (bonded_count < MAX_BONDED_CONTROLLERS) {
-        bt_addr_copy(&bonded_list[bonded_count], info->addr);
-        bonded_count++;
-    }
-}
-
-static void bonded_list_load(void)
-{
-    bonded_count = 0;
-    bt_br_foreach_bond(bonded_list_collect_cb, NULL);
-
-    size_t real_len = 0;
-    uint8_t stored_idx = 0;
-    int ret = bt_settings_get_bin(NV_ACTIVE_CTRL_KEY, &stored_idx,
-                                  sizeof(stored_idx), &real_len);
-    if (ret == 0 && real_len == 1 && stored_idx < bonded_count) {
-        active_idx = stored_idx;
-    } else {
-        active_idx = 0;
-    }
-
-    LOG_INF("[BT] Bonded list: %d controllers, active_idx=%d\n",
-           bonded_count, active_idx);
-    for (int i = 0; i < bonded_count; i++) {
-        char a[BT_ADDR_STR_LEN];
-        bt_addr_to_str(&bonded_list[i], a, sizeof(a));
-        LOG_INF("[BT]   [%d]%s %s\n", i, (i == active_idx) ? "*" : " ", a);
-    }
-}
-
-static void bonded_list_persist_idx(void)
-{
-    bt_settings_set_bin(NV_ACTIVE_CTRL_KEY, &active_idx, sizeof(active_idx));
-}
+static bt_addr_t active_addr;
+static volatile bool active_addr_dirty;
+static volatile bool bonded_refresh_pending;
+static bt_addr_t pairing_addr;
+static volatile bool pairing_addr_pending;
 
 static int bonded_list_find_addr(const bt_addr_t *addr)
 {
@@ -205,6 +172,110 @@ static int bonded_list_find_addr(const bt_addr_t *addr)
             return i;
     }
     return -1;
+}
+
+static void bonded_list_collect_cb(const struct bt_br_bond_info *info,
+                                   void *user_data)
+{
+    (void)user_data;
+    if (bonded_count < MAX_BONDED_CONTROLLERS &&
+        bonded_list_find_addr(info->addr) < 0) {
+        bt_addr_copy(&bonded_list[bonded_count], info->addr);
+        bonded_count++;
+    }
+}
+
+/* Caller holds the critical section. Persist identity, never the SDK slot. */
+static void bonded_list_select_index(uint8_t index)
+{
+    bt_addr_t selected = {{0}};
+    active_idx = bonded_count ? index : 0;
+    if (bonded_count)
+        bt_addr_copy(&selected, &bonded_list[active_idx]);
+    if (bt_addr_cmp(&active_addr, &selected) != 0) {
+        bt_addr_copy(&active_addr, &selected);
+        active_addr_dirty = true;
+    }
+}
+
+static void bonded_list_refresh(void)
+{
+    /* The SDK modifies its BR key table in RX context. Take a bounded,
+     * in-memory snapshot without letting RX change slots during enumeration. */
+    taskENTER_CRITICAL();
+    bonded_count = 0;
+    memset(bonded_list, 0, sizeof(bonded_list));
+    bt_br_foreach_bond(bonded_list_collect_cb, NULL);
+    int idx = -1;
+    if (pairing_addr_pending) {
+        idx = bonded_list_find_addr(&pairing_addr);
+        if (idx >= 0)
+            pairing_addr_pending = false;
+    }
+    if (idx < 0)
+        idx = bonded_list_find_addr(&active_addr);
+    bonded_list_select_index(idx >= 0 ? (uint8_t)idx : 0);
+    bonded_refresh_pending = false;
+    taskEXIT_CRITICAL();
+}
+
+static bool bonded_list_copy_active(bt_addr_t *addr)
+{
+    taskENTER_CRITICAL();
+    bool valid = bonded_count > 0;
+    bt_addr_copy(addr, &active_addr);
+    taskEXIT_CRITICAL();
+    return valid;
+}
+
+static void bonded_list_persist(void)
+{
+    taskENTER_CRITICAL();
+    if (!active_addr_dirty) {
+        taskEXIT_CRITICAL();
+        return;
+    }
+    bt_addr_t selected = active_addr;
+    active_addr_dirty = false;
+    taskEXIT_CRITICAL();
+
+    /* Flash writes stay outside the critical section and RX callbacks.
+     * An all-zero address records an empty list, preventing legacy resurrection. */
+    int err = bt_settings_set_bin(NV_ACTIVE_ADDR_KEY, selected.val, sizeof(selected.val));
+    if (err) {
+        active_addr_dirty = true;
+        LOG_WRN("[BT] Failed to save active controller address (%d)\n", err);
+    } else {
+        settings_delete(NV_ACTIVE_CTRL_KEY);
+    }
+}
+
+static void bonded_list_load(void)
+{
+    bt_addr_t stored = {{0}};
+    size_t real_len = 0;
+    int ret = bt_settings_get_bin(NV_ACTIVE_ADDR_KEY, stored.val,
+                                  sizeof(stored.val), &real_len);
+    bool have_address = ret == 0 && real_len == sizeof(stored.val);
+    pairing_addr_pending = false;
+    active_addr = have_address ? stored : (bt_addr_t){{0}};
+    active_addr_dirty = false;
+    bonded_list_refresh();
+
+    if (!have_address) {
+        uint8_t stored_idx = 0;
+        real_len = 0;
+        ret = bt_settings_get_bin(NV_ACTIVE_CTRL_KEY, &stored_idx,
+                                  sizeof(stored_idx), &real_len);
+        taskENTER_CRITICAL();
+        if (ret == 0 && real_len == 1 && stored_idx < bonded_count)
+            bonded_list_select_index(stored_idx);
+        active_addr_dirty = true; /* One-time migration, including an empty list. */
+        taskEXIT_CRITICAL();
+    }
+    bonded_list_persist();
+    LOG_INF("[BT] Bonded list: %d controllers, active_idx=%d\n",
+            bonded_count, active_idx);
 }
 
 /* ---------- internal state ---------- */
@@ -830,28 +901,16 @@ static void auth_pairing_complete(struct bt_conn *conn, bool bonded)
 {
     LOG_INF("[BT] Pairing complete, bonded=%d\n", bonded);
 
-    if (bonded) {
-        /* This is BR/EDR; bt_conn_get_dst() exposes the SDK's LE layout. */
+    if (conn == hid_ctx.conn && bonded) {
+        /* Pairing Complete may precede Link Key Notify. Remember the peer,
+         * but only select it once the SDK actually has its key. */
         const bt_addr_t *addr = conn_get_br_addr(conn);
         if (addr) {
-            int idx = bonded_list_find_addr(addr);
-            if (idx >= 0) {
-                active_idx = (uint8_t)idx;
-            } else {
-                /* link_key_notify may not have fired yet, so
-                 * bt_br_foreach_bond won't find the new key.
-                 * Manually add this address to bonded_list. */
-                if (bonded_count < MAX_BONDED_CONTROLLERS) {
-                    bt_addr_copy(&bonded_list[bonded_count], addr);
-                    active_idx = bonded_count;
-                    bonded_count++;
-                } else {
-                    active_idx = 0;
-                }
-            }
-            bonded_list_persist_idx();
-            LOG_INF("[BT] Active controller updated: idx=%d, total=%d\n",
-                   active_idx, bonded_count);
+            taskENTER_CRITICAL();
+            bt_addr_copy(&pairing_addr, addr);
+            pairing_addr_pending = true;
+            bonded_refresh_pending = true;
+            taskEXIT_CRITICAL();
         }
     }
 }
@@ -865,7 +924,14 @@ static void clear_rejected_key(struct bt_conn *conn, enum bt_security_err err)
     const bt_addr_t *remote = conn_get_br_addr(conn);
     if (remote) {
         extern void bt_keys_link_key_clear_addr(const bt_addr_t *addr);
-        bt_keys_link_key_clear_addr(remote);
+        bt_addr_t rejected = *remote;
+        bt_keys_link_key_clear_addr(&rejected);
+        taskENTER_CRITICAL();
+        if (pairing_addr_pending && bt_addr_cmp(&pairing_addr, &rejected) == 0)
+            pairing_addr_pending = false;
+        taskEXIT_CRITICAL();
+        bonded_list_refresh();
+        hid_ctx.has_target = bonded_list_copy_active(&hid_ctx.target_addr);
         LOG_WRN("[BT] Explicit authentication failure: cleared rejected key\n");
     }
 }
@@ -961,6 +1027,7 @@ static void conn_connected(struct bt_conn *conn, uint8_t err)
 
     if (err) {
         LOG_ERR("[BT] Connection failed: 0x%02x\n", err);
+        bonded_refresh_pending = true;
         if (hid_ctx.conn != NULL && conn != hid_ctx.conn)
             return;
         hid_ctx.conn = NULL;
@@ -1034,6 +1101,8 @@ static void conn_disconnected(struct bt_conn *conn, uint8_t reason)
            "state=%d fallback_retry=%d\n",
            conn, hid_ctx.conn, reason, hid_ctx.state, hid_ctx.fallback_retry);
 
+    bonded_list_refresh();
+    bonded_refresh_pending = true;
     if (conn != hid_ctx.conn) {
         LOG_INF("[BT] Old ACL teardown complete (unowned conn, reason 0x%02x, "
                "state=%d)\n", reason, hid_ctx.state);
@@ -1046,6 +1115,9 @@ static void conn_disconnected(struct bt_conn *conn, uint8_t reason)
         return;
     }
 
+    taskENTER_CRITICAL();
+    pairing_addr_pending = false;
+    taskEXIT_CRITICAL();
     const char *r_str = reason == 0x08 ? "CONN_TIMEOUT" :
                         reason == 0x13 ? "REMOTE_USER" :
                         reason == 0x16 ? "LOCAL_HOST" : "OTHER";
@@ -1091,9 +1163,8 @@ static void conn_disconnected(struct bt_conn *conn, uint8_t reason)
 
     LOG_INF("[BT] conn_disconnected: fallback_retry=%d bonded_count=%d\n",
            hid_ctx.fallback_retry, bonded_count);
-    if (hid_ctx.fallback_retry && bonded_count > 0) {
+    if (hid_ctx.fallback_retry && bonded_list_copy_active(&hid_ctx.pending_addr)) {
         hid_ctx.fallback_retry = false;
-        memcpy(hid_ctx.pending_addr.val, bonded_list[active_idx].val, 6);
         hid_ctx.connect_pending = true;
         hid_ctx.connect_pending_tick = xTaskGetTickCount();
         LOG_INF("[BT] Fallback: outgoing connect scheduled (ACL already down)\n");
@@ -1818,23 +1889,8 @@ int bt_hid_host_connect(const uint8_t *addr)
     set_state(BT_HID_STATE_CONNECTING);
     LOG_DBG("[BT] connect [3] state=CONNECTING, outgoing=true\n");
 
-    /* Clear link key only for devices NOT in our bonded list (fresh discovery).
-     * For bonded devices (fallback retry / reconnection), keep the key. */
-    {
-        bool is_bonded = false;
-        for (uint8_t i = 0; i < bonded_count; i++) {
-            if (bt_addr_cmp(&bonded_list[i], &bt_addr) == 0) {
-                is_bonded = true;
-                break;
-            }
-        }
-        if (!is_bonded) {
-            extern void bt_keys_link_key_clear_addr(const bt_addr_t *addr);
-            bt_keys_link_key_clear_addr(&bt_addr);
-            LOG_INF("[BT] Cleared stale link key for outgoing connection "
-                   "(fresh SSP)\n");
-        }
-    }
+    /* The SDK answers Link Key Request from its actual key store. Do not
+     * delete a valid key based on a potentially older application snapshot. */
 
     LOG_DBG("[BT] connect [4] bt_conn_create_br...\n");
     /* Disable page scan before paging — BL616 HCI controller can't do both */
@@ -1909,9 +1965,13 @@ void bt_hid_host_force_disconnect(void)
 
     LOG_INF("[BT] force_disconnect: fallback_retry=%d bonded_count=%d\n",
            hid_ctx.fallback_retry, bonded_count);
-    if (hid_ctx.fallback_retry && bonded_count > 0) {
+    bonded_list_refresh();
+    taskENTER_CRITICAL();
+    pairing_addr_pending = false;
+    bonded_refresh_pending = true;
+    taskEXIT_CRITICAL();
+    if (hid_ctx.fallback_retry && bonded_list_copy_active(&hid_ctx.pending_addr)) {
         hid_ctx.fallback_retry = false;
-        memcpy(hid_ctx.pending_addr.val, bonded_list[active_idx].val, 6);
         hid_ctx.connect_pending = true;
         hid_ctx.connect_pending_tick = (TickType_t)UINT32_MAX;
         LOG_INF("[BT] Fallback: outgoing connect pending (waiting for ACL teardown)\n");
@@ -1949,6 +2009,11 @@ void bt_hid_host_drop_stale_conn(void)
 
     feature_cache_clear();
 
+    bonded_list_refresh();
+    taskENTER_CRITICAL();
+    pairing_addr_pending = false;
+    bonded_refresh_pending = true;
+    taskEXIT_CRITICAL();
     set_state(BT_HID_STATE_IDLE);
 
     if (switch_pending) {
@@ -2116,15 +2181,15 @@ int bt_hid_host_try_reconnect(void)
     if (hid_ctx.state != BT_HID_STATE_IDLE)
         return -1;
 
-    if (bonded_count == 0) {
+    bonded_list_refresh();
+    bt_addr_t selected;
+    if (!bonded_list_copy_active(&selected)) {
+        hid_ctx.has_target = false;
         LOG_INF("[BT] No bonded BR/EDR device found\n");
         return -1;
     }
 
-    if (active_idx >= bonded_count)
-        active_idx = 0;
-
-    bt_addr_t *addr = &bonded_list[active_idx];
+    const bt_addr_t *addr = &selected;
     char addr_str[BT_ADDR_STR_LEN];
     bt_addr_to_str(addr, addr_str, sizeof(addr_str));
 
@@ -2141,16 +2206,22 @@ int bt_hid_host_try_reconnect(void)
 
 int bt_hid_host_switch_next(void)
 {
+    bonded_list_refresh();
+    taskENTER_CRITICAL();
     if (bonded_count <= 1) {
+        taskEXIT_CRITICAL();
         LOG_INF("[BT] switch_next: only %d bonded, nothing to switch\n",
                bonded_count);
         return -1;
     }
 
-    active_idx = (active_idx + 1) % bonded_count;
-    bonded_list_persist_idx();
+    pairing_addr_pending = false; /* Explicit user selection supersedes pairing. */
+    bonded_list_select_index((active_idx + 1) % bonded_count);
+    bt_addr_t selected = active_addr;
+    taskEXIT_CRITICAL();
+    bonded_list_persist();
 
-    bt_addr_t *addr = &bonded_list[active_idx];
+    const bt_addr_t *addr = &selected;
     bt_addr_copy(&hid_ctx.target_addr, addr);
     hid_ctx.has_target = true;
 
@@ -2206,6 +2277,7 @@ bool bt_hid_host_is_switching(void)
 
 uint8_t bt_hid_host_get_bonded_count(void)
 {
+    bonded_list_refresh();
     return bonded_count;
 }
 
@@ -2251,9 +2323,12 @@ void bt_hid_host_clear_bonds(void)
     blacklist_dirty = false;
     LOG_INF("[BT] All link keys and blacklist cleared\n");
 
-    bonded_count = 0;
-    active_idx = 0;
-    bonded_list_persist_idx();
+    taskENTER_CRITICAL();
+    pairing_addr_pending = false;
+    taskEXIT_CRITICAL();
+    bonded_list_refresh();
+    active_addr_dirty = true;
+    bonded_list_persist();
 
     hid_ctx.has_target = false;
     memset(&hid_ctx.target_addr, 0, sizeof(hid_ctx.target_addr));
@@ -2333,6 +2408,9 @@ int bt_hid_host_set_feature_crc(uint8_t report_id, const uint8_t *data,
 
 void bt_hid_host_persist_if_dirty(void)
 {
+    if (bonded_refresh_pending || pairing_addr_pending)
+        bonded_list_refresh();
+    bonded_list_persist();
     if (blacklist_dirty) {
         blacklist_dirty = false;
         blacklist_persist();
