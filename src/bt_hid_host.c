@@ -242,7 +242,7 @@ static struct {
     volatile TickType_t security_done_tick;
 
     struct {
-        TickType_t started, last_attempt, probe_tick;
+        TickType_t last_attempt, probe_tick;
         bool attempted;
         volatile uint8_t sent, received;
         uint8_t attempts[4], probe_attempts;
@@ -473,19 +473,17 @@ static const uint8_t handshake_ids[] = {
     0x22, DS5_FEATURE_REPORT_CALIBRATION
 };
 #define HANDSHAKE_RETRY_TICKS pdMS_TO_TICKS(100)
-#define HANDSHAKE_SETTLE_TICKS pdMS_TO_TICKS(1000)
 #define HANDSHAKE_PROBE_TICKS pdMS_TO_TICKS(1000)
 
 static void handshake_begin(void)
 {
     memset(&hid_ctx.handshake, 0, sizeof(hid_ctx.handshake));
-    hid_ctx.handshake.started = xTaskGetTickCount();
     hid_ctx.check_dse = true;
     set_state(BT_HID_STATE_HANDSHAKE);
 }
 
-/* Run in the BT task. Like DS5Dongle, issue the initialization GETs without
- * chaining each send to the previous response. Keep the type probe separate:
+/* Run in the BT task. Like DS5Dongle, issue 0x09/0x20/0x22/0x05/0x70 in order
+ * without waiting for earlier replies. Probe retries remain separate because
  * HID HANDSHAKE errors do not carry a report ID. */
 static void handshake_send_pending(void)
 {
@@ -500,7 +498,6 @@ static void handshake_send_pending(void)
     hid_ctx.handshake.last_attempt = now;
     uint32_t generation = app_tx_generation;
 
-    bool retry_pending = false;
     for (unsigned i = 0; i < sizeof(handshake_ids); ++i) {
         uint8_t bit = 1u << i;
         if ((hid_ctx.handshake.sent & bit) || hid_ctx.handshake.attempts[i] >= 3)
@@ -513,19 +510,13 @@ static void handshake_send_pending(void)
             return;
         if (err) {
             hid_ctx.handshake.sent &= ~bit;
-            retry_pending |= hid_ctx.handshake.attempts[i] < 3;
             LOG_WRN("[HID] Init GET_REPORT(0x%02x) failed (%d), attempt %u\n",
                     handshake_ids[i], err, hid_ctx.handshake.attempts[i]);
         }
     }
-    if (retry_pending)
-        return;
-
-    /* Collect responses for cache/Edge unlock, but one missing optional report
-     * must not hold up every later GET. Type detection has its own retries. */
+    /* Start the first Edge probe in the same pass, even if an earlier GET
+     * failed to submit or has not replied. Only repeated probes are paced. */
     uint8_t pending = hid_ctx.handshake.sent & ~hid_ctx.handshake.received;
-    if (pending && (TickType_t)(now - hid_ctx.handshake.started) < HANDSHAKE_SETTLE_TICKS)
-        return;
     if (hid_ctx.handshake.probe_attempts &&
         (TickType_t)(now - hid_ctx.handshake.probe_tick) < HANDSHAKE_PROBE_TICKS)
         return;

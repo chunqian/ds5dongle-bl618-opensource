@@ -22,7 +22,7 @@ def extract(source, signature):
     return source[start:end]
 
 
-handshake_fields = SOURCE[SOURCE.index("    struct {\n        TickType_t started"):
+handshake_fields = SOURCE[SOURCE.index("    struct {\n        TickType_t last_attempt"):
                           SOURCE.index("    } handshake;") + len("    } handshake;")]
 constants = SOURCE[SOURCE.index("static const uint8_t handshake_ids[]"):
                    SOURCE.index("static void handshake_begin")]
@@ -83,7 +83,7 @@ static TickType_t tick;
 static uint32_t app_tx_generation=1;
 static unsigned sent[256], sent_count, fail_count[256], cached[256];
 static unsigned deleted_keys, disconnected, edge_unlocks, notifications, encryptions;
-static bool immediate_response, reset_on_send, disconnect_on_unlock;
+static bool immediate_response, optional_response, reset_on_send, disconnect_on_unlock;
 static TickType_t xTaskGetTickCount(void) { return tick; }
 static void set_state(enum bt_hid_host_state s) { hid_ctx.state=s; }
 static void feature_cache_store(uint8_t id, const uint8_t *data, uint16_t len) { ++cached[id]; }
@@ -115,7 +115,7 @@ int bt_hid_host_get_feature(uint8_t id) {
         reset_on_send=false; ++app_tx_generation; handshake_begin(); return -1;
     }
     if (fail_count[id]) { --fail_count[id]; return -1; }
-    if (immediate_response) reply(id);
+    if (immediate_response || (optional_response && id!=0x70)) reply(id);
     return 0;
 }
 '''
@@ -158,7 +158,7 @@ static void setup(void) {
     hid_ctx.conn=&current; control.conn=&current;
     hid_ctx.ctrl_connected=hid_ctx.intr_connected=true;
     tick=0; sent_count=deleted_keys=disconnected=edge_unlocks=notifications=encryptions=0;
-    immediate_response=reset_on_send=disconnect_on_unlock=false; ++app_tx_generation;
+    immediate_response=optional_response=reset_on_send=disconnect_on_unlock=false; ++app_tx_generation;
     handshake_begin();
 }
 '''
@@ -170,34 +170,34 @@ static void auth_event(uint8_t status, uint16_t handle) {
 }
 int main(void) {
     setup(); bt_hid_host_handshake_tick();
-    assert(sent_count==4 && sent[0]==9 && sent[1]==0x20 && sent[2]==0x22 && sent[3]==5);
-    /* Missing 0x09 does not suppress the other GETs or the Edge probe. */
+    /* All five requests are submitted in the first pass, before any reply. */
+    assert(tick==0 && sent_count==5 && sent[0]==9 && sent[1]==0x20 &&
+           sent[2]==0x22 && sent[3]==5 && sent[4]==0x70);
+    /* Missing 0x09 does not suppress the other GETs or the Edge probe.
+     * Repeated ticks do not resend successful requests before probe retry. */
     reply(0x20); reply(0x22); reply(5); tick=900; bt_hid_host_handshake_tick();
-    assert(sent_count==4); tick=1000; bt_hid_host_handshake_tick();
     assert(sent_count==5 && sent[4]==0x70);
     reply(0x70); assert(hid_ctx.state==BT_HID_STATE_CONNECTED && hid_ctx.is_dse && edge_unlocks==1);
     assert(cached[0x20]==1 && cached[5]==1 && !disconnected);
 
     setup(); fail_count[9]=2; bt_hid_host_handshake_tick();
-    assert(sent_count==4 && !(hid_ctx.handshake.sent&1));
+    assert(sent_count==5 && sent[4]==0x70 && !(hid_ctx.handshake.sent&1));
     tick=100; bt_hid_host_handshake_tick(); tick=200; bt_hid_host_handshake_tick();
-    assert(sent_count==6 && sent[4]==9 && sent[5]==9 && (hid_ctx.handshake.sent&1));
+    assert(sent_count==7 && sent[5]==9 && sent[6]==9 && (hid_ctx.handshake.sent&1));
     setup(); fail_count[9]=99;
     for(tick=0;tick<=1000;tick+=100) bt_hid_host_handshake_tick();
     assert(hid_ctx.handshake.attempts[0]==3 && sent[sent_count-1]==0x70);
 
     /* An unrelated INVALID_ID cannot classify Edge as DS5 before probing. */
-    setup(); bt_hid_host_handshake_tick(); reject();
+    setup(); reject();
     assert(hid_ctx.state==BT_HID_STATE_HANDSHAKE && hid_ctx.check_dse);
-    tick=1000; bt_hid_host_handshake_tick(); reject();
+    bt_hid_host_handshake_tick(); reject();
     assert(hid_ctx.state==BT_HID_STATE_HANDSHAKE);
     reject(); assert(hid_ctx.handshake.probe_rejections==1); /* duplicate is ignored */
-    tick=2000; bt_hid_host_handshake_tick(); reject();
+    tick=1000; bt_hid_host_handshake_tick(); reject();
     assert(hid_ctx.state==BT_HID_STATE_CONNECTED && !hid_ctx.is_dse && !edge_unlocks);
 
-    setup(); bt_hid_host_handshake_tick();
-    reply(9); reply(0x20); reply(0x22); reply(5);
-    tick=100; bt_hid_host_handshake_tick(); reject();
+    setup(); optional_response=true; bt_hid_host_handshake_tick(); reject();
     assert(hid_ctx.state==BT_HID_STATE_CONNECTED && !hid_ctx.is_dse);
 
     setup(); immediate_response=true; bt_hid_host_handshake_tick();
@@ -215,7 +215,7 @@ int main(void) {
     assert(hid_ctx.state==BT_HID_STATE_HANDSHAKE && hid_ctx.check_dse); /* never guess DS5 */
     setup(); reset_on_send=true; bt_hid_host_handshake_tick();
     assert(sent_count==1 && hid_ctx.handshake.sent==0);
-    bt_hid_host_handshake_tick(); assert(sent_count==5);
+    bt_hid_host_handshake_tick(); assert(sent_count==6);
     control.conn=&other; reply(0x70); reject();
     assert(!edge_unlocks && !hid_ctx.handshake.probe_rejections);
 
