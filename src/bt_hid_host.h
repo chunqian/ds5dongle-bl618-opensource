@@ -106,6 +106,9 @@ void bt_hid_host_force_disconnect(void);
  */
 int bt_hid_host_send_output(const uint8_t *data, uint16_t len);
 
+/* Continue queued output after failed submissions; call from the BT task. */
+void bt_hid_host_poll_tx(void);
+
 /**
  * Send a SET_REPORT (Feature) on the control channel.
  * @param report_id  HID report ID

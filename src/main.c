@@ -798,6 +798,7 @@ static void bt_task(void *arg)
 
         bt_hid_host_poll_security_watchdog();
         bt_hid_host_poll_incoming_l2cap_fallback();
+        bt_hid_host_poll_tx();
 
         if (dse_mode_changed) {
             dse_mode_changed = false;

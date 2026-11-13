@@ -287,6 +287,7 @@ static uint16_t app_tx_len[APP_TX_DEPTH];
 static volatile uint8_t  app_tx_head = 0;   /* next slot to consume */
 static volatile uint8_t  app_tx_tail = 0;   /* next slot to fill */
 static volatile bool     app_tx_busy = false; /* true: one packet is in HCI */
+static uint32_t app_tx_generation = 1; /* invalidate callbacks across FIFO resets */
 
 /* bt_conn_tx_cb_t: SDK declaration from conn_internal.h */
 static void hid_tx_drain_one(void);  /* forward declaration */
@@ -295,55 +296,111 @@ static void on_hid_output_sent(struct bt_conn *conn, void *user_data)
 {
     /* HCI controller acknowledged the previous packet — equivalent to
      * BTstack's L2CAP_EVENT_CAN_SEND_NOW: mark idle then drain next. */
-    app_tx_busy = false;
-    hid_tx_drain_one();
+    taskENTER_CRITICAL();
+    bool current = conn == hid_ctx.conn && app_tx_busy &&
+                   (uint32_t)(uintptr_t)user_data == app_tx_generation;
+    if (current)
+        app_tx_busy = false;
+    taskEXIT_CRITICAL();
+    if (current)
+        hid_tx_drain_one();
+}
+
+/* Consume buf on every path. The SDK BR wrapper discards the return value
+ * from bt_l2cap_send_cb(), which already consumes buf on both success and
+ * failure. Call that layer directly so failures cannot leave busy latched. */
+static int hid_tx_submit(struct net_buf *buf, uint32_t generation)
+{
+    struct bt_conn *conn = NULL;
+    uint16_t cid = 0, mtu = 0;
+    taskENTER_CRITICAL();
+    if (generation == app_tx_generation && app_tx_busy &&
+        hid_ctx.intr_connected && hid_ctx.conn &&
+        hid_ctx.intr_chan.chan.conn == hid_ctx.conn) {
+        conn = bt_conn_ref(hid_ctx.conn);
+        cid = hid_ctx.intr_chan.tx.cid;
+        mtu = hid_ctx.intr_chan.tx.mtu;
+    }
+    taskEXIT_CRITICAL();
+
+    if (!conn) {
+        net_buf_unref(buf);
+        return -ENOTCONN;
+    }
+    if (buf->len > mtu) {
+        net_buf_unref(buf);
+        bt_conn_unref(conn);
+        return -EMSGSIZE;
+    }
+
+    extern int bt_l2cap_send_cb(struct bt_conn *conn, uint16_t cid,
+                              struct net_buf *buf, bt_conn_tx_cb_t cb,
+                              void *user_data);
+    int err = bt_l2cap_send_cb(conn, cid, buf, on_hid_output_sent,
+                             (void *)(uintptr_t)generation);
+    bt_conn_unref(conn);
+    return err;
 }
 
 static void hid_tx_drain_one(void)
 {
-    if (app_tx_busy)
-        return;
-    if (app_tx_head == app_tx_tail)
-        return;  /* FIFO empty */
-    if (!hid_ctx.intr_connected || !hid_ctx.conn)
-        return;
+    /* DS5Dongle also advances after a failed send. No completion callback is
+     * scheduled on failure, so drain queued successors here, with a bound. */
+    for (unsigned attempt = 0; attempt < APP_TX_DEPTH; ++attempt) {
+        uint8_t data[APP_TX_DATA_SZ];
+        uint16_t len;
+        uint32_t generation;
+        taskENTER_CRITICAL();
+        if (app_tx_busy || app_tx_head == app_tx_tail ||
+            !hid_ctx.intr_connected || !hid_ctx.conn) {
+            taskEXIT_CRITICAL();
+            return;
+        }
+        app_tx_busy = true;
+        generation = app_tx_generation;
+        uint8_t idx = app_tx_head;
+        len = app_tx_len[idx];
+        memcpy(data, app_tx_buf[idx], len);
+        app_tx_head = (idx + 1) % APP_TX_DEPTH;
+        taskEXIT_CRITICAL();
 
-    app_tx_busy = true;
+        int err = -ENOBUFS;
+        struct net_buf *buf = net_buf_alloc(&hid_tx_pool, K_NO_WAIT);
+        if (buf) {
+            net_buf_reserve(buf, BT_L2CAP_CHAN_SEND_RESERVE);
+            net_buf_add_mem(buf, data, len);
+            err = hid_tx_submit(buf, generation);
+        }
+        if (err >= 0)
+            return; /* Only successful submissions have a completion callback. */
 
-    uint8_t idx = app_tx_head;
-    app_tx_head = (app_tx_head + 1) % APP_TX_DEPTH;
-
-    struct net_buf *buf = net_buf_alloc(&hid_tx_pool, K_NO_WAIT);
-    if (!buf) {
-        LOG_WRN("[HID] drain: pool empty, dropping frame (head=%u tail=%u)\n",
-               app_tx_head, app_tx_tail);
-        app_tx_busy = false;
-        return;
-    }
-
-    net_buf_reserve(buf, BT_L2CAP_CHAN_SEND_RESERVE);
-    net_buf_add_mem(buf, app_tx_buf[idx], app_tx_len[idx]);
-
-    /* bt_l2cap_br_chan_send_cb added to SDK l2cap_br.c */
-    extern int bt_l2cap_br_chan_send_cb(struct bt_l2cap_chan *chan,
-                                        struct net_buf *buf,
-                                        bt_conn_tx_cb_t cb, void *user_data);
-
-    int err = bt_l2cap_br_chan_send_cb(&hid_ctx.intr_chan.chan, buf,
-                                        on_hid_output_sent, NULL);
-    if (err < 0) {
         LOG_ERR("[HID] drain: send err=%d\n", err);
-        net_buf_unref(buf);
-        app_tx_busy = false;
+        taskENTER_CRITICAL();
+        bool current = generation == app_tx_generation;
+        if (current)
+            app_tx_busy = false;
+        taskEXIT_CRITICAL();
+        if (!current)
+            return;
     }
-    /* On success: app_tx_busy stays true until on_hid_output_sent fires */
 }
 
 static void app_tx_fifo_reset(void)
 {
+    taskENTER_CRITICAL();
+    if (++app_tx_generation == 0)
+        ++app_tx_generation;
     app_tx_head = 0;
     app_tx_tail = 0;
     app_tx_busy = false;
+    taskEXIT_CRITICAL();
+}
+
+void bt_hid_host_poll_tx(void)
+{
+    /* A producer may refill the FIFO during a bounded failure drain. No
+     * completion is pending then; the BT task supplies the next opportunity. */
+    hid_tx_drain_one();
 }
 
 static struct bt_br_discovery_result discovery_results[BT_MAX_DISCOVERED];
@@ -1908,9 +1965,10 @@ int bt_hid_host_send_output(const uint8_t *data, uint16_t len)
     }
 
     /* FIFO path for 0x31 game output (equivalent to DS5Dongle's send_fifo) */
+    taskENTER_CRITICAL();
     uint8_t next_tail = (app_tx_tail + 1) % APP_TX_DEPTH;
 
-    /* FIFO full: drop oldest frame to make room (same as DS5Dongle) */
+    /* Preserve the existing drop-oldest policy when the FIFO is full. */
     if (next_tail == app_tx_head) {
         app_tx_head = (app_tx_head + 1) % APP_TX_DEPTH;
     }
@@ -1920,6 +1978,7 @@ int bt_hid_host_send_output(const uint8_t *data, uint16_t len)
     memcpy(app_tx_buf[slot] + 1, data, len);
     app_tx_len[slot] = len + 1;
     app_tx_tail = next_tail;
+    taskEXIT_CRITICAL();
 
     if (!first_output_logged) {
         first_output_logged = true;
@@ -1927,9 +1986,7 @@ int bt_hid_host_send_output(const uint8_t *data, uint16_t len)
     }
 
     /* Trigger drain if channel is idle (CAN_SEND_NOW equivalent) */
-    if (!app_tx_busy) {
-        hid_tx_drain_one();
-    }
+    hid_tx_drain_one();
 
     return 0;
 }
