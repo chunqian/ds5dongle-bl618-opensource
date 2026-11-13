@@ -1,7 +1,7 @@
 """Build separate offline Windows and macOS LCTech BL616 HS flashing bundles.
 
 Only the maintainer needs Python; macOS packages also need Xcode and the ARM64
-runtime. End users need neither. --platform defaults to both.
+runtimes. End users need neither. --platform defaults to both.
 """
 from pathlib import Path
 import argparse
@@ -60,7 +60,6 @@ def build_platform(args, platform, native_info, revision):
     sdk = args.sdk.resolve()
     output = args.output.resolve()
     firmware = args.firmware_dir.resolve()
-    native = args.native_dir.resolve()
     spec = PLATFORMS[platform]
     name = NAME + "-" + spec["suffix"]
     cube = "tools/bflb_tools/bouffalo_flash_cube"
@@ -92,19 +91,24 @@ def build_platform(args, platform, native_info, revision):
             "[FW]\nfiledir = ./ds5dongle-lctech616-hs.bin\naddress = @partition\n", encoding="ascii")
 
         # Use a pinned SDK revision, not generated loader/whole-flash files from a prior run.
-        executable = "BLFlashCommand-macos" if platform == "macos" else "BLFlashCommand.exe"
-        original = git(sdk, "show", f"{SDK_COMMIT}:{cube}/{executable}")
-        if platform == "windows" and args.windows_exe and args.windows_exe.read_bytes() != original:
-            raise SystemExit("Windows executable differs from pinned SDK version.")
-        target = package / "tools" / platform / executable
-        target.write_bytes(original)
-        target.chmod(0o755)
-        if platform == "macos":
-            shutil.copytree(native / 'runtime', package / 'tools/macos-arm64', symlinks=False)
-            shutil.copyfile(native / 'native-info.json', package / 'tools/macos-arm64/native-info.json')
-            shutil.copytree(native / 'licenses', package / 'licenses/macOS-native')
-            shutil.copyfile(native / 'vendor-source.tar.gz', package / 'source/native-flash-command-source.tar.gz')
-            shutil.copyfile(native / 'build-requirements.txt', package / 'source/native-build-requirements.txt')
+        if platform == "windows":
+            original = git(sdk, "show", f"{SDK_COMMIT}:{cube}/BLFlashCommand.exe")
+            if args.windows_exe and args.windows_exe.read_bytes() != original:
+                raise SystemExit("Windows executable differs from pinned SDK version.")
+            target = package / "tools/windows/BLFlashCommand.exe"
+            target.write_bytes(original)
+            target.chmod(0o755)
+        else:
+            for arch, native, subdir, license_dir, source_prefix in (
+                ('arm64', args.native_dir, 'macos-arm64', 'macOS-native', 'native'),
+                ('x86_64', args.intel_native_dir, 'macos', 'macOS-Intel-native', 'intel-native'),
+            ):
+                shutil.copytree(native / 'runtime', package / 'tools' / subdir,
+                                symlinks=False, dirs_exist_ok=True)
+                shutil.copyfile(native / 'native-info.json', package / 'tools' / subdir / 'native-info.json')
+                shutil.copytree(native / 'licenses', package / 'licenses' / license_dir)
+                shutil.copyfile(native / 'vendor-source.tar.gz', package / 'source' / (source_prefix + '-flash-command-source.tar.gz'))
+                shutil.copyfile(native / 'build-requirements.txt', package / 'source' / (source_prefix + '-build-requirements.txt'))
         assets = git(sdk, "ls-tree", "-r", "--name-only", SDK_COMMIT,
                      f"{cube}/chips/bl616", f"{cube}/utils/pem").decode().splitlines()
         for asset in assets:
@@ -133,9 +137,13 @@ def build_platform(args, platform, native_info, revision):
         metadata = {"version": VERSION, "board": "LCTech BL616", "usb": "HS",
                     "platform": platform, "architectures": spec["architectures"],
                     "firmware_sha256": FIRMWARE_SHA, "firmware_commit": revision,
-                    "sdk_commit": SDK_COMMIT, "flashcube_version": "1.4.2",
+                    "sdk_commit": SDK_COMMIT,
                     "package_hardware_tested": False}
-        if platform == "macos": metadata["macos_arm64_backend"] = native_info
+        if platform == "macos":
+            metadata["macos_arm64_backend"] = native_info['arm64']
+            metadata["macos_intel_backend"] = native_info['x86_64']
+        else:
+            metadata["flashcube_version"] = "1.4.2"
         (package / "package-info.json").write_text(json.dumps(metadata, indent=2) + "\n")
         (package / "NOTICE.txt").write_text(
             f"Firmware: {VERSION}\nSource revision: {revision}\nSHA-256: {FIRMWARE_SHA}\n\n"
@@ -146,12 +154,13 @@ def build_platform(args, platform, native_info, revision):
             "Wrapper sources: source/easy_flash (GPL-3.0-or-later)\n"
             "Upstream license texts and release notes: licenses/\n"
             "Stock utils/pem files are public SDK test material; this package does not enable firmware signing or efuse programming.\n"
-            f"Platform: {platform}; SDK FlashCube binary is copied unchanged.\n" + (
-                "Apple Silicon uses unmodified bflb-flash-command 1.0.0 source, frozen with an ARM64 Python runtime.\n"
-                f"Native source: {native_info['source_url']}\nSource SHA-256: {native_info['source_sha256']}\n"
-                "Native runtime metadata: tools/macos-arm64/native-info.json; notices: licenses/macOS-native/\n"
+            f"Platform: {platform}.\n" + (
+                "Both Mac architectures use unmodified bflb-flash-command 1.0.0 source and independent onedir Python runtimes.\n"
+                f"Native source: {native_info['arm64']['source_url']}\nSource SHA-256: {native_info['arm64']['source_sha256']}\n"
+                "Native runtime metadata: tools/macos-arm64/native-info.json and tools/macos/native-info.json.\n"
+                "Notices: licenses/macOS-native/ and licenses/macOS-Intel-native/.\n"
                 "This package has not completed Developer ID signing or Apple notarization.\n"
-                if platform == "macos" else "Windows native flashing still requires hardware acceptance testing.\n"
+                if platform == "macos" else "SDK Windows FlashCube binary is copied unchanged; native flashing still requires hardware acceptance testing.\n"
             ), encoding="utf-8")
         checked = [p for p in package.rglob('*') if p.is_file() and p.relative_to(package).parts[0] in ('app', 'firmware', 'tools')]
         (package / "asset-hashes.txt").write_text(''.join(
@@ -176,6 +185,7 @@ def main():
     parser.add_argument("--windows-exe", type=Path)
     parser.add_argument("--output", type=Path, default=REPO / "build/easy_flash")
     parser.add_argument("--native-dir", type=Path, default=REPO / "build/native_macos")
+    parser.add_argument("--intel-native-dir", type=Path, default=REPO / "build/native_macos_intel")
     parser.add_argument("--firmware-dir", type=Path, default=REPO / "firmware/lctech616")
     args = parser.parse_args()
     platforms = ("windows", "macos") if args.platform == "both" else (args.platform,)
@@ -186,13 +196,22 @@ def main():
     revision = git(REPO, "rev-parse", "HEAD").decode().strip()
     if VERSION.encode() not in git(REPO, "show", "HEAD:src/usb_gamepad.c"):
         raise SystemExit("Source snapshot firmware version differs from the packaged binary.")
-    native_info = None
+    native_info = {}
     if "macos" in platforms:
-        native_info = json.loads((args.native_dir / "native-info.json").read_text())
-        if native_info['machine'] != 'arm64' or native_info['rosetta'] or native_info['minimum_macos'] != '11.0':
-            raise SystemExit('The Apple Silicon runtime must be native ARM64 and compatible with macOS 11.')
-        if sha(args.native_dir / 'runtime/BLFlashCommand-macos') != native_info['executable_sha256']:
-            raise SystemExit('Native executable differs from its build metadata.')
+        for arch, native in (('arm64', args.native_dir), ('x86_64', args.intel_native_dir)):
+            info = json.loads((native / "native-info.json").read_text())
+            if info['machine'] != arch or info['minimum_macos'] != '11.0':
+                raise SystemExit(f'{arch} runtime must match its architecture and support macOS 11.')
+            if arch == 'arm64' and info['rosetta']:
+                raise SystemExit('Apple Silicon runtime must run natively.')
+            if not (native / 'runtime/_internal').is_dir():
+                raise SystemExit(f'{arch} requires an onedir runtime with all dependencies.')
+            if sha(native / 'runtime/BLFlashCommand-macos') != info['executable_sha256']:
+                raise SystemExit(f'{arch} executable differs from its build metadata.')
+            native_info[arch] = info
+        for key in ('backend', 'source_sha256', 'python'):
+            if native_info['arm64'][key] != native_info['x86_64'][key]:
+                raise SystemExit(f'Mac runtimes must use the same {key}.')
     args.output.mkdir(parents=True, exist_ok=True)
     for platform in platforms:
         build_platform(args, platform, native_info, revision)

@@ -24,11 +24,11 @@ TOOL_SUBDIR=$(mac_tool_subdir "$(/usr/sbin/sysctl -n hw.optional.arm64 2>/dev/nu
 TOOL_DIR="$ROOT/tools/$TOOL_SUBDIR"
 [[ -x "$ROOT/app/list-ports-macos" ]] || fail '端口检测程序无法执行，请重新解压安装包。'
 [[ -x "$TOOL_DIR/BLFlashCommand-macos" ]] || fail '烧录程序无法执行，请重新解压安装包。'
+if ! "$TOOL_DIR/BLFlashCommand-macos" --runtime-info >"$STAGE/runtime-check.log" 2>&1; then
+    cat "$STAGE/runtime-check.log"
+    fail '原生烧录程序无法启动。请完整解压安装包，并按系统提示允许运行。'
+fi
 if [[ "$TOOL_SUBDIR" == macos-arm64 ]]; then
-    if ! "$TOOL_DIR/BLFlashCommand-macos" --runtime-info >"$STAGE/runtime-check.log" 2>&1; then
-        cat "$STAGE/runtime-check.log"
-        fail 'Apple 芯片原生烧录程序无法启动。请完整解压安装包，并按系统提示允许运行。'
-    fi
     printf '已选择 Apple 芯片原生版，无需 Rosetta。\n'
 else
     printf '已选择 Intel Mac 原生版。\n'
@@ -60,8 +60,9 @@ while :; do
     fi
 done
 
-mkdir -p "$ROOT/logs" || fail '安装包目录不可写，请解压到下载或桌面目录。'
-LOG="$ROOT/logs/mac-$(date '+%Y%m%d-%H%M%S')-$$.log"
+LOG_DIR=${DS5_FLASH_LOG_DIR:-"$ROOT/logs"}
+mkdir -p "$LOG_DIR" || fail "无法创建日志目录：$LOG_DIR"
+LOG="$LOG_DIR/mac-$(date '+%Y%m%d-%H%M%S')-$$.log"
 cp -R "$TOOL_DIR" "$STAGE/tool" || fail '复制烧录程序失败。'
 cp -R "$ROOT/tools/common/." "$STAGE/tool/" || fail '复制芯片配置失败。'
 cp -R "$ROOT/firmware" "$STAGE/firmware" || fail '复制固件失败。'

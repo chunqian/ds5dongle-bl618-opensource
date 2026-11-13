@@ -1,4 +1,4 @@
-"""Native ARM64 entry point for the unmodified Bouffalo Flash Command source."""
+"""Native macOS entry point for the unmodified Bouffalo Flash Command source."""
 import ctypes
 import json
 import platform
@@ -20,7 +20,7 @@ def main():
         info = {'machine': platform.machine(), 'rosetta': bool(translated.value),
                 'python': platform.python_version(), 'backend': 'bflb-flash-command 1.0.0'}
         print(json.dumps(info))
-        return 0 if info['machine'] == 'arm64' and not info['rosetta'] else 1
+        return 0 if info['machine'] in ('arm64', 'x86_64') else 1
     BLFlashCommand.MainClass().main(sys.argv[1:])
     return 0  # The launcher additionally requires all three device SHA checks.
 

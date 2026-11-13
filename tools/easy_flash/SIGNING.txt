@@ -1,0 +1,66 @@
+macOS 烧录工具 — Developer ID 签名 / Apple 公证工具包
+
+这是维护者工具，复制完整 ZIP 到另一台 Mac，完整解压后使用。
+包内直接使用普通 macOS 包的固件和 ARM64 / Intel 独立运行时，不需要固件仓库、SDK、
+Homebrew 或 Python 第三方模块。签名 Mac 只需 Xcode Command Line Tools、
+其自带 /usr/bin/python3、Developer ID Application 证书和公证凭据。
+签名时不运行烧录、不访问适配器，也不修改原始输入包。
+
+另一台 Mac 上的准备（只做一次）
+1. 安装 Xcode Command Line Tools：xcode-select --install
+2. 钥匙串中安装 Developer ID Application 证书及对应私钥。
+   检查：security find-identity -v -p codesigning
+   Apple Development、Developer ID Installer 及临时签名不能替代此证书。
+3. 安全保存公证凭据到钥匙串：
+   xcrun notarytool store-credentials DS5Dongle-Notary
+   按提示输入 Apple ID、Team ID 和 App 专用密码，或使用 Apple 支持的 API Key。
+   密码只输入 Apple 工具的交互提示，不要写进脚本、参数文件或发给他人。
+
+使用
+双击 Sign-Mac.command，填写 Developer ID Application 证书 SHA-1 和
+公证配置名（例如 DS5Dongle-Notary）。只有一个符合要求的证书时可留空。
+钥匙串可能请求允许 codesign 使用私钥，这是 macOS 自身的权限提示。
+
+也可在工具包目录运行：
+/usr/bin/python3 sign_macos.py --check
+/usr/bin/python3 sign_macos.py --identity '证书SHA-1' --keychain-profile DS5Dongle-Notary
+
+--check 只校验包、编译双架构启动器，不使用证书、不上传、不刷设备。
+正式运行会将签名后的 App ZIP 上传至 Apple 公证服务，需要网络。
+默认不允许省略公证凭据。确实只需签名时可明确添加 --sign-only；
+该产物名称含 Signed-Unnotarized，不能当作公证完成版分发。
+
+输出
+每次运行创建独立 output/sign-*/ 工作目录，保存日志、签名 App 和 Apple 回执。
+只有公证状态为 Accepted、票据附加/校验和 Gatekeeper 验证全部通过后，
+才生成 release/*-Signed-Notarized.zip，以及 SHA-256 和 receipt.json。
+分发 release 目录中的 ZIP 和回执，不要分发本签名工具包。
+用户解压后双击 DS5Dongle Flash.app，会打开 Terminal 中的原烧录流程。
+用户无需 Rosetta、Python 或 Xcode；Apple 芯片 / Intel 自动选择本机版本。
+运行日志保存在 ~/Library/Logs/DS5Dongle-Flash，避免修改 App 内的签名资源。
+
+失败处理
+签名或 Apple 审核失败会返回非零状态，不会生成“已公证”分发包。
+查看工作目录中的 notary-result.json、notary-log.json 和 notary-stderr.txt。
+公证等待上限 20 分钟；超时不代表 Apple 拒绝，也不取消服务器任务。
+可使用回执 ID 查询：
+  xcrun notarytool info 提交ID --keychain-profile DS5Dongle-Notary
+  xcrun notarytool log 提交ID --keychain-profile DS5Dongle-Notary 审核日志.json
+排除原因后重新运行工具，会保留上一次工作目录并重新提交。
+不要修改已签名 App 内的固件、脚本或配置，否则需重新签名和公证。
+
+实现说明
+- 包含可封装为 App 的双架构原生启动器，脚本作为受签名保护的资源。
+- 两个平台烧录后端均为 bflb-flash-command 1.0.0 的 onedir 构建，逐个签名
+  Python 动态库、扩展模块、烧录程序、端口检测器，再签名最外层 App。
+- 普通 Mac 包与签名 App 使用相同的两套 onedir 程序，签名时不替换烧录后端。
+- 所有代码采用 Hardened Runtime 和 Apple 安全时间戳，不添加放宽安全的权限。
+- 签名后更新 native-info、package-info、资产哈希，再封装并签名 App。
+- 启动脚本与日志路径更新，不改变固件和串口烧录参数。
+- 本机验证不包含真实 Developer ID 签名、Apple 审核或 Windows/Intel 实机烧录；
+  正式分发以另一台 Mac 的验证结果和 Apple Accepted 回执为准。
+
+官方参考
+https://developer.apple.com/developer-id/
+https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution
+https://pyinstaller.org/en/stable/feature-notes.html#macos-binary-code-signing

@@ -1,4 +1,4 @@
-"""Freeze the verified upstream Python source into a self-contained ARM64 binary.
+"""Freeze the verified upstream Python source into a self-contained macOS binary.
 
 Run with the ARM64 build venv, after installing native-requirements.txt:
   python tools/easy_flash/build_native_macos.py --archive /path/bflb-flash-command-1.0.0.tar.gz
@@ -28,13 +28,14 @@ REPO = Path(__file__).resolve().parents[2]
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--archive', type=Path)
+    parser.add_argument('--arch', choices=('arm64', 'x86_64'), default='arm64')
     parser.add_argument('--output', type=Path, default=REPO / 'build/native_macos')
     parser.add_argument('--python-provenance', type=Path)
     parser.add_argument('--python-licenses', type=Path,
                         help='Directory of dependency notices from the matching full Python archive')
     args = parser.parse_args()
-    if sys.platform != 'darwin' or platform.machine() != 'arm64':
-        raise SystemExit('Build using a native ARM64 Python on an Apple Silicon Mac.')
+    if sys.platform != 'darwin' or platform.machine() != args.arch:
+        raise SystemExit('Run using a macOS Python matching --arch (Intel builds may use Rosetta).')
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='ds5-arm64-build-') as d:
@@ -51,7 +52,7 @@ def main():
         code = upstream / 'bflb_flash_command'
         # Leave upstream sources unmodified; ship only a CLI entry point of our own.
         subprocess.run([sys.executable, '-m', 'PyInstaller', '--noconfirm', '--clean', '--onedir',
-                        '--target-arch', 'arm64', '--name', 'BLFlashCommand-macos',
+                        '--target-arch', args.arch, '--name', 'BLFlashCommand-macos',
                         '--distpath', str(stage / 'dist'), '--workpath', str(stage / 'work'),
                         '--specpath', str(stage), '--paths', str(code),
                         '--collect-submodules', 'libs', '--hidden-import', 'config',
@@ -60,9 +61,9 @@ def main():
         bundle = stage / 'dist/BLFlashCommand-macos'
         executable = bundle / 'BLFlashCommand-macos'
         info = json.loads(subprocess.check_output([str(executable), '--runtime-info'], text=True))
-        if info['machine'] != 'arm64' or info['rosetta']:
+        if info['machine'] != args.arch or (args.arch == 'arm64' and info['rosetta']):
             raise SystemExit('The frozen program is not running natively.')
-        # Reject any Mach-O dependency lacking an ARM64 slice, including Python itself.
+        # Reject any Mach-O dependency lacking the requested architecture slice, including Python itself.
         macho_count = 0
         minimum_os = (11, 0)
         for path in bundle.rglob('*'):
@@ -70,7 +71,7 @@ def main():
             kind = subprocess.check_output(['file', '-b', str(path)], text=True)
             if 'Mach-O' in kind:
                 archs = subprocess.check_output(['xcrun', 'lipo', '-archs', str(path)], text=True).split()
-                if 'arm64' not in archs: raise SystemExit(f'Non-native dependency: {path}')
+                if args.arch not in archs: raise SystemExit(f'Non-native dependency: {path}')
                 builds = subprocess.check_output(['xcrun', 'vtool', '-show-build', str(path)], text=True)
                 for version in re.findall(r'\bminos\s+([0-9.]+)', builds):
                     required = tuple(int(part) for part in version.split('.')[:2])
@@ -114,7 +115,7 @@ def main():
         freeze = subprocess.check_output([sys.executable, '-m', 'pip', 'freeze'], text=True)
         (output / 'build-requirements.txt').write_text(freeze)
         info.update(source_url=SOURCE_URL, source_sha256=SOURCE_SHA, macho_files_checked=macho_count,
-                    minimum_macos='11.0',
+                    minimum_macos='11.0', layout='onedir', target_arch=args.arch,
                     executable_sha256=hashlib.sha256((target / 'BLFlashCommand-macos').read_bytes()).hexdigest())
         if args.python_provenance:
             info['python_distribution'] = json.loads(args.python_provenance.read_text())

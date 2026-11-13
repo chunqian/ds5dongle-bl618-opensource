@@ -60,7 +60,7 @@ def fixture(base, package, platform, outcome, ports):
     return root
 
 
-def run_case(package, pwsh, platform, outcome, count):
+def run_case(package, pwsh, platform, outcome, count, external_logs=False):
     with tempfile.TemporaryDirectory(prefix='ds5-launcher-test-') as directory:
         base = Path(directory)
         ports = ([f'COM{5+i}' for i in range(count)] if platform == 'windows' else
@@ -68,6 +68,10 @@ def run_case(package, pwsh, platform, outcome, count):
         root = fixture(base, package, platform, outcome, ports)
         called = base / 'called.txt'
         env = dict(os.environ, DS5_TEST_CALL_FILE=str(called))
+        env.pop('DS5_FLASH_LOG_DIR', None)
+        log_dir = base / '用户 日志' if external_logs else root / 'logs'
+        if external_logs:
+            env['DS5_FLASH_LOG_DIR'] = str(log_dir)
         if platform == 'macos':
             command = ['/bin/bash', str(root / 'Flash-Mac.command')]
         else:
@@ -89,12 +93,14 @@ def run_case(package, pwsh, platform, outcome, count):
             assert not Path(lines[0]).exists(), ('temporary directory leaked', output)
             assert lines[1:] == ['--interface=uart', '--baudrate=2000000', '--port=' + ports[0],
                                 '--chipname=bl616', '--config=flash_prog_cfg.ini'], lines
-            assert list((root / 'logs').glob('*.log')), 'missing persistent log'
+            assert list(log_dir.glob('*.log')), 'missing persistent log'
+            if external_logs:
+                assert not (root / 'logs').exists(), 'log written inside signed payload'
         if success or count != 1:
             assert result.returncode == 0, output
         else:
             assert result.returncode != 0, output
-        print(f'PASS: {platform}: {outcome}, {count} download port(s)')
+        print(f'PASS: {platform}: {outcome}, {count} download port(s), external logs={external_logs}')
 
 
 def test_powershell(package, pwsh):
@@ -137,6 +143,17 @@ def test_layout(package):
     assert {p.name for p in package.glob('Flash-*')} == {
         'Flash-Mac.command' if mac else 'Flash-Windows.bat'}
     assert ('macos_arm64_backend' in metadata) == mac
+    assert ('macos_intel_backend' in metadata) == mac
+    if mac:
+        for subdir, key, arch in [('macos-arm64', 'macos_arm64_backend', 'arm64'),
+                                  ('macos', 'macos_intel_backend', 'x86_64')]:
+            runtime = package / 'tools' / subdir
+            info = json.loads((runtime / 'native-info.json').read_text())
+            assert info == metadata[key] and info['machine'] == arch
+            assert (runtime / '_internal').is_dir()
+            assert digest(runtime / 'BLFlashCommand-macos') == info['executable_sha256']
+        for key in ('backend', 'source_sha256', 'python'):
+            assert metadata['macos_arm64_backend'][key] == metadata['macos_intel_backend'][key]
     actual = {p.relative_to(package).as_posix(): digest(p)
               for name in ('app', 'firmware', 'tools')
               for p in (package / name).rglob('*') if p.is_file()}
@@ -178,6 +195,8 @@ def main():
     for outcome, count in [('success',1), ('exit-error',1), ('no-verification',1), ('wrong-hash',1),
                            ('corrupt',1), ('success',0), ('success',2)]:
         run_case(package, pwsh, platform, outcome, count)
+    if platform == 'macos':
+        run_case(package, pwsh, platform, 'success', 1, external_logs=True)
     print('PASS: no real device was opened or flashed by these tests')
 
 
