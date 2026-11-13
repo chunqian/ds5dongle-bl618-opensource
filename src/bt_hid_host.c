@@ -215,6 +215,12 @@ static struct {
     bt_addr_t target_addr;
     bool has_target;
 
+    /* Manual scans outlive a busy ACL/inquiry. Only the BT task submits HCI
+     * commands; callbacks keep the request intact until cleanup finishes. */
+    volatile bool scan_requested;
+    bool scan_retry_valid;
+    TickType_t scan_retry_tick;
+
     struct bt_l2cap_br_chan ctrl_chan;
     struct bt_l2cap_br_chan intr_chan;
     volatile bool ctrl_connected;
@@ -282,7 +288,7 @@ static volatile bool switch_pending = false;
 static bool channel_is_current(const struct bt_l2cap_chan *chan)
 {
     return chan->conn && chan->conn == hid_ctx.conn &&
-           !hid_ctx.teardown_pending;
+           !hid_ctx.teardown_pending && !hid_ctx.scan_requested;
 }
 
 /* Task callers retain a local reference across SDK operations which may
@@ -291,7 +297,7 @@ static struct bt_conn *active_conn_ref(void)
 {
     struct bt_conn *conn = NULL;
     taskENTER_CRITICAL();
-    if (hid_ctx.conn && !hid_ctx.teardown_pending)
+    if (hid_ctx.conn && !hid_ctx.teardown_pending && !hid_ctx.scan_requested)
         conn = bt_conn_ref(hid_ctx.conn);
     taskEXIT_CRITICAL();
     return conn;
@@ -920,10 +926,15 @@ static void conn_connected(struct bt_conn *conn, uint8_t err)
         return;
     }
 
-    if (hid_ctx.teardown_pending) {
+    if (hid_ctx.teardown_pending || hid_ctx.scan_requested) {
         /* The owning ACL is already scheduled for disconnect. Reject any
-         * second ACL without letting it reset the teardown state. */
-        if (conn != hid_ctx.conn)
+         * second ACL without letting it reset the teardown state. A manual
+         * scan also gates incoming connections while inquiry is cancelled. */
+        if (!hid_ctx.conn)
+            hid_ctx.conn = bt_conn_ref(conn);
+        if (conn == hid_ctx.conn)
+            request_disconnect(conn);
+        else
             bt_conn_disconnect(conn, BT_HCI_ERR_CONN_LIMIT_EXCEEDED);
         return;
     }
@@ -1017,6 +1028,10 @@ static void discovery_complete(struct bt_br_discovery_result *results,
 {
     LOG_INF("[BT] Inquiry complete, found %zu device(s)\n", count);
 
+    if (hid_ctx.scan_requested || hid_ctx.teardown_pending ||
+        hid_ctx.state != BT_HID_STATE_SCANNING)
+        return;
+
     if (hid_ctx.conn) {
         LOG_INF("[BT] Inquiry ended but ACL already established, skipping\n");
         return;
@@ -1083,7 +1098,7 @@ static void l2cap_server_ensure_conn(struct bt_conn *conn)
 static int l2cap_ctrl_server_accept(struct bt_conn *conn,
                                      struct bt_l2cap_chan **chan)
 {
-    if (hid_ctx.teardown_pending)
+    if (hid_ctx.teardown_pending || hid_ctx.scan_requested)
         return -EBUSY;
     char addr_str[BT_ADDR_STR_LEN] = "??";
     const bt_addr_t *remote = conn_get_br_addr(conn);
@@ -1125,7 +1140,7 @@ static int l2cap_ctrl_server_accept(struct bt_conn *conn,
 static int l2cap_intr_server_accept(struct bt_conn *conn,
                                      struct bt_l2cap_chan **chan)
 {
-    if (hid_ctx.teardown_pending)
+    if (hid_ctx.teardown_pending || hid_ctx.scan_requested)
         return -EBUSY;
     char addr_str[BT_ADDR_STR_LEN] = "??";
     const bt_addr_t *remote = conn_get_br_addr(conn);
@@ -1389,7 +1404,8 @@ int bt_hid_host_init(const struct bt_hid_host_config *config)
 
 int bt_hid_host_scan_start(uint8_t duration_sec)
 {
-    if (hid_ctx.state != BT_HID_STATE_IDLE || hid_ctx.conn)
+    if (hid_ctx.state != BT_HID_STATE_IDLE || hid_ctx.conn ||
+        hid_ctx.teardown_pending || hid_ctx.scan_requested)
         return -1;
 
     /* Don't scan if an outgoing connect retry is pending —
@@ -1413,12 +1429,105 @@ int bt_hid_host_scan_start(uint8_t duration_sec)
                                      discovery_complete);
     if (err) {
         LOG_ERR("[BT] Discovery start failed: %d\n", err);
-        set_state(BT_HID_STATE_IDLE);
+        /* An incoming ACL may have arrived while the HCI command yielded. */
+        if (hid_ctx.state == BT_HID_STATE_SCANNING && !hid_ctx.conn)
+            set_state(BT_HID_STATE_IDLE);
         return err;
     }
 
     LOG_INF("[BT] Scanning for devices...\n");
     return 0;
+}
+
+static void request_scan(bool clear_target)
+{
+    taskENTER_CRITICAL();
+    hid_ctx.scan_requested = true;
+    hid_ctx.scan_retry_valid = false;
+    hid_ctx.connect_pending = false;
+    hid_ctx.connect_pending_tick = 0;
+    hid_ctx.connect_retries = 0;
+    hid_ctx.fallback_retry = false;
+    if (clear_target) {
+        hid_ctx.has_target = false;
+        memset(&hid_ctx.target_addr, 0, sizeof(hid_ctx.target_addr));
+        switch_pending = false;
+    }
+    taskEXIT_CRITICAL();
+    request_disconnect(hid_ctx.conn);
+    LOG_INF("[BT] Manual scan queued: state=%s target_only=%d\n",
+            state_name(hid_ctx.state), hid_ctx.has_target);
+}
+
+void bt_hid_host_request_pairing(void)
+{
+    /* Keep saved link keys, but allow discovery of a different controller. */
+    request_scan(true);
+}
+
+#define MANUAL_SCAN_RETRY_TICKS pdMS_TO_TICKS(500)
+
+bool bt_hid_host_poll_pairing(void)
+{
+    if (!hid_ctx.scan_requested)
+        return false;
+
+    /* Includes an ACL still paging/authenticating and one arriving during
+     * cancellation. The normal teardown poll owns all refs/channel cleanup. */
+    request_disconnect(hid_ctx.conn);
+    if (hid_ctx.conn || hid_ctx.teardown_pending)
+        return true;
+
+    TickType_t now = xTaskGetTickCount();
+    if (hid_ctx.scan_retry_valid &&
+        (TickType_t)(now - hid_ctx.scan_retry_tick) < MANUAL_SCAN_RETRY_TICKS)
+        return true;
+    hid_ctx.scan_retry_valid = true;
+    hid_ctx.scan_retry_tick = now;
+
+    /* Cancel even when the app says IDLE: the SDK may still be resolving
+     * names or retaining an inquiry whose previous start returned an error. */
+    int err = bt_br_discovery_stop();
+    if (err && err != -EALREADY) {
+        LOG_WRN("[BT] Manual scan: stop failed (%d), retrying\n", err);
+        return true;
+    }
+    if (hid_ctx.conn || hid_ctx.teardown_pending)
+        return true;
+
+    err = bt_br_set_connectable(true);
+    if (err && err != -EALREADY) {
+        LOG_WRN("[BT] Manual scan: page scan failed (%d), retrying\n", err);
+        return true;
+    }
+    if (hid_ctx.conn || hid_ctx.teardown_pending)
+        return true;
+    err = bt_br_set_discoverable(true);
+    if (err && err != -EALREADY) {
+        LOG_WRN("[BT] Manual scan: discoverable failed (%d), retrying\n", err);
+        return true;
+    }
+    if (hid_ctx.conn || hid_ctx.teardown_pending)
+        return true;
+
+    hid_ctx.connect_pending = false;
+    hid_ctx.security_pending = false;
+    hid_ctx.sdp_pending = false;
+    hid_ctx.outgoing = false;
+    set_state(BT_HID_STATE_IDLE);
+    /* Accept callbacks for the new inquiry, including completion delivered
+     * before discovery_start returns. Failed submission retains the request. */
+    hid_ctx.scan_requested = false;
+    err = bt_hid_host_scan_start(0);
+    if (err) {
+        hid_ctx.scan_requested = true;
+        LOG_WRN("[BT] Manual scan: start failed (%d), retrying\n", err);
+    } else {
+        hid_ctx.scan_retry_valid = false;
+        switch_pending = false;
+        LOG_INF("[BT] Manual scan started\n");
+    }
+    return true;
 }
 
 void bt_hid_host_scan_stop(void)
@@ -1430,7 +1539,7 @@ void bt_hid_host_scan_stop(void)
 
 bool bt_hid_host_poll_scan_early(void)
 {
-    if (hid_ctx.state != BT_HID_STATE_SCANNING)
+    if (hid_ctx.state != BT_HID_STATE_SCANNING || hid_ctx.scan_requested)
         return false;
 
     for (int i = 0; i < BT_MAX_DISCOVERED; i++) {
@@ -1466,7 +1575,7 @@ bool bt_hid_host_poll_scan_early(void)
 
 bool bt_hid_host_poll_connect(void)
 {
-    if (!hid_ctx.connect_pending || hid_ctx.teardown_pending)
+    if (!hid_ctx.connect_pending || hid_ctx.teardown_pending || hid_ctx.scan_requested)
         return false;
 
     /* If controller already reconnected (incoming), cancel outgoing */
@@ -1830,7 +1939,7 @@ bool bt_hid_host_poll_disconnect(void)
     taskEXIT_CRITICAL();
     if (drained) {
         const bt_addr_t *remote = conn_get_br_addr(conn);
-        bool retry = hid_ctx.fallback_retry && !switch_pending &&
+        bool retry = hid_ctx.fallback_retry && !switch_pending && !hid_ctx.scan_requested &&
                      bonded_count > 0 && remote;
         if (retry)
             bt_addr_copy(&hid_ctx.pending_addr, remote);
@@ -1865,7 +1974,7 @@ bool bt_hid_host_poll_disconnect(void)
         hid_ctx.conn = NULL;
         bt_conn_unref(conn);
         taskEXIT_CRITICAL();
-        /* on_hid_state(IDLE) may start a user-requested scan. */
+        /* Manual scans are submitted by the next BT task poll, after cleanup. */
         set_state(BT_HID_STATE_IDLE);
         hid_ctx.teardown_pending = false;
         switch_pending = false;
@@ -2104,46 +2213,10 @@ int bt_hid_host_switch_next(void)
     char addr_str[BT_ADDR_STR_LEN];
     bt_addr_to_str(addr, addr_str, sizeof(addr_str));
 
-    if (hid_ctx.conn) {
-        /* Block further BT sends immediately */
-        hid_ctx.ctrl_connected = false;
-        hid_ctx.intr_connected = false;
-        switch_pending = true;
-        hid_ctx.fallback_retry = false;
-
-        LOG_INF("[BT] Switching: disconnect current → wait ACL teardown → "
-               "reconnect [%d/%d] %s\n", active_idx, bonded_count, addr_str);
-        request_disconnect(hid_ctx.conn);
-        /* The BT task reopens scanning after SDK channel cleanup. */
-    } else {
-        if (hid_ctx.state == BT_HID_STATE_SCANNING)
-            bt_br_discovery_stop();
-
-        hid_ctx.ctrl_accepting = false;
-        hid_ctx.intr_accepting = false;
-        hid_ctx.outgoing = false;
-        hid_ctx.is_dse = false;
-        hid_ctx.check_dse = false;
-        hid_ctx.security_pending = false;
-        hid_ctx.security_done = false;
-        hid_ctx.sdp_pending = false;
-        hid_ctx.connect_pending = false;
-        hid_ctx.handshake_next  = 0;
-        hid_ctx.handshake_count = 0;
-        hid_ctx.handshake_send_failed = false;
-
-        app_tx_fifo_reset();
-        feature_cache_clear();
-        dse_reset();
-        cached_rssi = 1;
-
-        bt_br_set_connectable(true);
-        bt_br_set_discoverable(true);
-
-        LOG_INF("[BT] Switched to controller [%d/%d] %s — waiting for reconnect\n",
-               active_idx, bonded_count, addr_str);
-        set_state(BT_HID_STATE_IDLE);
-    }
+    switch_pending = true;
+    LOG_INF("[BT] Switching to controller [%d/%d] %s\n",
+            active_idx, bonded_count, addr_str);
+    request_scan(false);
 
     return (int)active_idx;
 }

@@ -74,6 +74,11 @@ int bt_hid_host_init(const struct bt_hid_host_config *config);
  */
 int bt_hid_host_scan_start(uint8_t duration_sec);
 
+/* BT task only: queue a fresh, unrestricted inquiry without deleting bonds.
+ * Busy inquiry/ACL cleanup and failed HCI submissions are handled by the poll. */
+void bt_hid_host_request_pairing(void);
+bool bt_hid_host_poll_pairing(void);
+
 /**
  * Stop scanning.
  */

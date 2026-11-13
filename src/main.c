@@ -71,7 +71,6 @@ static volatile uint64_t handshake_start_us;
 static volatile TickType_t connecting_start_tick = 0;
 static volatile bool dse_mode_changed = false;
 static volatile bool prev_led_disabled = false;
-static volatile bool scan_after_disconnect = false;
 /* Deferred USB soft-disconnect: wait N seconds after BT disconnect before
  * pulling USB, so quick controller switching preserves Windows audio session. */
 #define USB_DEFERRED_DISC_US  (10ULL * 1000000ULL)
@@ -402,14 +401,8 @@ static void on_hid_state(enum bt_hid_host_state state)
         }
         if (!conn_led_off)
             led_status_set(was_connected ? LED_RED_BLINK : LED_PURPLE_BLINK_SLOW);
-        if (state == BT_HID_STATE_IDLE && scan_after_disconnect) {
-            scan_after_disconnect = false;
-            LOG_INF("[MAIN] State: IDLE — button-triggered rescan\n");
-            bt_hid_host_scan_start(0);
-        } else {
-            LOG_INF("[MAIN] State: %s\n",
-                    state == BT_HID_STATE_IDLE ? "IDLE" : "DISCONNECTING");
-        }
+        LOG_INF("[MAIN] State: %s\n",
+                state == BT_HID_STATE_IDLE ? "IDLE" : "DISCONNECTING");
         break;
     }
 
@@ -727,30 +720,25 @@ static void bt_task(void *arg)
                     btn_fsm = BTN_IDLE;
                     btn_press_samples = 0;
 
+                    /* Manual actions must be visible even after LED auto-off. */
+                    conn_led_off = false;
+                    conn_led_start_us = bflb_mtimer_get_time_us();
+                    scan_fail_count = 0;
+                    scan_retry_ticks = 0;
+                    led_status_set(LED_PURPLE_BLINK_FAST);
+
                     if (clicks == 1) {
                         if (bt_hid_host_get_bonded_count() > 1) {
                             int next = bt_hid_host_switch_next();
                             LOG_INF("[BTN] Single click — switching to controller %d\n", next);
                         } else {
-                            LOG_INF("[BTN] Single click — only 1 bonded, fresh scan\n");
-                            scan_fail_count = 0;
-                            if (ds5_connected) {
-                                scan_after_disconnect = true;
-                                bt_hid_host_disconnect();
-                            } else {
-                                bt_hid_host_scan_start(0);
-                            }
+                            LOG_INF("[BTN] Single click — fresh pairing requested\n");
+                            bt_hid_host_request_pairing();
                         }
                         idle_ticks = 0;
                     } else if (clicks >= 2) {
-                        LOG_INF("[BTN] Double click — disconnect + fresh scan\n");
-                        scan_fail_count = 0;
-                        if (ds5_connected) {
-                            scan_after_disconnect = true;
-                            bt_hid_host_disconnect();
-                        } else {
-                            bt_hid_host_scan_start(0);
-                        }
+                        LOG_INF("[BTN] Double click — fresh pairing requested\n");
+                        bt_hid_host_request_pairing();
                         idle_ticks = 0;
                     }
                 }
@@ -785,6 +773,11 @@ static void bt_task(void *arg)
          * cleanup before reopening the connection. Keep polling even when
          * USB/audio tasks detect the loss first. */
         if (bt_hid_host_poll_disconnect()) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        if (bt_hid_host_poll_pairing()) {
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }

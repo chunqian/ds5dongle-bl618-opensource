@@ -186,9 +186,14 @@ LCTech BL616 has a single blue LED (GPIO27); states are distinguished by blink c
 
 | Gesture | Action |
 |---------|--------|
-| **Single click** | Switch to the next paired controller (up to 8 remembered) |
+| **Single click** | Switch to the next paired controller; with 0 or 1 saved controller, scan for pairing (up to 8 remembered) |
 | **Double click** | Disconnect current controller + scan for a new one (link keys preserved) |
 | **Long press (3s)** | Since R7: release after the triple blink to reboot and reset all saved settings, bonds and remap profiles |
+
+Since R9, single/double-click scan requests wait for inquiry and ACL cleanup and retry failed
+HCI submissions. Fresh pairing removes the previous target-address filter without deleting bonds;
+switching between saved controllers stays targeted. Button actions also restore the status LED
+after automatic shutoff. Manual inquiries run in the BT task, never from a state callback.
 
 Hold BOOT only after normal startup; holding it while plugging in USB still enters download mode.
 Factory reset clears all PSM settings, including audio/LED/polling/touchpad configuration, remap

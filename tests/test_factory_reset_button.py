@@ -30,11 +30,12 @@ harness = r'''
 #define LOG_INF(...) ((void)0)
 #define LOG_ERR(...) ((void)0)
 #define pdMS_TO_TICKS(v) (v)
-static bool pending, ds5_connected, scan_after_disconnect;
+static bool pending, ds5_connected, conn_led_off;
+static uint64_t conn_led_start_us;
 static enum factory_reset_request_result request_result = FACTORY_RESET_REQUEST_ARMED;
 static bool usb_reset_pending, arm_during_delay;
 static unsigned requests, resets, switches, scans, disconnects, saves;
-static unsigned idle_ticks, scan_fail_count;
+static unsigned idle_ticks, scan_fail_count, scan_retry_ticks, bonded_count = 2;
 static enum led_pattern led;
 enum factory_reset_request_result factory_reset_request(void) {
     ++requests;
@@ -43,10 +44,10 @@ enum factory_reset_request_result factory_reset_request(void) {
 }
 bool factory_reset_is_pending(void) { return pending; }
 void led_status_set(enum led_pattern p) { led = p; }
-static int bt_hid_host_get_bonded_count(void) { return 2; }
+static int bt_hid_host_get_bonded_count(void) { return bonded_count; }
 static int bt_hid_host_switch_next(void) { ++switches; return 1; }
-static void bt_hid_host_disconnect(void) { ++disconnects; }
-static void bt_hid_host_scan_start(int mode) { assert(mode == 0); ++scans; }
+static void bt_hid_host_request_pairing(void) { ++scans; }
+static uint64_t bflb_mtimer_get_time_us(void) { return 1234567; }
 static void GLB_SW_System_Reset(void) { ++resets; }
 static void config_save(void) { ++saves; }
 static void vTaskDelay(unsigned ms) {
@@ -58,7 +59,10 @@ harness += state + '\nstatic void poll(bool pressed) {\n' + fsm + '\n}\n'
 harness += '\nstatic void usb_reset(void) {\n' + reset + '\n}\n'
 harness += r'''
 static void setup(void) {
-    pending = ds5_connected = scan_after_disconnect = usb_reset_pending = arm_during_delay = false;
+    pending = ds5_connected = usb_reset_pending = arm_during_delay = false;
+    conn_led_off = true;
+    conn_led_start_us = 0;
+    bonded_count = 2;
     request_result = FACTORY_RESET_REQUEST_ARMED;
     requests = resets = switches = scans = disconnects = saves = 0;
     btn_fsm = BTN_IDLE;
@@ -77,7 +81,16 @@ int main(void) {
     assert(!requests && !resets && !switches && scans == 1);
     setup(); ds5_connected = true;
     poll(true); poll(false); poll(true); ticks(false, 6);
-    assert(disconnects == 1 && scan_after_disconnect && !requests);
+    assert(scans == 1 && !disconnects && !requests);
+    for (unsigned bonds = 0; bonds <= 1; ++bonds) {
+        for (unsigned connected = 0; connected <= 1; ++connected) {
+            setup(); bonded_count = bonds; ds5_connected = connected;
+            poll(true); ticks(false, 6);
+            assert(scans == 1 && !switches && !disconnects);
+            assert(!conn_led_off && conn_led_start_us == 1234567);
+            assert(led == LED_PURPLE_BLINK_FAST);
+        }
+    }
 
     setup(); request_result = FACTORY_RESET_REQUEST_CANCELLED;
     ticks(true, 30); ticks(true, 60); poll(false);

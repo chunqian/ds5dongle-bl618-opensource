@@ -15,7 +15,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 KIT = f'DS5Dongle-{RELEASE}-Mac-Signing-Kit'
 # Both the ARM64 and Intel backends produced this exact image in offline validation.
-IMAGE_SHA = '648bde464cbf502c2cfcf330a47aa8b45d5f15745fda4e07e469f21108ba8dff'
+IMAGE_SHA = 'cc891cdac40c6514704d6f118866c5410abb885e811935ff4d264a87b12b71df'
 
 
 def main():

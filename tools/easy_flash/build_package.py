@@ -15,11 +15,11 @@ import zipfile
 REPO = Path(__file__).resolve().parents[2]
 TEMPLATES = Path(__file__).resolve().parent
 SDK_COMMIT = "b3532953322194233f80436701e7fb6bb4ad8275"
-FIRMWARE_SHA = "8bd223898d9c595b2b577e87b0b9a77935d7c1611fa6d0ff72e35515a1959833"
-RELEASE = "R8"
-VERSION = "LCT616-DS5 3.18H-HidAudio-R8"
-NAME = "DS5Dongle-LCTech616-HS-HidAudio-R8-Flash"
-# R8 has passed the host tests and compilation, but has not been flashed yet.
+FIRMWARE_SHA = "b523625c626b012c32398908d8de199d9a058d2c1b3a33230252ffe659e36019"
+RELEASE = "R9"
+VERSION = "LCT616-DS5 3.18H-HidAudio-R9"
+NAME = "DS5Dongle-LCTech616-HS-HidAudio-R9-Flash"
+# R9 has passed the host tests and compilation, but has not been flashed yet.
 FIRMWARE_HARDWARE_TESTED = False
 
 
@@ -183,7 +183,7 @@ def build_platform(args, platform, revision):
             'Wrapper sources (both platforms, for rebuilding): source/easy_flash (GPL-3.0-or-later)\n'
             'Upstream license texts and release notes: licenses/\n'
             'Stock utils/pem files are public SDK test material; this package does not enable firmware signing or efuse programming.\n'
-            'R8 firmware has passed compilation and host tests; hardware flashing has not been verified.\n')
+            'R9 firmware has passed compilation and host tests; hardware flashing has not been verified.\n')
         if platform == 'macos':
             notice += (
                 'Intel Mac FlashCube uses the pinned SDK binary, with its code signature replaced in signed packages.\n'
@@ -229,7 +229,7 @@ def main():
     if args.platform == 'windows' and args.sign_identity:
         parser.error('--sign-identity applies only to --platform macos or all')
     if sha(firmware / "ds5dongle-lctech616-hs.bin") != FIRMWARE_SHA:
-        raise SystemExit("Expected the pinned R8 HS binary; update version/hash deliberately for a new release.")
+        raise SystemExit("Expected the pinned R9 HS binary; update version/hash deliberately for a new release.")
     if VERSION.encode() not in (firmware / "ds5dongle-lctech616-hs.bin").read_bytes():
         raise SystemExit("Firmware version does not match package metadata.")
     subprocess.run(["git", "-C", str(REPO), "diff", "--exit-code", "HEAD", "--", "src", "CMakeLists.txt", "cmake"], check=True)

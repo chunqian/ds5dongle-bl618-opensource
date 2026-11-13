@@ -95,6 +95,16 @@ static int connect_result, disconnect_result;
 static bool callback_during_disconnect, finish_sdk_in_send;
 static bool callback_during_create;
 static bool incoming_during_open;
+static unsigned inquiry_starts, inquiry_stops, persisted_idx;
+static int inquiry_start_result, inquiry_stop_result, page_scan_result, discoverable_result;
+static bool inquiry_active, result_during_stop, result_during_start, incoming_during_stop;
+static bool incoming_during_start;
+#define BT_MAX_DISCOVERED 8
+#define BT_INQUIRY_LEN 5
+struct bt_br_discovery_result { bt_addr_t addr; uint8_t cod[3]; };
+struct bt_br_discovery_param { uint8_t length; bool limited; };
+static struct bt_br_discovery_result discovery_results[BT_MAX_DISCOVERED];
+static void discovery_complete(struct bt_br_discovery_result *, size_t);
 static bool app_tx_busy;
 static bt_addr_t deleted_addr;
 static void conn_disconnected(struct bt_conn *, uint8_t);
@@ -107,9 +117,40 @@ start = source.index('static struct {', source.index('/* ---------- internal sta
 harness += source[start:source.index('} hid_ctx;', start) + len('} hid_ctx;')]
 harness += r'''
 static void set_state(enum bt_hid_host_state s) { hid_ctx.state=s; }
-static int bt_br_set_connectable(bool b) { if (b) { assert(!hid_ctx.teardown_pending); ++scans_enabled; } return 0; }
-static int bt_br_set_discoverable(bool b) { (void)b; return 0; }
-static int bt_br_discovery_stop(void) { return 0; }
+static int bt_br_set_connectable(bool b) { if (b) { assert(!hid_ctx.teardown_pending); ++scans_enabled; } return page_scan_result; }
+static int bt_br_set_discoverable(bool b) { (void)b; return discoverable_result; }
+static struct bt_br_discovery_result gamepad(unsigned addr) {
+    struct bt_br_discovery_result r={.addr={{0}},.cod={0x08,0x05,0}};
+    r.addr.val[0]=addr; return r;
+}
+static int bt_br_discovery_stop(void) {
+    ++inquiry_stops;
+    if (result_during_stop) {
+        struct bt_br_discovery_result r=gamepad(3);
+        result_during_stop=false; discovery_complete(&r,1);
+    }
+    if (incoming_during_stop) {
+        incoming_during_stop=false; conn_connected(&current,0);
+    }
+    if (inquiry_stop_result) return inquiry_stop_result;
+    bool was_active=inquiry_active; inquiry_active=false;
+    return was_active ? 0 : -EALREADY;
+}
+static int bt_br_discovery_start(const struct bt_br_discovery_param *p,
+        struct bt_br_discovery_result *r, size_t n,
+        void (*cb)(struct bt_br_discovery_result *, size_t)) {
+    (void)p;(void)r;(void)n;
+    ++inquiry_starts;
+    if (incoming_during_start) { incoming_during_start=false; conn_connected(&current,0); }
+    if (inquiry_start_result) return inquiry_start_result;
+    inquiry_active=true;
+    if (result_during_start) {
+        struct bt_br_discovery_result found=gamepad(3);
+        result_during_start=false; inquiry_active=false; cb(&found,1);
+    }
+    return 0;
+}
+static void bonded_list_persist_idx(void) { ++persisted_idx; }
 static void app_tx_fifo_reset(void) { app_tx_busy=false; }
 static void feature_cache_clear(void) {}
 static void dse_reset(void) {}
@@ -171,13 +212,14 @@ int bt_l2cap_send_cb(struct bt_conn *c, uint16_t cid, struct net_buf *b,
     return 0;
 }
 '''
-for define in ('DISCONNECT_TIMEOUT_TICKS', 'DISCONNECT_RETRY_TICKS',
+for define in ('DISCONNECT_TIMEOUT_TICKS', 'DISCONNECT_RETRY_TICKS', 'MANUAL_SCAN_RETRY_TICKS',
                'SECURITY_TIMEOUT_TICKS', 'INCOMING_L2CAP_FALLBACK_MS'):
     harness += next(line for line in source.splitlines() if line.startswith('#define '+define+' ')) + '\n'
 for signature in (
     'static bool channel_is_current(', 'static struct bt_conn *active_conn_ref(',
     'static int send_hid_buf(', 'static void request_disconnect(',
     'static void record_security_failure(', 'static void conn_disconnected(',
+    'static void discovery_complete(',
     'static void l2cap_ctrl_disconnected(', 'static void l2cap_intr_disconnected(',
     'static void on_hid_output_sent(', 'static void security_changed(',
     'static void auth_pairing_failed(', 'static void conn_connected(',
@@ -186,6 +228,9 @@ for signature in (
     'void bt_hid_host_disconnect(', 'void bt_hid_host_force_disconnect(',
     'void bt_hid_host_drop_stale_conn(', 'bool bt_hid_host_has_pending_conn(',
     'bool bt_hid_host_poll_disconnect(', 'bool bt_hid_host_poll_connect(',
+    'int bt_hid_host_scan_start(', 'static void request_scan(',
+    'void bt_hid_host_request_pairing(', 'bool bt_hid_host_poll_pairing(',
+    'int bt_hid_host_switch_next(',
     'bool bt_hid_host_poll_security_watchdog(', 'bool bt_hid_host_poll_sdp(',
     'bool bt_hid_host_poll_incoming_l2cap_fallback(',
     'int bt_hid_host_get_feature(', 'int bt_hid_host_set_feature(',
@@ -213,6 +258,10 @@ static void setup(void) {
     callback_during_create=false;
     incoming_during_open=false;
     connect_result=disconnect_result=0;
+    inquiry_starts=inquiry_stops=persisted_idx=0;
+    inquiry_start_result=inquiry_stop_result=page_scan_result=discoverable_result=0;
+    inquiry_active=result_during_stop=result_during_start=incoming_during_stop=false;
+    incoming_during_start=false;
 }
 int main(void) {
     /* Disconnect callback runs inside the blocking HCI request. It must not
@@ -402,8 +451,111 @@ int main(void) {
     tick+=500; connect_result=0; assert(bt_hid_host_poll_connect() && !hid_ctx.connect_retries);
     hid_ctx.state=BT_HID_STATE_IDLE; hid_ctx.connect_pending=true;
     connect_result=-ENOMEM; assert(bt_hid_host_poll_connect() && hid_ctx.connect_retries==1);
+    /* Manual pairing must survive every busy state, without deleting bonds or
+     * reusing live channels. This exercises the real scan function, not a
+     * success-only button stub. */
+    for (unsigned s=BT_HID_STATE_IDLE; s<=BT_HID_STATE_DISCONNECTING; ++s) {
+        setup(); hid_ctx.state=s;
+        bool owns_acl=s>=BT_HID_STATE_CONNECTING;
+        if (!owns_acl) {
+            hid_ctx.conn=NULL;
+            hid_ctx.ctrl_chan.chan.conn=hid_ctx.intr_chan.chan.conn=NULL;
+        }
+        inquiry_active=(s==BT_HID_STATE_SCANNING);
+        hid_ctx.has_target=true; hid_ctx.target_addr=current.addr;
+        hid_ctx.connect_pending=true; hid_ctx.fallback_retry=true;
+        bt_hid_host_request_pairing();
+        assert(hid_ctx.scan_requested && !hid_ctx.has_target);
+        assert(!hid_ctx.connect_pending && !hid_ctx.fallback_retry && !deleted_keys);
+        struct bt_l2cap_chan *ch=NULL;
+        assert(l2cap_ctrl_server_accept(&current,&ch)==-EBUSY);
+        if (owns_acl) {
+            assert(bt_hid_host_poll_pairing() && !inquiry_starts);
+            assert(hid_ctx.conn==&current && current.ref==2);
+            sdk_finish(); bt_hid_host_poll_disconnect();
+            assert(!hid_ctx.conn && hid_ctx.scan_requested && !inquiry_starts);
+        }
+        assert(bt_hid_host_poll_pairing());
+        assert(inquiry_starts==1 && !hid_ctx.scan_requested && !deleted_keys);
+        assert(hid_ctx.state==BT_HID_STATE_SCANNING);
+        assert(!bt_hid_host_poll_pairing());
+        struct bt_br_discovery_result found=gamepad(3);
+        discovery_complete(&found,1);
+        assert(hid_ctx.connect_pending && hid_ctx.pending_addr.val[0]==3);
+    }
+
+    /* A stale outgoing attempt without an ACL is cancelled. Failure to stop
+     * inquiry or restart it retains the request, with a 500 ms retry cadence. */
+    for (unsigned failure=0;failure<4;failure++) {
+        setup(); hid_ctx.conn=NULL;
+        hid_ctx.ctrl_chan.chan.conn=hid_ctx.intr_chan.chan.conn=NULL;
+        hid_ctx.state=BT_HID_STATE_CONNECTING; hid_ctx.connect_pending=true;
+        if (failure==0) inquiry_stop_result=-EIO;
+        if (failure==1) inquiry_start_result=-EALREADY;
+        if (failure==2) page_scan_result=-ENOBUFS;
+        if (failure==3) discoverable_result=-EIO;
+        tick=UINT32_MAX-100;
+        bt_hid_host_request_pairing(); bt_hid_host_poll_pairing();
+        assert(hid_ctx.scan_requested && !hid_ctx.connect_pending);
+        unsigned calls=inquiry_stops;
+        tick+=499; bt_hid_host_poll_pairing(); assert(inquiry_stops==calls);
+        tick++;
+        inquiry_stop_result=inquiry_start_result=page_scan_result=discoverable_result=0;
+        bt_hid_host_poll_pairing();
+        assert(!hid_ctx.scan_requested && hid_ctx.state==BT_HID_STATE_SCANNING);
+        assert(inquiry_stops==calls+1 && !deleted_keys);
+    }
+
+    /* Old discovery results are ignored during cancellation, but synchronous
+     * completion of the new inquiry is accepted, even before start returns. */
+    setup(); hid_ctx.conn=NULL; hid_ctx.state=BT_HID_STATE_SCANNING;
+    hid_ctx.ctrl_chan.chan.conn=hid_ctx.intr_chan.chan.conn=NULL;
+    result_during_stop=true; result_during_start=true;
+    bt_hid_host_request_pairing(); bt_hid_host_poll_pairing();
+    assert(!hid_ctx.scan_requested && hid_ctx.connect_pending);
+    assert(hid_ctx.state==BT_HID_STATE_CONNECTING && hid_ctx.pending_addr.val[0]==3);
+
+    /* An incoming ACL racing cancellation must drain before the requested
+     * inquiry starts. The request is neither lost nor allowed to reuse refs. */
+    setup(); hid_ctx.conn=NULL; hid_ctx.state=BT_HID_STATE_SCANNING;
+    hid_ctx.ctrl_chan.chan.conn=hid_ctx.intr_chan.chan.conn=NULL;
+    incoming_during_stop=true; bt_hid_host_request_pairing();
+    bt_hid_host_poll_pairing();
+    assert(hid_ctx.scan_requested && hid_ctx.teardown_pending && !inquiry_starts);
+    assert(hid_ctx.conn==&current && current.ref==3);
+    sdk_finish(); bt_conn_unref(&current); bt_hid_host_poll_disconnect();
+    tick+=500; bt_hid_host_poll_pairing();
+    assert(!hid_ctx.scan_requested && inquiry_starts==1);
+
+    /* An incoming ACL during the new start is valid. A failed start must not
+     * roll its CONNECTING state back to IDLE, and must retain the request. */
+    for (unsigned failed=0;failed<2;failed++) {
+        setup(); hid_ctx.conn=NULL; hid_ctx.state=BT_HID_STATE_IDLE;
+        hid_ctx.ctrl_chan.chan.conn=hid_ctx.intr_chan.chan.conn=NULL;
+        bt_hid_host_request_pairing(); incoming_during_start=true;
+        inquiry_start_result=failed ? -EIO : 0;
+        bt_hid_host_poll_pairing();
+        assert(hid_ctx.conn==&current && hid_ctx.state==BT_HID_STATE_CONNECTING);
+        assert(hid_ctx.scan_requested==(bool)failed);
+    }
+
+    /* Multi-controller single click stays targeted, including a superseding
+     * click while switching. Double click then opens discovery to all pads. */
+    setup(); bonded_count=3; bonded_list[1]=other.addr; bonded_list[2].val[0]=3;
+    assert(bt_hid_host_switch_next()==1 && persisted_idx==1);
+    TickType_t started=hid_ctx.teardown_started;
+    assert(bt_hid_host_switch_next()==2 && persisted_idx==2);
+    assert(hid_ctx.teardown_started==started && hid_ctx.target_addr.val[0]==3);
+    sdk_finish(); bt_hid_host_poll_disconnect(); bt_hid_host_poll_pairing();
+    assert(!switch_pending && !hid_ctx.scan_requested && hid_ctx.has_target);
+    struct bt_br_discovery_result candidates[]={gamepad(2),gamepad(3)};
+    discovery_complete(candidates,2);
+    assert(hid_ctx.connect_pending && hid_ctx.pending_addr.val[0]==3);
+    bt_hid_host_request_pairing(); bt_hid_host_poll_pairing();
+    discovery_complete(candidates,2);
+    assert(hid_ctx.connect_pending && hid_ctx.pending_addr.val[0]==2 && !deleted_keys);
     assert(!critical_depth);
-    puts("PASS: Bluetooth callback ordering, ownership, bounded recovery, bonds, channels, TX and retries");
+    puts("PASS: Bluetooth ownership, callback ordering, TX, manual pairing in all states, scan failure retries, racing ACL/results, target switching and bond preservation");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='ds5-bt-reconnect-') as tmp:

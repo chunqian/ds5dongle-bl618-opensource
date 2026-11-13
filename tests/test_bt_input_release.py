@@ -100,7 +100,7 @@ assert 'process_input_release();\n        if (!ds5_connected)' in source
 harness += r'''
 static void setup(void) {
     ds5_connected=false; ever_connected=false; input_release_pending=false;
-    queued=disconnect_during_copy=switching=suspended=scan_after_disconnect=false;
+    queued=disconnect_during_copy=switching=suspended=false;
     critical_depth=publications=scans=remap_resets=0;
     memset(host_report,0x55,sizeof(host_report));
     on_hid_state(BT_HID_STATE_CONNECTED);
@@ -149,11 +149,12 @@ int main(void) {
     usb_gamepad_send_raw_input(readback+2); assert(process_input_release());
     expect_neutral(); assert(publications==2 && !queued);
 
-    /* User-requested inquiry waits for actual SDK cleanup, not logical loss. */
-    setup(); scan_after_disconnect=true;
+    /* State callbacks must not submit HCI inquiries; the BT task retries them
+     * after actual SDK cleanup (covered by test_bt_reconnect.py). */
+    setup();
     on_hid_state(BT_HID_STATE_DISCONNECTING);
-    assert(scan_after_disconnect && !scans);
-    on_hid_state(BT_HID_STATE_IDLE); assert(!scan_after_disconnect && scans==1);
+    assert(!scans);
+    on_hid_state(BT_HID_STATE_IDLE); assert(!scans);
     assert(!critical_depth);
     puts("PASS: immediate logical loss, neutral without ACL cleanup, stale reports, mid-copy loss, quick reconnect and deferred scan");
     return 0;
