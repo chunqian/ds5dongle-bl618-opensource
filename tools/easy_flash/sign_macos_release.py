@@ -257,7 +257,7 @@ def make_dmg(package, identity, output):
         '请把整个 DS5Dongle 文件夹复制到本机“下载”或“桌面”，再双击其中的 Flash-Mac.command。\n'
         '不要直接在只读磁盘映像中烧录。\n', encoding='utf-8')
     dmg = output / (package.name + '.dmg')
-    run(['/usr/bin/hdiutil', 'create', '-srcfolder', package.parent, '-volname', 'DS5Dongle R6',
+    run(['/usr/bin/hdiutil', 'create', '-srcfolder', package.parent, '-volname', 'DS5Dongle Mac',
          '-format', 'UDZO', '-fs', 'HFS+', dmg], timeout=300, log=output / 'dmg-build.log')
     run(['/usr/bin/codesign', '--force', '--sign', identity['sha1'], '--timestamp', dmg])
     verify_signature(dmg, identity['name'], runtime=False)

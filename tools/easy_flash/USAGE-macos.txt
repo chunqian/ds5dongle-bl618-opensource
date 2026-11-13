@@ -1,0 +1,8 @@
+Mac
+- 支持 Apple 芯片和 Intel Mac（macOS 11 或更新），自动选择对应的原生程序。
+- 不需要 Rosetta、Python、Homebrew、Xcode 或 SDK；运行依赖已随包提供。
+- 名称带 Signed 的安装包已对 Mac 烧录程序、运行库和端口检测程序进行证书签名，
+  详细身份和文件哈希见 signing-info.json。Flash-Mac.command 是启动脚本，不是 .app。
+  Apple Development 开发签名不等于 Developer ID 分发签名，本包未经过苹果公证。
+- 从网络下载后，macOS 可能要求首次允许运行：在“系统设置 → 隐私与安全性”
+  中允许此工具，再重新打开；不要关闭系统的整体安全检查。
