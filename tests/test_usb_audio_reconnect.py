@@ -21,6 +21,16 @@ def event_body(name):
     return source[source.index("\n", start) + 1:end]
 
 
+def extract(signature):
+    start = source.index(signature)
+    end = source.index("{", start) + 1
+    depth = 1
+    while depth:
+        depth += (source[end] == "{") - (source[end] == "}")
+        end += 1
+    return source[start:end]
+
+
 harness = r"""
 #include "usb_audio_control.h"
 #include <assert.h>
@@ -34,7 +44,13 @@ harness = r"""
 #define LOG_INF(...) ((void)0)
 static struct usb_audio_control audio_control;
 static bool usb_configured, ep_in_busy, kbd_ep_busy, pending_valid, pending_active;
-static bool first_usb_send_logged, detached;
+static bool first_usb_send_logged, usb_bt_hidden, usb_reenumerating;
+static uint32_t usb_regs[0x118/4];
+#define USB_BASE ((uintptr_t)usb_regs)
+#define detached (usb_regs[0x114/4] & 1u)
+static unsigned suspends;
+static void note_suspend(void) { ++suspends; }
+static void (*hook_suspend)(void) = note_suspend;
 static unsigned profile, profile_changes, connects, inject;
 static unsigned critical_depth, unprotected_time_samples;
 static bool inject_command_on_enter;
@@ -54,8 +70,7 @@ static uint64_t bflb_mtimer_get_time_us(void) {
     if (!critical_depth) unprotected_time_samples++;
     return now_us;
 }
-static void usb_soft_disconnect(void) { detached = true; }
-static void usb_soft_connect(void) { assert(detached); detached = false; connects++; }
+
 static void usb_audio_stop(void) {}
 static void usb_audio_mic_stop(void) {}
 static void audio_set_mic_active(bool enabled) { (void)enabled; }
@@ -69,6 +84,11 @@ static void apply_audio_profile(void) {
     }
 }
 """
+harness += extract("void usb_soft_disconnect(") + "\n"
+harness += extract("void usb_soft_connect(").replace("void usb_soft_connect", "static void actual_usb_soft_connect") + "\n"
+harness += "static void usb_soft_connect(void) { bool was_detached=detached; actual_usb_soft_connect(); if(was_detached && !detached) ++connects; }\n"
+harness += extract("bool usb_gamepad_set_bt_visible(") + "\n"
+harness += "static void suspend(void) {\n" + event_body("USBD_EVENT_SUSPEND") + "}\n"
 harness += "static void bus_reset(void) {\n" + event_body("USBD_EVENT_RESET") + "}\n"
 harness += "static void physical_disconnect(void) {\n" + event_body("USBD_EVENT_DISCONNECTED") + "}\n"
 harness += r"""
@@ -80,13 +100,19 @@ static void vTaskDelay(unsigned ms) {
     inject = 0;
     if (event == 1) bus_reset();
     if (event == 2) physical_disconnect();
+    if (event == 3) { usb_gamepad_set_bt_visible(false); suspend(); }
+    if (event == 4) {
+        usb_gamepad_set_bt_visible(false); usb_gamepad_set_bt_visible(true);
+        assert(detached); /* BT may not shorten the audio descriptor detach. */
+    }
 }
 """ + task + r"""
 static void setup(void) {
     memset(&audio_control, 0, sizeof(audio_control));
     usb_configured = true;
     ep_in_busy = kbd_ep_busy = pending_valid = pending_active = first_usb_send_logged = false;
-    detached = false;
+    memset(usb_regs,0,sizeof(usb_regs));
+    usb_bt_hidden=usb_reenumerating=false; suspends=0;
     profile = profile_changes = connects = inject = 0;
     critical_depth = unprotected_time_samples = 0;
     inject_command_on_enter = false;
@@ -135,6 +161,9 @@ int main(void) {
     bus_reset(); /* Same-host bus reset; no OS device-match callback assumed. */
     assert(profile == 3 && profile_changes == before);
     assert(audio_control.visible && detached);
+    suspend(); assert(!suspends);
+    usb_gamepad_set_bt_visible(true);
+    assert(detached); /* BT cannot bypass descriptor revocation after reset. */
     /* Must recover even if the host never sends SET_CONFIGURATION again. */
     now_us += 100001;
     usb_gamepad_process_deferred();
@@ -158,7 +187,20 @@ int main(void) {
         assert(!audio_control.grant_until_us && profile == 0 && !detached);
         bus_reset(); configured(); enable();
     }
-    puts("PASS: atomic time/request snapshot, full command grace, reset/unplug recovery, no reconnect loop");
+    setup(); request(true); now_us+=100001; inject=3;
+    usb_gamepad_process_deferred();
+    assert(detached && usb_bt_hidden && !connects && !suspends);
+    now_us+=10000000; usb_gamepad_process_deferred();
+    assert(detached && !connects); /* Grant expiry also respects BT visibility. */
+    assert(usb_gamepad_set_bt_visible(true));
+    assert(!detached && connects==1);
+    assert(!usb_gamepad_set_bt_visible(true) && connects==1);
+    suspend(); assert(suspends==1); /* Genuine host suspend is still delivered. */
+
+    setup(); request(true); now_us+=100001; inject=4;
+    usb_gamepad_process_deferred();
+    assert(!detached && connects==1 && audio_control.visible);
+    puts("PASS: BT visibility, suspend filtering, descriptor detach interval, atomic time/request snapshot, full command grace, reset/unplug recovery, no reconnect loop");
 }
 """
 with tempfile.TemporaryDirectory(prefix="ds5-usb-reconnect-") as directory:

@@ -53,7 +53,7 @@
 static QueueHandle_t input_queue;
 static QueueHandle_t output_queue;
 static volatile bool ds5_connected = false;
-static volatile bool ever_connected = false;
+static volatile bool bt_disconnect_pending_usb = false;
 static volatile bool battery_low = false;
 static volatile bool bt_init_done = false;
 
@@ -69,10 +69,6 @@ static volatile TickType_t connecting_start_tick = 0;
 static volatile bool dse_mode_changed = false;
 static volatile bool prev_led_disabled = false;
 static volatile bool scan_after_disconnect = false;
-/* Deferred USB soft-disconnect: wait N seconds after BT disconnect before
- * pulling USB, so quick controller switching preserves Windows audio session. */
-#define USB_DEFERRED_DISC_US  (10ULL * 1000000ULL)
-static volatile uint64_t usb_deferred_disc_us = 0;
 /* Deferred primer re-send: after CONNECTED, wait ~300ms then re-send
  * volume to ensure the controller has fully initialized its HID channel. */
 static volatile uint64_t primer_resend_us = 0;
@@ -366,11 +362,12 @@ static void on_hid_state(enum bt_hid_host_state state)
         usb_fwd_count = 0;
         first_input_logged = false;
         usb_wake_on_bt_disconnect();
-        if (was_connected && !bt_hid_host_is_switching() &&
+        if (bt_disconnect_pending_usb && !config_wake_enabled() &&
             !usb_wake_host_suspended()) {
-            usb_deferred_disc_us = bflb_mtimer_get_time_us();
-            LOG_INF("[MAIN] USB disconnect deferred (10s timer started)\n");
+            usb_gamepad_set_bt_visible(false);
+            LOG_INF("[MAIN] BT disconnected: USB hidden\n");
         }
+        bt_disconnect_pending_usb = false;
         dse_reset();
         audio_reset();
         remap_on_disconnect();
@@ -432,25 +429,15 @@ static void on_hid_state(enum bt_hid_host_state state)
 
         handshake_start_us = 0;
 
-        if (ever_connected) {
-            if (usb_deferred_disc_us) {
-                usb_deferred_disc_us = 0;
-                LOG_INF("[MAIN] Deferred disconnect cancelled — USB stayed connected\n");
-            } else {
-                usb_soft_connect();
-                LOG_INF("[MAIN] USB replug (was disconnected)\n");
-                stealth_primer_countdown = 5;
-            }
-        } else if (config_usb_stealth()) {
-            /* First connection, stealth: USB was disconnected at boot.
-             * Let Windows send blue init, then override with our primer. */
+        /* DS5Dongle reattaches only while the host is awake. Keeping the
+         * existing attachment during suspend avoids an unintended USB wake. */
+        if (!usb_wake_host_suspended() && usb_gamepad_set_bt_visible(true)) {
             stealth_primer_countdown = 5;
-            LOG_INF("[MAIN] Stealth: primer pending after 5 USB output frames\n");
-            usb_soft_connect();
+            LOG_INF("[MAIN] USB reattached; primer pending after host output\n");
         }
+        bt_disconnect_pending_usb = false;
 
         ds5_connected = true;
-        ever_connected = true;
         battery_low = false;
         primer_resend_us = bflb_mtimer_get_time_us();
         usb_wake_on_bt_connect();
@@ -460,6 +447,12 @@ static void on_hid_state(enum bt_hid_host_state state)
         LOG_INF("[MAIN] State: CONNECTED%s\n", is_dse ? " (Edge)" : "");
         break;
     }
+
+    case BT_HID_STATE_DISCONNECTING:
+        /* This event marks a real ACL teardown; ordinary scan/connect errors
+         * can also enter IDLE and must not hide the configuration device. */
+        bt_disconnect_pending_usb = true;
+        break;
 
     default:
         LOG_INF("[MAIN] State: %d\n", state);
@@ -723,15 +716,6 @@ static void bt_task(void *arg)
 
         bt_hid_host_poll_disconnect();
 
-        /* Deferred USB soft-disconnect: if BT disconnected and no reconnection
-         * within the timeout, pull USB so Windows removes the phantom device. */
-        if (usb_deferred_disc_us && !ds5_connected &&
-            (bflb_mtimer_get_time_us() - usb_deferred_disc_us) > USB_DEFERRED_DISC_US) {
-            usb_deferred_disc_us = 0;
-            usb_soft_disconnect();
-            LOG_INF("[MAIN] Deferred USB disconnect (no reconnect within 15s)\n");
-        }
-
         if (bt_hid_host_poll_scan_early()) {
             continue;
         }
@@ -965,7 +949,10 @@ static void usb_task(void *arg)
 
     if (config_usb_stealth()) {
         vTaskDelay(pdMS_TO_TICKS(150));
-        usb_soft_disconnect();
+        taskENTER_CRITICAL();
+        if (!ds5_connected && !usb_wake_host_suspended())
+            usb_gamepad_set_bt_visible(false);
+        taskEXIT_CRITICAL();
     }
 
     uint8_t raw_report[DS5_BT_INPUT_REPORT_SIZE];

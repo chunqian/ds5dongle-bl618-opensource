@@ -44,6 +44,10 @@ void usb_gamepad_set_dse_mode(bool dse);
 
 void usb_gamepad_process_deferred(void);
 
+/* Set BT-controlled USB presentation. Audio re-enumeration respects this gate.
+ * Returns true if the requested visibility changed. Call from task context. */
+bool usb_gamepad_set_bt_visible(bool visible);
+
 void usb_soft_disconnect(void);
 void usb_soft_connect(void);
 

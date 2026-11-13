@@ -639,6 +639,9 @@ static void apply_audio_profile(void)
 }
 
 static volatile bool usb_configured = false;
+/* BT presentation policy is independent of the HID-controlled audio profile. */
+static volatile bool usb_bt_hidden = false;
+static volatile bool usb_reenumerating = false;
 static volatile bool ep_in_busy = false;
 static volatile bool kbd_ep_busy = false;
 static volatile uint64_t kbd_ep_busy_since_us = 0;
@@ -755,7 +758,10 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
         usb_audio_mic_stop();
         audio_set_mic_active(false);
         LOG_INF("[USB-EVT] SUSPEND\n");
-        if (hook_suspend)
+        /* Our own detach must not masquerade as a sleeping host, otherwise
+         * BT reconnect would refuse to reattach USB indefinitely. */
+        if (!usb_bt_hidden && !usb_reenumerating &&
+            !audio_control.revoke_pending && hook_suspend)
             hook_suspend();
         break;
     case USBD_EVENT_RESUME:
@@ -822,6 +828,7 @@ void usb_gamepad_process_deferred(void)
     bool enabled = change && audio_control.requested;
     uint32_t generation = audio_control.generation;
     if (change || expired) {
+        usb_reenumerating = true;
         usb_soft_disconnect();
         usb_configured = false;
     }
@@ -841,9 +848,11 @@ void usb_gamepad_process_deferred(void)
         pending_valid = false;
         pending_active = false;
         enabled = audio_control.visible;
+        usb_reenumerating = false;
         usb_soft_connect();
         taskEXIT_CRITICAL();
-        LOG_INF("[USB-AUDIO] Reconnected: audio visibility=%d\n", enabled);
+        LOG_INF("[USB-AUDIO] Profile applied: audio=%d, BT hidden=%d\n",
+                enabled, usb_bt_hidden);
     }
 
     if (usb_reset_pending) {
@@ -1473,7 +1482,28 @@ void usb_soft_disconnect(void)
 
 void usb_soft_connect(void)
 {
+    if (usb_bt_hidden || usb_reenumerating || audio_control.revoke_pending)
+        return;
     volatile uint32_t *phy_tst = (volatile uint32_t *)(USB_BASE + 0x114);
     *phy_tst &= ~1u;
     LOG_INF("[USB] Soft connect (stealth)\n");
+}
+
+bool usb_gamepad_set_bt_visible(bool visible)
+{
+    taskENTER_CRITICAL();
+    bool changed = usb_bt_hidden == visible;
+    usb_bt_hidden = !visible;
+    if (visible) {
+        usb_soft_connect();
+    } else {
+        usb_soft_disconnect();
+        usb_configured = false;
+        ep_in_busy = false;
+        kbd_ep_busy = false;
+        pending_valid = false;
+        pending_active = false;
+    }
+    taskEXIT_CRITICAL();
+    return changed;
 }
