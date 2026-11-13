@@ -241,11 +241,15 @@ static struct {
     volatile TickType_t acl_connect_tick;
     volatile TickType_t security_done_tick;
 
-    /* Paced handshake: send feature GETs one at a time */
-    const uint8_t *handshake_ids;
-    volatile uint8_t handshake_count;
-    volatile uint8_t handshake_next;
-    volatile bool handshake_send_failed;
+    struct {
+        TickType_t started, last_attempt, probe_tick;
+        bool attempted;
+        volatile uint8_t sent, received;
+        uint8_t attempts[4], probe_attempts;
+        volatile bool probe_pending;
+        bool probe_confirm_needed;
+        volatile uint8_t probe_rejections;
+    } handshake;
 
     bt_hid_input_cb_t  input_cb;
     bt_hid_state_cb_t  state_cb;
@@ -309,17 +313,19 @@ static void on_hid_output_sent(struct bt_conn *conn, void *user_data)
 /* Consume buf on every path. The SDK BR wrapper discards the return value
  * from bt_l2cap_send_cb(), which already consumes buf on both success and
  * failure. Call that layer directly so failures cannot leave busy latched. */
-static int hid_tx_submit(struct net_buf *buf, uint32_t generation)
+static int hid_send_buf(struct bt_l2cap_br_chan *chan, struct net_buf *buf,
+                       bt_conn_tx_cb_t cb, uint32_t generation)
 {
     struct bt_conn *conn = NULL;
     uint16_t cid = 0, mtu = 0;
     taskENTER_CRITICAL();
-    if (generation == app_tx_generation && app_tx_busy &&
-        hid_ctx.intr_connected && hid_ctx.conn &&
-        hid_ctx.intr_chan.chan.conn == hid_ctx.conn) {
+    bool connected = (chan == &hid_ctx.intr_chan && hid_ctx.intr_connected) ||
+                     (chan == &hid_ctx.ctrl_chan && hid_ctx.ctrl_connected);
+    if (generation == app_tx_generation && (!cb || app_tx_busy) &&
+        connected && hid_ctx.conn && chan->chan.conn == hid_ctx.conn) {
         conn = bt_conn_ref(hid_ctx.conn);
-        cid = hid_ctx.intr_chan.tx.cid;
-        mtu = hid_ctx.intr_chan.tx.mtu;
+        cid = chan->tx.cid;
+        mtu = chan->tx.mtu;
     }
     taskEXIT_CRITICAL();
 
@@ -336,10 +342,15 @@ static int hid_tx_submit(struct net_buf *buf, uint32_t generation)
     extern int bt_l2cap_send_cb(struct bt_conn *conn, uint16_t cid,
                               struct net_buf *buf, bt_conn_tx_cb_t cb,
                               void *user_data);
-    int err = bt_l2cap_send_cb(conn, cid, buf, on_hid_output_sent,
+    int err = bt_l2cap_send_cb(conn, cid, buf, cb,
                              (void *)(uintptr_t)generation);
     bt_conn_unref(conn);
     return err;
+}
+
+static int hid_tx_submit(struct net_buf *buf, uint32_t generation)
+{
+    return hid_send_buf(&hid_ctx.intr_chan, buf, on_hid_output_sent, generation);
 }
 
 static void hid_tx_drain_one(void)
@@ -457,31 +468,90 @@ static struct net_buf *l2cap_alloc_buf(struct bt_l2cap_chan *chan)
     return net_buf_alloc(&hid_rx_pool, K_NO_WAIT);
 }
 
-static void handshake_send_next(void)
+static const uint8_t handshake_ids[] = {
+    DS5_FEATURE_REPORT_PAIRING, DS5_FEATURE_REPORT_FIRMWARE,
+    0x22, DS5_FEATURE_REPORT_CALIBRATION
+};
+#define HANDSHAKE_RETRY_TICKS pdMS_TO_TICKS(100)
+#define HANDSHAKE_SETTLE_TICKS pdMS_TO_TICKS(1000)
+#define HANDSHAKE_PROBE_TICKS pdMS_TO_TICKS(1000)
+
+static void handshake_begin(void)
 {
-    if (hid_ctx.state != BT_HID_STATE_HANDSHAKE)
+    memset(&hid_ctx.handshake, 0, sizeof(hid_ctx.handshake));
+    hid_ctx.handshake.started = xTaskGetTickCount();
+    hid_ctx.check_dse = true;
+    set_state(BT_HID_STATE_HANDSHAKE);
+}
+
+/* Run in the BT task. Like DS5Dongle, issue the initialization GETs without
+ * chaining each send to the previous response. Keep the type probe separate:
+ * HID HANDSHAKE errors do not carry a report ID. */
+static void handshake_send_pending(void)
+{
+    if (hid_ctx.state != BT_HID_STATE_HANDSHAKE || !hid_ctx.conn ||
+        !hid_ctx.ctrl_connected || !hid_ctx.intr_connected)
+        return;
+    TickType_t now = xTaskGetTickCount();
+    if (hid_ctx.handshake.attempted &&
+        (TickType_t)(now - hid_ctx.handshake.last_attempt) < HANDSHAKE_RETRY_TICKS)
+        return;
+    hid_ctx.handshake.attempted = true;
+    hid_ctx.handshake.last_attempt = now;
+    uint32_t generation = app_tx_generation;
+
+    bool retry_pending = false;
+    for (unsigned i = 0; i < sizeof(handshake_ids); ++i) {
+        uint8_t bit = 1u << i;
+        if ((hid_ctx.handshake.sent & bit) || hid_ctx.handshake.attempts[i] >= 3)
+            continue;
+        ++hid_ctx.handshake.attempts[i];
+        /* Set before submission: a response can arrive during the SDK call. */
+        hid_ctx.handshake.sent |= bit;
+        int err = bt_hid_host_get_feature(handshake_ids[i]);
+        if (generation != app_tx_generation || hid_ctx.state != BT_HID_STATE_HANDSHAKE)
+            return;
+        if (err) {
+            hid_ctx.handshake.sent &= ~bit;
+            retry_pending |= hid_ctx.handshake.attempts[i] < 3;
+            LOG_WRN("[HID] Init GET_REPORT(0x%02x) failed (%d), attempt %u\n",
+                    handshake_ids[i], err, hid_ctx.handshake.attempts[i]);
+        }
+    }
+    if (retry_pending)
         return;
 
-    if (hid_ctx.handshake_next < hid_ctx.handshake_count) {
-        uint8_t rid = hid_ctx.handshake_ids[hid_ctx.handshake_next];
-        if (bt_hid_host_get_feature(rid) == 0) {
-            hid_ctx.handshake_next++;
-            hid_ctx.handshake_send_failed = false;
-        } else {
-            hid_ctx.handshake_send_failed = true;
-            LOG_ERR("[HID] GET_REPORT(0x%02x) send failed, will retry\n", rid);
-        }
-    } else if (hid_ctx.check_dse &&
-               hid_ctx.state == BT_HID_STATE_HANDSHAKE) {
-        hid_ctx.check_dse = false;
-        hid_ctx.is_dse    = false;
-        LOG_INF("[HID] DualSense (non-Edge) assumed (handshake complete)\n");
-        set_state(BT_HID_STATE_CONNECTED);
+    /* Collect responses for cache/Edge unlock, but one missing optional report
+     * must not hold up every later GET. Type detection has its own retries. */
+    uint8_t pending = hid_ctx.handshake.sent & ~hid_ctx.handshake.received;
+    if (pending && (TickType_t)(now - hid_ctx.handshake.started) < HANDSHAKE_SETTLE_TICKS)
+        return;
+    if (hid_ctx.handshake.probe_attempts &&
+        (TickType_t)(now - hid_ctx.handshake.probe_tick) < HANDSHAKE_PROBE_TICKS)
+        return;
+    if (hid_ctx.handshake.probe_attempts >= 6)
+        return; /* Main handshake deadline disconnects; never guess the type. */
+
+    if (!hid_ctx.handshake.probe_attempts)
+        hid_ctx.handshake.probe_confirm_needed = pending != 0;
+    hid_ctx.handshake.probe_tick = now;
+    ++hid_ctx.handshake.probe_attempts;
+    hid_ctx.handshake.probe_pending = true;
+    int err = bt_hid_host_get_feature(0x70);
+    if (generation != app_tx_generation || hid_ctx.state != BT_HID_STATE_HANDSHAKE)
+        return;
+    if (err) {
+        hid_ctx.handshake.probe_pending = false;
+        LOG_WRN("[HID] Edge probe send failed (%d), attempt %u\n",
+                err, hid_ctx.handshake.probe_attempts);
     }
 }
 
 static int l2cap_ctrl_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 {
+    if (!hid_ctx.conn || chan->conn != hid_ctx.conn ||
+        !hid_ctx.ctrl_connected || hid_ctx.state == BT_HID_STATE_DISCONNECTING)
+        return 0;
     uint8_t *data = buf->data;
     uint16_t len  = buf->len;
 
@@ -495,13 +565,20 @@ static int l2cap_ctrl_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
     switch (trans) {
     case HID_TRANS_HANDSHAKE:
         LOG_INF("[HID] Handshake: 0x%02x\n", param);
-        if (hid_ctx.check_dse && param == HID_HANDSHAKE_INVALID_ID) {
-            hid_ctx.check_dse = false;
-            hid_ctx.is_dse    = false;
-            LOG_INF("[HID] DualSense (non-Edge) confirmed\n");
-            set_state(BT_HID_STATE_CONNECTED);
+        if (hid_ctx.state == BT_HID_STATE_HANDSHAKE && hid_ctx.check_dse &&
+            hid_ctx.handshake.probe_pending &&
+            param == HID_HANDSHAKE_INVALID_ID) {
+            hid_ctx.handshake.probe_pending = false;
+            /* If initialization replies were missing, this untagged error
+             * could belong to an old GET. Confirm with a separate probe. */
+            unsigned required = hid_ctx.handshake.probe_confirm_needed ? 2 : 1;
+            if (++hid_ctx.handshake.probe_rejections >= required) {
+                hid_ctx.check_dse = false;
+                hid_ctx.is_dse = false;
+                LOG_INF("[HID] DualSense (non-Edge) confirmed\n");
+                set_state(BT_HID_STATE_CONNECTED);
+            }
         }
-        handshake_send_next();
         break;
 
     case HID_TRANS_DATA:
@@ -512,19 +589,28 @@ static int l2cap_ctrl_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
                        rid, len - 2);
 
                 feature_cache_store(rid, data + 2, len - 2);
+                for (unsigned i = 0; i < sizeof(handshake_ids); ++i) {
+                    if (rid == handshake_ids[i])
+                        hid_ctx.handshake.received |= 1u << i;
+                }
 
-                if (rid == 0x70 && hid_ctx.check_dse) {
+                if (rid == 0x70 && hid_ctx.state == BT_HID_STATE_HANDSHAKE &&
+                    hid_ctx.check_dse &&
+                    hid_ctx.handshake.probe_attempts > 0) {
+                    uint32_t generation = app_tx_generation;
                     hid_ctx.check_dse = false;
                     hid_ctx.is_dse    = true;
                     LOG_INF("[HID] DualSense Edge detected\n");
                     dse_on_edge_detected();
-                    set_state(BT_HID_STATE_CONNECTED);
+                    if (generation == app_tx_generation &&
+                        hid_ctx.state == BT_HID_STATE_HANDSHAKE &&
+                        chan->conn == hid_ctx.conn)
+                        set_state(BT_HID_STATE_CONNECTED);
                 }
             } else {
                 LOG_WRN("[HID] Feature DATA too short (len=%d), skipping\n",
                        len);
             }
-            handshake_send_next();
         }
         break;
 
@@ -638,23 +724,9 @@ static void l2cap_intr_connected(struct bt_l2cap_chan *chan)
         }
     }
 
-    set_state(BT_HID_STATE_HANDSHAKE);
+    /* The BT task issues initialization GETs; RX callbacks only collect data. */
+    handshake_begin();
 
-    /* Request feature reports in the same order as DS5Dongle:
-     * 0x09 (pairing/firmware), 0x20 (firmware info), 0x22 (additional),
-     * 0x05 (calibration), then 0x70 to probe for DualSense Edge.
-     * Paced: send one at a time, next sent in l2cap_ctrl_recv on response. */
-    static const uint8_t handshake_ids[] = {
-        DS5_FEATURE_REPORT_PAIRING, DS5_FEATURE_REPORT_FIRMWARE,
-        0x22, DS5_FEATURE_REPORT_CALIBRATION, 0x70
-    };
-    hid_ctx.handshake_ids   = handshake_ids;
-    hid_ctx.handshake_count = sizeof(handshake_ids);
-    hid_ctx.handshake_next  = 0;
-    hid_ctx.handshake_send_failed = false;
-    hid_ctx.check_dse       = true;
-
-    handshake_send_next();
 }
 
 static void l2cap_ctrl_disconnected(struct bt_l2cap_chan *chan)
@@ -784,10 +856,28 @@ static void auth_pairing_complete(struct bt_conn *conn, bool bonded)
     }
 }
 
+static void clear_rejected_key(struct bt_conn *conn, enum bt_security_err err)
+{
+    if (conn != hid_ctx.conn ||
+        (err != BT_SECURITY_ERR_AUTH_FAIL &&
+         err != BT_SECURITY_ERR_PIN_OR_KEY_MISSING))
+        return;
+    const bt_addr_t *remote = conn_get_br_addr(conn);
+    if (remote) {
+        extern void bt_keys_link_key_clear_addr(const bt_addr_t *addr);
+        bt_keys_link_key_clear_addr(remote);
+        LOG_WRN("[BT] Explicit authentication failure: cleared rejected key\n");
+    }
+}
+
 static void auth_pairing_failed(struct bt_conn *conn,
                                  enum bt_security_err reason)
 {
     LOG_ERR("[BT] Pairing failed, reason=%d\n", reason);
+    if (conn == hid_ctx.conn) {
+        clear_rejected_key(conn, reason);
+        bt_hid_host_disconnect();
+    }
 }
 
 static struct bt_conn_auth_cb auth_callbacks = {
@@ -834,17 +924,13 @@ static void security_changed(struct bt_conn *conn, bt_security_t level,
 
     if (err) {
         LOG_ERR("[BT] Security elevation failed: level=%d err=%d\n", level, err);
-        /* Clear stale link key so next reconnect triggers fresh SSP pairing
-         * (mirrors DS5Dongle's gap_drop_link_key on AUTHENTICATION_COMPLETE fail) */
-        const bt_addr_t *remote = conn_get_br_addr(conn);
-        if (remote) {
-            extern void bt_keys_link_key_clear_addr(const bt_addr_t *addr);
-            bt_keys_link_key_clear_addr(remote);
-            LOG_WRN("[BT] Cleared stale link key for re-pairing\n");
-        }
-        bt_conn_disconnect(conn, BT_HCI_ERR_AUTH_FAIL);
+        clear_rejected_key(conn, err);
+        bt_hid_host_disconnect();
         return;
     }
+
+    if (level < BT_SECURITY_L2)
+        return;
 
     LOG_INF("[BT] Security level raised to %d (outgoing=%d state=%s)\n",
            level, hid_ctx.outgoing, state_name(hid_ctx.state));
@@ -928,17 +1014,8 @@ static void conn_connected(struct bt_conn *conn, uint8_t err)
            conn->handle, conn->sec_level, conn->required_sec_level,
            conn->encrypt);
 
-    /* Defer security establishment to task context.
-     *
-     * Root cause found in SDK: conn_new() does NOT clear the bt_conn struct,
-     * so required_sec_level retains the stale value (L2) from the previous
-     * connection.  bt_conn_set_security(L2) checks:
-     *     if (sec_level >= sec || required_sec_level >= sec) return 0;
-     * and returns immediately without doing anything.
-     *
-     * Fix: reset required_sec_level in poll_security() (task context) before
-     * calling bt_conn_set_security.  We also can't call bt_hci_cmd_send_sync
-     * from this callback (deadlock risk), so deferring is the safe approach. */
+    /* Start authentication from the BT task, not an RX callback. The SDK
+     * initializes new connections and owns required_sec_level while pairing. */
     hid_ctx.security_pending = true;
     hid_ctx.security_done = false;
     hid_ctx.acl_connect_tick = xTaskGetTickCount();
@@ -984,9 +1061,7 @@ static void conn_disconnected(struct bt_conn *conn, uint8_t reason)
     hid_ctx.outgoing = false;
     hid_ctx.is_dse = false;
     hid_ctx.check_dse = false;
-    hid_ctx.handshake_next  = 0;
-    hid_ctx.handshake_count = 0;
-    hid_ctx.handshake_send_failed = false;
+    memset(&hid_ctx.handshake, 0, sizeof(hid_ctx.handshake));
     hid_ctx.security_pending = false;
     hid_ctx.security_done = false;
     hid_ctx.sdp_pending = false;
@@ -1564,16 +1639,6 @@ bool bt_hid_host_poll_security(void)
            conn->sec_level, conn->required_sec_level, conn->encrypt,
            hid_ctx.outgoing);
 
-    /* Root cause fix: conn_new() doesn't clear bt_conn, so
-     * required_sec_level retains the stale value from a previous
-     * connection.  Reset it so bt_conn_set_security() actually
-     * initiates authentication. */
-    if (conn->required_sec_level >= BT_SECURITY_L2) {
-        LOG_DBG("[BT] poll_security: resetting stale required_sec_level "
-               "%d -> L1\n", conn->required_sec_level);
-        conn->required_sec_level = BT_SECURITY_L1;
-    }
-
     int err = bt_conn_set_security(conn, BT_SECURITY_L2);
     LOG_DBG("[BT] poll_security: bt_conn_set_security(L2) = %d "
            "(now sec=%d req=%d)\n",
@@ -1657,28 +1722,17 @@ bool bt_hid_host_poll_security_watchdog(void)
     if (conn->encrypt && conn->sec_level >= BT_SECURITY_L2) {
         LOG_WRN("[BT] WATCHDOG: encryption active, forcing L2CAP path\n");
         hid_ctx.security_done = true;
+        hid_ctx.security_done_tick = xTaskGetTickCount();
         if (hid_ctx.outgoing) {
             hid_ctx.sdp_pending = true;
         }
         return true;
     }
 
-    /* Auth failed: required_sec_level was reset by reset_pairing() in the
-     * SDK, meaning the controller rejected our link key.  Delete the stale
-     * key so the next connection attempt triggers fresh SSP pairing. */
-    const bt_addr_t *remote = conn_get_br_addr(conn);
-    if (remote) {
-        LOG_WRN("[BT] WATCHDOG: clearing stale link key for "
-               "%02X:%02X:%02X:%02X:%02X:%02X\n",
-               remote->val[5], remote->val[4], remote->val[3],
-               remote->val[2], remote->val[1], remote->val[0]);
-        extern void bt_keys_link_key_clear_addr(const bt_addr_t *addr);
-        bt_keys_link_key_clear_addr(remote);
-    }
-
-    LOG_WRN("[BT] WATCHDOG: disconnecting to retry with fresh pairing\n");
-    bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-    return false;
+    /* A timeout is not a rejected key. Keep the bond for normal PS reconnect. */
+    LOG_WRN("[BT] Security timeout: preserving bond, disconnecting\n");
+    bt_hid_host_disconnect();
+    return true;
 }
 
 #define INCOMING_L2CAP_FALLBACK_MS 3000
@@ -1827,9 +1881,7 @@ void bt_hid_host_force_disconnect(void)
     hid_ctx.outgoing = false;
     hid_ctx.is_dse = false;
     hid_ctx.check_dse = false;
-    hid_ctx.handshake_next  = 0;
-    hid_ctx.handshake_count = 0;
-    hid_ctx.handshake_send_failed = false;
+    memset(&hid_ctx.handshake, 0, sizeof(hid_ctx.handshake));
     hid_ctx.connect_pending = false;
     hid_ctx.sdp_pending = false;
     hid_ctx.security_pending = false;
@@ -1932,6 +1984,7 @@ int8_t bt_hid_host_get_cached_rssi(void)
 
 int bt_hid_host_send_output(const uint8_t *data, uint16_t len)
 {
+    uint32_t generation = app_tx_generation;
     if (!hid_ctx.intr_connected || !hid_ctx.conn)
         return -1;
 
@@ -1955,9 +2008,8 @@ int bt_hid_host_send_output(const uint8_t *data, uint16_t len)
         net_buf_reserve(buf, BT_L2CAP_CHAN_SEND_RESERVE);
         net_buf_add_u8(buf, HID_HEADER(HID_TRANS_DATA, HID_REPORT_OUTPUT));
         net_buf_add_mem(buf, data, len);
-        int err = bt_l2cap_chan_send(&hid_ctx.intr_chan.chan, buf);
+        int err = hid_send_buf(&hid_ctx.intr_chan, buf, NULL, generation);
         if (err < 0) {
-            net_buf_unref(buf);
             LOG_ERR("[HID] send_output direct: l2cap err=%d\n", err);
             return err;
         }
@@ -1994,6 +2046,7 @@ int bt_hid_host_send_output(const uint8_t *data, uint16_t len)
 int bt_hid_host_set_feature(uint8_t report_id, const uint8_t *data,
                              uint16_t len)
 {
+    uint32_t generation = app_tx_generation;
     if (!hid_ctx.ctrl_connected || !hid_ctx.conn)
         return -1;
 
@@ -2007,9 +2060,8 @@ int bt_hid_host_set_feature(uint8_t report_id, const uint8_t *data,
     if (data && len > 0)
         net_buf_add_mem(buf, data, len);
 
-    int err = bt_l2cap_chan_send(&hid_ctx.ctrl_chan.chan, buf);
+    int err = hid_send_buf(&hid_ctx.ctrl_chan, buf, NULL, generation);
     if (err < 0) {
-        net_buf_unref(buf);
         return err;
     }
 
@@ -2018,6 +2070,7 @@ int bt_hid_host_set_feature(uint8_t report_id, const uint8_t *data,
 
 int bt_hid_host_get_feature(uint8_t report_id)
 {
+    uint32_t generation = app_tx_generation;
     if (!hid_ctx.ctrl_connected || !hid_ctx.conn)
         return -1;
 
@@ -2029,9 +2082,8 @@ int bt_hid_host_get_feature(uint8_t report_id)
     net_buf_add_u8(buf, HID_HEADER(HID_TRANS_GET_REPORT, HID_REPORT_FEATURE));
     net_buf_add_u8(buf, report_id);
 
-    int err = bt_l2cap_chan_send(&hid_ctx.ctrl_chan.chan, buf);
+    int err = hid_send_buf(&hid_ctx.ctrl_chan, buf, NULL, generation);
     if (err < 0) {
-        net_buf_unref(buf);
         return err;
     }
 
@@ -2129,9 +2181,7 @@ int bt_hid_host_switch_next(void)
         hid_ctx.security_done = false;
         hid_ctx.sdp_pending = false;
         hid_ctx.connect_pending = false;
-        hid_ctx.handshake_next  = 0;
-        hid_ctx.handshake_count = 0;
-        hid_ctx.handshake_send_failed = false;
+        memset(&hid_ctx.handshake, 0, sizeof(hid_ctx.handshake));
 
         app_tx_fifo_reset();
         feature_cache_clear();
@@ -2189,9 +2239,7 @@ void bt_hid_host_clear_bonds(void)
     hid_ctx.outgoing = false;
     hid_ctx.is_dse = false;
     hid_ctx.check_dse = false;
-    hid_ctx.handshake_next  = 0;
-    hid_ctx.handshake_count = 0;
-    hid_ctx.handshake_send_failed = false;
+    memset(&hid_ctx.handshake, 0, sizeof(hid_ctx.handshake));
     hid_ctx.security_pending = false;
     hid_ctx.security_done = false;
     hid_ctx.sdp_pending = false;
@@ -2241,6 +2289,7 @@ bool bt_hid_host_is_dse(void)
 int bt_hid_host_set_feature_crc(uint8_t report_id, const uint8_t *data,
                                 uint16_t len)
 {
+    uint32_t generation = app_tx_generation;
     if (!hid_ctx.ctrl_connected || !hid_ctx.conn) {
         LOG_WRN("[HID] SET_FEATURE_CRC(0x%02x): not connected (ctrl=%d conn=%p)\n",
                report_id, hid_ctx.ctrl_connected, hid_ctx.conn);
@@ -2270,11 +2319,10 @@ int bt_hid_host_set_feature_crc(uint8_t report_id, const uint8_t *data,
         ds5_write_le32(crc_region + crc_data_len, crc);
     }
 
-    int err = bt_l2cap_chan_send(&hid_ctx.ctrl_chan.chan, buf);
+    int err = hid_send_buf(&hid_ctx.ctrl_chan, buf, NULL, generation);
     if (err < 0) {
         LOG_ERR("[HID] SET_FEATURE_CRC(0x%02x): l2cap send failed err=%d\n",
                report_id, err);
-        net_buf_unref(buf);
         return err;
     }
 
@@ -2293,10 +2341,7 @@ void bt_hid_host_persist_if_dirty(void)
 
 void bt_hid_host_handshake_tick(void)
 {
-    if (hid_ctx.state == BT_HID_STATE_HANDSHAKE &&
-        hid_ctx.handshake_send_failed) {
-        handshake_send_next();
-    }
+    handshake_send_pending();
 }
 
 void bt_hid_host_radio_idle(void)

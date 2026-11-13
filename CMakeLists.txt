@@ -9,6 +9,10 @@ endif()
 
 find_package(bouffalo_sdk REQUIRED HINTS $ENV{BL_SDK_BASE})
 
+# Existing-key authentication failures must reach the same application handler
+# as SSP failures. Patch a build-local copy; leave the shared SDK unchanged.
+include(cmake/bt_auth_notify.cmake)
+
 # Incoming Bluetooth HCI/L2CAP reports must preempt audio encoding.
 sdk_add_compile_definitions(-DCONFIG_BT_RX_PRIO=5)
 

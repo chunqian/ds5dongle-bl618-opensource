@@ -36,8 +36,8 @@ struct net_buf { unsigned len, frees; uint8_t data[700]; } buffers[128];
 typedef void (*bt_conn_tx_cb_t)(struct bt_conn *, void *);
 static struct {
     struct bt_conn *conn;
-    bool intr_connected;
-    struct bt_l2cap_br_chan intr_chan;
+    bool intr_connected, ctrl_connected;
+    struct bt_l2cap_br_chan intr_chan, ctrl_chan;
 } hid_ctx;
 static unsigned critical_depth, allocated, allocation_failures;
 static unsigned sends, result_count, result_index, completion_count, completion_index;
@@ -52,12 +52,17 @@ static bool first_output_logged;
 #define LOG_ERR(...) ((void)0)
 #define LOG_WRN(...) ((void)0)
 #define LOG_INF(...) ((void)0)
+#define LOG_DBG(...) ((void)0)
 #define K_NO_WAIT 0
 #define BT_L2CAP_CHAN_SEND_RESERVE 8
 #define DS5_BT_OUTPUT_REPORT_SIZE 78
 #define DS5_BT_OUTPUT_REPORT_ID 0x31
 #define HID_TRANS_DATA 0xA
 #define HID_REPORT_OUTPUT 2
+#define HID_REPORT_FEATURE 3
+#define HID_TRANS_GET_REPORT 4
+#define HID_TRANS_SET_REPORT 5
+#define DS5_BT_FEATURE_CRC_SEED 0
 #define HID_HEADER(a,b) (((a)<<4)|(b))
 static struct bt_conn *bt_conn_ref(struct bt_conn *c) {
     assert(c && c->refs>0); ++c->refs; return c;
@@ -77,11 +82,16 @@ static void net_buf_add_mem(struct net_buf *b, const void *p, unsigned n) {
     memcpy(b->data+b->len,p,n); b->len+=n;
 }
 static void net_buf_add_u8(struct net_buf *b, uint8_t n) { net_buf_add_mem(b,&n,1); }
-static int bt_l2cap_chan_send(struct bt_l2cap_chan *c, struct net_buf *b) {
-    assert(!"test unexpectedly entered direct output path"); return -EINVAL;
+static uint32_t ds5_crc32(uint32_t seed, const uint8_t *data, uint16_t len) {
+    assert(len>0); return 0x11223344;
+}
+static void ds5_write_le32(uint8_t *out, uint32_t value) {
+    for(unsigned i=0;i<4;i++) out[i]=(value>>(i*8))&0xff;
 }
 '''
 harness += fifo + "\n" + function("bt_hid_host_send_output")
+harness += "\n" + "\n".join(function(name) for name in (
+    "bt_hid_host_get_feature", "bt_hid_host_set_feature", "bt_hid_host_set_feature_crc"))
 harness += r'''
 static void enqueue(unsigned id) {
     uint8_t data[78]={0x31}; data[1]=id;
@@ -89,7 +99,8 @@ static void enqueue(unsigned id) {
 }
 int bt_l2cap_send_cb(struct bt_conn *conn, uint16_t cid,
                     struct net_buf *buf, bt_conn_tx_cb_t cb, void *arg) {
-    assert(!critical_depth && conn==&connection && conn->refs==2 && cid==0x41);
+    assert(!critical_depth && conn==&connection && conn->refs==2);
+    assert(cid==0x41 || cid==0x40);
     assert(!buf->frees);
     sent_ids[sends++]=buf->data[2];
     int result=result_index<result_count?results[result_index++]:0;
@@ -102,7 +113,7 @@ int bt_l2cap_send_cb(struct bt_conn *conn, uint16_t cid,
         /* Model a new session acquiring the same storage before return. */
         assert(result<0);
     }
-    if (!result) {
+    if (!result && cb) {
         completions[completion_count].conn=conn;
         completions[completion_count].cb=cb;
         completions[completion_count++].arg=arg;
@@ -126,6 +137,8 @@ static void setup(void) {
     hid_ctx.conn=&connection; hid_ctx.intr_connected=true;
     hid_ctx.intr_chan.chan.conn=&connection;
     hid_ctx.intr_chan.tx.cid=0x41; hid_ctx.intr_chan.tx.mtu=672;
+    hid_ctx.ctrl_connected=true; hid_ctx.ctrl_chan.chan.conn=&connection;
+    hid_ctx.ctrl_chan.tx.cid=0x40; hid_ctx.ctrl_chan.tx.mtu=672;
 }
 static struct net_buf *payload(void) {
     struct net_buf *b=net_buf_alloc(&hid_tx_pool,0);
@@ -134,6 +147,24 @@ static struct net_buf *payload(void) {
 int main(void) {
     /* Preserve exact SDK errors, release buffers once, and balance refs. */
     int errors[]={-ENOTCONN,-ENOBUFS};
+    /* GET/SET/CRC/direct audio share the consuming adapter and return errors. */
+    for(unsigned i=0;i<2;i++) {
+        uint8_t feature[8]={0}; uint8_t output[142]={0x32};
+        setup(); results[0]=errors[i]; result_count=1;
+        assert(bt_hid_host_get_feature(0x20)==errors[i]);
+        assert(buffers[0].data[0]==0x43 && buffers[0].data[1]==0x20);
+        setup(); results[0]=errors[i]; result_count=1;
+        assert(bt_hid_host_set_feature(0x65,feature,sizeof(feature))==errors[i]);
+        setup(); results[0]=errors[i]; result_count=1;
+        assert(bt_hid_host_set_feature_crc(0x80,feature,sizeof(feature))==errors[i]);
+        assert(buffers[0].data[6]==0x44 && buffers[0].data[9]==0x11);
+        setup(); results[0]=errors[i]; result_count=1;
+        assert(bt_hid_host_send_output(output,sizeof(output))==errors[i]);
+        assert(!completion_count && connection.refs==1);
+    }
+    setup(); assert(bt_hid_host_get_feature(0x05)==0 && !completion_count);
+    setup(); hid_ctx.ctrl_chan.tx.mtu=1;
+    assert(bt_hid_host_get_feature(0x05)==-EMSGSIZE && !sends);
     for(unsigned i=0;i<2;i++) {
         setup(); results[0]=errors[i]; result_count=1; app_tx_busy=true;
         assert(hid_tx_submit(payload(),app_tx_generation)==errors[i]);

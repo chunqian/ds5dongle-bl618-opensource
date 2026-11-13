@@ -208,7 +208,7 @@ int bt_hid_host_set_feature_crc(uint8_t report_id, const uint8_t *data,
 void bt_hid_host_persist_if_dirty(void);
 
 /**
- * Retry a stalled handshake GET. Call periodically from bt_task when state
+ * Dispatch initialization GETs and retry the type probe. Call from bt_task when state
  * is HANDSHAKE to recover from transient TX pool exhaustion.
  */
 void bt_hid_host_handshake_tick(void);
