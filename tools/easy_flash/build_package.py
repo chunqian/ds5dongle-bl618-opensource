@@ -1,12 +1,13 @@
 """Build separate offline Windows and macOS LCTech BL616 HS flashing bundles.
 
-Only the maintainer needs Python; macOS packages also need Xcode and the ARM64
+Only the maintainer needs Python; macOS packages also need Xcode and both native
 runtimes. End users need neither. --platform defaults to both.
 """
 from pathlib import Path
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -15,9 +16,9 @@ import zipfile
 REPO = Path(__file__).resolve().parents[2]
 TEMPLATES = Path(__file__).resolve().parent
 SDK_COMMIT = "b3532953322194233f80436701e7fb6bb4ad8275"
-FIRMWARE_SHA = "d58a13fdf01f8651e49ff4bcb60ab8abf0765b2337892b5f2c27653f50e3cb58"
-VERSION = "LCT616-DS5 3.18H-HidAudio-R4"
-NAME = "DS5Dongle-LCTech616-HS-HidAudio-R4-Flash"
+FIRMWARE_SHA = "0f0452accc29497ebdc7b7a24f73281a0fb678388bea161652280d3511a7524c"
+VERSION = "LCT616-DS5 3.18H-HidAudio-R5"
+NAME = "DS5Dongle-LCTech616-HS-HidAudio-R5-Flash"
 
 PLATFORMS = {
     "windows": {
@@ -56,7 +57,26 @@ def git(repo, *args):
     return subprocess.check_output(["git", "-C", str(repo), *args])
 
 
-def build_platform(args, platform, native_info, revision):
+def source_snapshot(worktree):
+    revision = git(REPO, 'rev-parse', 'HEAD').decode().strip()
+    if not worktree:
+        subprocess.run(['git', '-C', str(REPO), 'diff', '--exit-code', 'HEAD', '--',
+                        'src', 'lib', 'CMakeLists.txt', 'proj.conf'], check=True)
+        return revision, git(REPO, 'rev-parse', 'HEAD^{tree}').decode().strip()
+    # Capture tracked files plus nonignored source/test additions using a private
+    # index. This creates a tree object, never a commit or a change to the user's index.
+    with tempfile.TemporaryDirectory(prefix='ds5-source-index-') as directory:
+        env = dict(os.environ, GIT_INDEX_FILE=str(Path(directory) / 'index'))
+        def indexed(*args):
+            return subprocess.check_output(['git', '-C', str(REPO), *args], env=env)
+        indexed('read-tree', revision)
+        indexed('add', '-u', '--', '.')
+        indexed('add', '--', 'src', 'lib', 'tests', 'tools/easy_flash')
+        tree = indexed('write-tree').decode().strip()
+    return revision, tree
+
+
+def build_platform(args, platform, native_info, revision, source_tree):
     sdk = args.sdk.resolve()
     output = args.output.resolve()
     firmware = args.firmware_dir.resolve()
@@ -133,10 +153,12 @@ def build_platform(args, platform, native_info, revision):
         for source in TEMPLATES.iterdir():
             if source.is_file(): shutil.copyfile(source, package / "source/easy_flash" / source.name)
         subprocess.run(["git", "-C", str(REPO), "archive", "--format=tar.gz", "-o",
-                        str(package / "source/firmware-source.tar.gz"), "HEAD"], check=True)
+                        str(package / "source/firmware-source.tar.gz"), source_tree], check=True)
         metadata = {"version": VERSION, "board": "LCTech BL616", "usb": "HS",
                     "platform": platform, "architectures": spec["architectures"],
                     "firmware_sha256": FIRMWARE_SHA, "firmware_commit": revision,
+                    "firmware_source_tree": source_tree,
+                    "firmware_source_dirty": source_tree != git(REPO, 'rev-parse', revision + '^{tree}').decode().strip(),
                     "sdk_commit": SDK_COMMIT,
                     "package_hardware_tested": False}
         if platform == "macos":
@@ -146,7 +168,7 @@ def build_platform(args, platform, native_info, revision):
             metadata["flashcube_version"] = "1.4.2"
         (package / "package-info.json").write_text(json.dumps(metadata, indent=2) + "\n")
         (package / "NOTICE.txt").write_text(
-            f"Firmware: {VERSION}\nSource revision: {revision}\nSHA-256: {FIRMWARE_SHA}\n\n"
+            f"Firmware: {VERSION}\nBase revision: {revision}\nSource tree: {source_tree}\nSHA-256: {FIRMWARE_SHA}\n\n"
             "Firmware source snapshot: source/firmware-source.tar.gz\n"
             "Repository: https://github.com/chunqian/ds5dongle-bl618-opensource\n"
             f"SDK / FlashCube source and binaries: https://github.com/sqlCRT/bouffalo_sdk/tree/{SDK_COMMIT}\n"
@@ -187,14 +209,15 @@ def main():
     parser.add_argument("--native-dir", type=Path, default=REPO / "build/native_macos")
     parser.add_argument("--intel-native-dir", type=Path, default=REPO / "build/native_macos_intel")
     parser.add_argument("--firmware-dir", type=Path, default=REPO / "firmware/lctech616")
+    parser.add_argument('--snapshot-worktree', action='store_true',
+                        help='Include uncommitted source changes in an explicit source-tree snapshot; never commit them')
     args = parser.parse_args()
     platforms = ("windows", "macos") if args.platform == "both" else (args.platform,)
     firmware = args.firmware_dir / "ds5dongle-lctech616-hs.bin"
     if sha(firmware) != FIRMWARE_SHA or VERSION.encode() not in firmware.read_bytes():
-        raise SystemExit("Expected the verified R4 HS binary; update version/hash deliberately for a new release.")
-    subprocess.run(["git", "-C", str(REPO), "diff", "--exit-code", "HEAD", "--", "src", "CMakeLists.txt"], check=True)
-    revision = git(REPO, "rev-parse", "HEAD").decode().strip()
-    if VERSION.encode() not in git(REPO, "show", "HEAD:src/usb_gamepad.c"):
+        raise SystemExit("Expected the pinned R5 HS binary; update version/hash deliberately for a new release.")
+    revision, source_tree = source_snapshot(args.snapshot_worktree)
+    if VERSION.encode() not in git(REPO, "show", source_tree + ":src/usb_gamepad.c"):
         raise SystemExit("Source snapshot firmware version differs from the packaged binary.")
     native_info = {}
     if "macos" in platforms:
@@ -214,7 +237,7 @@ def main():
                 raise SystemExit(f'Mac runtimes must use the same {key}.')
     args.output.mkdir(parents=True, exist_ok=True)
     for platform in platforms:
-        build_platform(args, platform, native_info, revision)
+        build_platform(args, platform, native_info, revision, source_tree)
 
 
 if __name__ == '__main__':

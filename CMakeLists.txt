@@ -25,6 +25,7 @@ target_sources(app PRIVATE
     src/led_status.c
     src/state_mgr.c
     src/config.c
+    src/factory_reset.c
     src/dse.c
     src/remap.c
 )

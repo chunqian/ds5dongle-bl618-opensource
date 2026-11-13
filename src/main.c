@@ -14,6 +14,7 @@
 #include "led_status.h"
 #include "state_mgr.h"
 #include "config.h"
+#include "factory_reset.h"
 #include "dse.h"
 #include "remap.h"
 
@@ -40,7 +41,7 @@
 #define MIC_TASK_PRIORITY     (configMAX_PRIORITIES - 4)
 #define LED_TASK_STACK_SIZE   STACK_WORDS(1024*2)
 #define LED_TASK_PRIORITY     (tskIDLE_PRIORITY + 1)
-#define BOOT_HOLD_TICKS      30   /* 30 x 100ms = 3 seconds */
+#define BOOT_HOLD_US         (3ULL * 1000000ULL)
 #define BOOT_CLICK_WINDOW    5    /* 500ms window between clicks */
 #define RECONNECT_TIMEOUT_MS 2000
 #define HANDSHAKE_TIMEOUT_US  (10ULL * 1000000ULL)
@@ -596,13 +597,15 @@ static void bt_task(void *arg)
      * Button gesture FSM (polled at 10 Hz, independent of loop speed).
      *   single click  → switch to next bonded controller
      *   double click  → disconnect + fresh scan (search new controller)
-     *   hold >= 3s    → clear all bonds + blacklist + reset
+     *   hold >= 3s    → request full settings reset; reboot on release
      */
     enum { BTN_IDLE, BTN_PRESSING, BTN_HELD, BTN_WAIT } btn_fsm = BTN_IDLE;
     uint8_t  btn_press_samples = 0;
     uint8_t  btn_wait_samples  = 0;
     uint8_t  btn_click_count   = 0;
     uint64_t btn_last_poll_us  = 0;
+    uint64_t btn_press_start_us = 0;
+    bool     btn_reset_requested = false;
     uint8_t  btn_debug_counter = 0;
 
     prev_led_disabled = config_led_disabled();
@@ -638,6 +641,7 @@ static void bt_task(void *arg)
                 if (pressed) {
                     btn_fsm = BTN_PRESSING;
                     btn_press_samples = 1;
+                    btn_press_start_us = btn_now;
                     LOG_DBG("[BTN] IO2 pressed (raw=%d)\n",
                            (int)bflb_gpio_read(btn_gpio, BOOT_BUTTON_PIN));
                 }
@@ -649,16 +653,20 @@ static void bt_task(void *arg)
                     /* LED feedback while holding: fast red blink to show
                      * "keep holding" (revert to previous pattern on release) */
                     if (btn_press_samples == 3) {
-                        LOG_DBG("[BTN] IO2 holding... (%d/%d)\n",
-                               btn_press_samples, BOOT_HOLD_TICKS);
+                        LOG_DBG("[BTN] IO2 holding...\n");
                         led_status_set(LED_RED_BLINK);
                     }
-                    if (btn_press_samples >= BOOT_HOLD_TICKS) {
+                    if (btn_now - btn_press_start_us >= BOOT_HOLD_US) {
                         btn_click_count = 0;
                         btn_fsm = BTN_HELD;
-                        LOG_INF("[BTN] IO2 held 3s — clearing all bonds\n");
-                        bt_hid_host_clear_bonds();
-                        led_status_set(LED_BLINK_TRIPLE);
+                        btn_reset_requested = factory_reset_request();
+                        if (btn_reset_requested) {
+                            LOG_INF("[BTN] IO2 held 3s — full reset saved; release to reboot\n");
+                            led_status_set(LED_BLINK_TRIPLE);
+                        } else {
+                            LOG_ERR("[BTN] Failed to save reset request; release and retry\n");
+                            led_status_set(LED_RED_BLINK);
+                        }
                         idle_ticks = 0;
                     }
                 } else {
@@ -678,9 +686,11 @@ static void bt_task(void *arg)
                 if (!pressed) {
                     btn_fsm = BTN_IDLE;
                     btn_press_samples = 0;
-                    LOG_INF("[BTN] IO2 released after hold — resetting\n");
-                    vTaskDelay(pdMS_TO_TICKS(300));
-                    GLB_SW_System_Reset();
+                    if (btn_reset_requested) {
+                        LOG_INF("[BTN] IO2 released after hold — resetting all settings\n");
+                        vTaskDelay(pdMS_TO_TICKS(300));
+                        GLB_SW_System_Reset();
+                    }
                 }
                 break;
 
@@ -688,6 +698,7 @@ static void bt_task(void *arg)
                 if (pressed) {
                     btn_fsm = BTN_PRESSING;
                     btn_press_samples = 1;
+                    btn_press_start_us = btn_now;
                 } else if (++btn_wait_samples >= BOOT_CLICK_WINDOW) {
                     uint8_t clicks = btn_click_count;
                     btn_click_count = 0;
@@ -1408,7 +1419,16 @@ int main(void)
     }
 
     bflb_mtd_init();
-    easyflash_init();
+    if (easyflash_init() != EF_NO_ERR || !factory_reset_apply_pending()) {
+        LOG_ERR("[B] Settings reset/storage failed; reconnect power to retry\n");
+        /* Never start Bluetooth/USB with partially reset settings. */
+        led_status_init();
+        led_status_set(LED_BLINK_BATTERY);
+        while (1) {
+            led_status_tick();
+            bflb_mtimer_delay_ms(10);
+        }
+    }
     if (rfparam_init(0, NULL, 0) != 0)
         LOG_ERR("[B] RF init FAIL\n");
     bflb_mtimer_delay_ms(3000);

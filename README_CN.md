@@ -130,7 +130,7 @@ build_windows.bat flash COM5   rem 串口烧录
 
 已有固件可制作 **macOS 和 Windows 两个独立简易离线烧录包**：完整解压后双击对应启动器，
 按住 BOOT 插入设备，再按回车即可自动查找端口、烧录和校验，无需安装 SDK 或 Python。
-当前包针对 LCTech BL616 的 `3.18H-HidAudio-R4` HS 固件；Windows 包面向 x64，macOS 包自动选择 Apple 芯片 / Intel 原生程序，无需 Rosetta。
+当前包针对 LCTech BL616 的 `3.18H-HidAudio-R5` HS 固件；Windows 包面向 x64，macOS 包自动选择 Apple 芯片 / Intel 原生程序，无需 Rosetta。
 使用与打包说明见 [tools/easy_flash/README.md](tools/easy_flash/README.md)。
 macOS 另提供可复制到另一台 Mac 的 Developer ID 签名、公证工具包，步骤见 [SIGNING.txt](tools/easy_flash/SIGNING.txt)。
 
@@ -190,7 +190,10 @@ LCTech BL616 为单颗蓝色 LED（GPIO27），不同状态以闪烁节奏区分
 |------|------|
 | **单击** | 切换到下一个已配对的手柄（最多记忆 8 个） |
 | **双击** | 断开当前手柄 + 重新扫描配对新手柄（保留 link key） |
-| **长按 3 秒** | 清除所有配对 + 重新扫描（三次蓝闪确认） |
+| **长按 3 秒** | 恢复全部用户设置（含两个按键映射档案、配对记录、黑名单）；三次闪烁确认后松开，自动重启并使用实时档 |
+
+长按操作须在适配器正常运行时进行；按住 BOOT 再插电仍是下载模式。未满 3 秒不会恢复默认。
+已有保存的档位在升级时保留，首次启动或执行恢复默认后使用实时档。
 
 ## 功能特性
 
@@ -254,7 +257,7 @@ USB 端提供 DualSense 兼容的 HID 描述符（DS 与 Edge 自动切换；标
 | 配置项 | 默认值 |
 |--------|--------|
 | 手柄模式 | Auto（DS5 / Edge / Auto） |
-| 轮询率 | 250Hz（250 / 500 / 实时 ~750Hz） |
+| 轮询率 | 实时档（只发送新帧；可选 250Hz / 500Hz） |
 | 空闲自动断开 | 30 分钟（0–60，0 = 关闭） |
 | LED 自动熄灭 | 开启（1 分钟后） |
 | 灯条自定义颜色 | 白色 |

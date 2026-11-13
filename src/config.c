@@ -95,7 +95,7 @@ void config_load(void)
         cfg.speaker_gain      = 2;
         cfg.inactive_time     = 30;
         cfg.disable_led       = 1;     /* auto-off LED after 1 min */
-        cfg.polling_rate_mode = 0;     /* default 250 Hz */
+        cfg.polling_rate_mode = 2;     /* default real-time, new frames only */
         cfg.audio_buffer_length = 64;
         cfg.controller_mode   = 2;     /* Auto */
         cfg.enable_wake       = 0;
