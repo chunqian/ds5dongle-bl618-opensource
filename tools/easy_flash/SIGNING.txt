@@ -1,6 +1,6 @@
 DS5Dongle R6 — 在另一台 Mac 上签名及苹果公证
 
-本目录已带上完整 R6 HS 烧录包，无需重新编译固件、安装 SDK、Homebrew 或 pip 依赖。
+本目录已带上完整 R6 HS Mac 专用烧录包，无需重新编译固件、安装 SDK、Homebrew 或 pip 依赖。
 签名电脑需要 Xcode 14 或更新、Xcode 提供的 Python 3.9 或更新，以及联网。
 本脚本不烧录设备；只检查签名、生成离线镜像、打包和公证。
 
@@ -23,7 +23,7 @@ Apple Development 和 Apple Distribution 也不能替代 Developer ID Applicatio
 
 输出 DMG 面向 Mac。打开 DMG 后，把整个 DS5Dongle 文件夹复制到“下载”或“桌面”，
 再运行 Flash-Mac.command；工具需要在其目录下写烧录日志，不能直接在只读 DMG 中烧录。
-Windows 程序不作修改；Windows 用户继续使用原有 R6 ZIP。
+签名材料和输出 DMG 均不含 Windows 运行程序；Windows 用户使用独立的 R6 Windows ZIP。
 签名脚本保留 .command 启动方式，不会将其变成 .app；macOS 仍可能显示首次打开确认。
 
 终端用法（先 cd 到解压后的签名工具目录）

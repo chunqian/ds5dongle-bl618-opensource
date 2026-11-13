@@ -1,6 +1,6 @@
 """Exercise launchers with a fake flasher; never opens or writes a real device.
 
-python3 tools/easy_flash/test_package.py --package build/easy_flash/DS5Dongle-LCTech616-HS-HidAudio-R6-Flash-NativeMac-Signed --pwsh /path/to/pwsh
+python3 tools/easy_flash/test_package.py --package /path/to/extracted/package [--pwsh /path/to/pwsh]
 PowerShell on macOS validates script logic, not Windows drivers/native flashing.
 """
 from pathlib import Path
@@ -11,6 +11,8 @@ import os
 import shutil
 import subprocess
 import tempfile
+
+from sign_macos_release import verify_package
 
 
 def digest(path):
@@ -26,17 +28,22 @@ def fixture(base, package, platform, outcome, ports):
     root = base / '中文 空格目录' / platform
     root.mkdir(parents=True)
     shutil.copytree(package / 'app', root / 'app')
-    for part in ('firmware', 'tools/common', 'tools/macos', 'tools/macos-arm64', 'tools/windows'):
+    parts = ['firmware', 'tools/common', 'tools/' + platform]
+    if platform == 'macos':
+        parts.append('tools/macos-arm64')
+    for part in parts:
         (root / part).mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(package / 'Flash-Mac.command', root / 'Flash-Mac.command')
+    launcher = 'Flash-Mac.command' if platform == 'macos' else 'Flash-Windows.bat'
+    shutil.copyfile(package / launcher, root / launcher)
     (root / 'firmware/version.txt').write_text('TEST FIXTURE - NO REAL DEVICE\n')
     for name in ('ds5dongle-lctech616-hs.bin', 'partition.bin', 'boot2_bl616_isp_release_v8.1.8.bin'):
         (root / 'firmware' / name).write_bytes(b'TEST FIXTURE ONLY\n')
     shutil.copyfile(package / 'firmware/flash_prog_cfg.ini', root / 'firmware/flash_prog_cfg.ini')
     (root / 'tools/common/test.conf').write_text('fixture\n')
-    helper = root / 'app/list-ports-macos'
-    helper.write_text('#!/bin/sh\n' + ''.join(f"printf '%s\\n' '{p}'\n" for p in ports if p.startswith('/dev/')))
-    helper.chmod(0o755)
+    if platform == 'macos':
+        helper = root / 'app/list-ports-macos'
+        helper.write_text('#!/bin/sh\n' + ''.join(f"printf '%s\\n' '{p}'\n" for p in ports if p.startswith('/dev/')))
+        helper.chmod(0o755)
     expected = digest(root / 'firmware/ds5dongle-lctech616-hs.bin')
     lines = ['Verification succeeded'] * 3 + [f'SHA caled by host: {expected}', f'SHA caled by dev: {expected}',
              'Flash writing succeeded', 'All programming completed successfully']
@@ -123,9 +130,41 @@ Test-PackageAssets $args[0]
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--package', type=Path, required=True)
-    parser.add_argument('--pwsh', type=Path, required=True)
+    parser.add_argument('--pwsh', type=Path, help='Required for Windows launcher tests only')
     args = parser.parse_args()
-    package, pwsh = args.package.resolve(), args.pwsh.resolve()
+    package = args.package.resolve()
+    pwsh = args.pwsh.resolve() if args.pwsh else None
+    metadata = json.loads((package / 'package-info.json').read_text())
+    platform = metadata.get('platform')
+    platforms = [platform] if platform else ['macos', 'windows']
+    assert all(p in ('macos', 'windows') for p in platforms)
+    if 'windows' in platforms and not pwsh:
+        parser.error('--pwsh is required for Windows launcher tests')
+    verify_package(package, metadata['firmware_sha256'])
+    assert (package / 'firmware/version.txt').read_text().strip() == metadata['version']
+    if platform:
+        expected_app = {'flash-mac.sh', 'flash-common.sh', 'list-ports-macos'} if platform == 'macos' else {'flash-windows.ps1', 'flash-common.ps1'}
+        expected_tools = {'common', 'macos', 'macos-arm64'} if platform == 'macos' else {'common', 'windows'}
+        assert {p.name for p in (package / 'app').iterdir()} == expected_app
+        assert {p.name for p in (package / 'tools').iterdir()} == expected_tools
+        assert (package / 'Flash-Mac.command').exists() == (platform == 'macos')
+        assert (package / 'Flash-Windows.bat').exists() == (platform == 'windows')
+        usage = (package / '使用说明.txt').read_text(encoding='utf-8-sig')
+        assert ('Flash-Mac.command' in usage) == (platform == 'macos')
+        assert ('Flash-Windows.bat' in usage) == (platform == 'windows')
+        if platform == 'windows':
+            assert not (package / 'signing-info.json').exists()
+            assert not (package / 'licenses/macOS-native').exists()
+            assert not (package / 'source/native-flash-command-source.tar.gz').exists()
+            assert not any(key.startswith('macos') for key in metadata)
+            # Windows PE machine type, verified without executing the EXE on Mac.
+            exe = (package / 'tools/windows/BLFlashCommand.exe').read_bytes()
+            offset = int.from_bytes(exe[0x3c:0x40], 'little')
+            assert exe[:2] == b'MZ' and exe[offset:offset + 4] == b'PE\0\0'
+            assert int.from_bytes(exe[offset + 4:offset + 6], 'little') == 0x8664
+            launcher = (package / 'Flash-Windows.bat').read_bytes()
+            assert b'\r\n' in launcher and b'\n' not in launcher.replace(b'\r\n', b'')
+        print('PASS: standalone platform layout, firmware and complete asset hashes')
     if (package / 'signing-info.json').exists():
         signing = json.loads((package / 'signing-info.json').read_text())
         actual_macho = set()
@@ -145,15 +184,17 @@ def main():
         native = json.loads((package / 'tools/macos-arm64/native-info.json').read_text())
         assert native['executable_sha256'] == digest(package / 'tools/macos-arm64/BLFlashCommand-macos')
         print('PASS: complete Mac signature coverage, identities and signed-file hashes')
-    for hardware, process, expected in [('1','arm64','macos-arm64'), ('1','x86_64','macos-arm64'),
-                                        ('0','x86_64','macos'), ('','arm64','macos-arm64')]:
-        actual = subprocess.check_output(['/bin/bash','-c','source "$1"; mac_tool_subdir "$2" "$3"',
-                                          'test',str(package/'app/flash-common.sh'),hardware,process],text=True).strip()
-        assert actual == expected,(hardware,process,actual)
-    print('PASS: Apple Silicon / Intel selection, including a translated parent shell')
-    subprocess.run(['/bin/bash', str(package / 'Flash-Mac.command'), '--check'], check=True, timeout=30)
-    test_powershell(package, pwsh)
-    for platform in ('macos', 'windows'):
+    if 'macos' in platforms:
+        for hardware, process, expected in [('1','arm64','macos-arm64'), ('1','x86_64','macos-arm64'),
+                                            ('0','x86_64','macos'), ('','arm64','macos-arm64')]:
+            actual = subprocess.check_output(['/bin/bash','-c','source "$1"; mac_tool_subdir "$2" "$3"',
+                                              'test',str(package/'app/flash-common.sh'),hardware,process],text=True).strip()
+            assert actual == expected,(hardware,process,actual)
+        print('PASS: Apple Silicon / Intel selection, including a translated parent shell')
+        subprocess.run(['/bin/bash', str(package / 'Flash-Mac.command'), '--check'], check=True, timeout=30)
+    if 'windows' in platforms:
+        test_powershell(package, pwsh)
+    for platform in platforms:
         for outcome, count in [('success',1), ('exit-error',1), ('no-verification',1), ('wrong-hash',1),
                                ('corrupt',1), ('success',0), ('success',2)]:
             run_case(package, pwsh, platform, outcome, count)

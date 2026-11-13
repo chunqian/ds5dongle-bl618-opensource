@@ -1,5 +1,5 @@
-DS5Dongle 简易烧录包 — LCTech BL616 / HS 高速版
-固件：LCT616-DS5 3.18H-HidAudio-R6
+DS5Dongle 简易烧录包 — {platform} / LCTech BL616 / HS 高速版
+固件：{version}
 
 适用设备：你此前使用的 LCTech BL616 适配器。
 本包不适用于 Pico 2W、M0S Dock、Ai-M61 或其他板型。
@@ -7,7 +7,7 @@ DS5Dongle 简易烧录包 — LCTech BL616 / HS 高速版
 使用步骤
 1. 把 ZIP 完整解压到本机“下载”或“桌面”，不要直接在压缩包里运行。
 2. 按住适配器 BOOT 键接入 USB，再松开 BOOT。每次仅连接一个待刷设备。
-3. Mac 双击 Flash-Mac.command；Windows 双击 Flash-Windows.bat。
+3. 双击 {launcher}。
 4. 按回车开始。工具自动查找端口、烧录、校验，无需选择 COM 口和文件。
 5. 显示“烧录成功”后，不按 BOOT，拔插一次即可使用。
 
@@ -16,22 +16,7 @@ DS5Dongle 简易烧录包 — LCTech BL616 / HS 高速版
 只有 VID 349B / PID 6160 的 BOOT 下载端口会被选中；多个匹配端口时会停止等待。
 这里识别的是芯片下载模式，无法据此判断开发板型号，因此仅在上述板型上使用。
 
-Mac
-- 支持 Apple 芯片和 Intel Mac（macOS 11 或更新），自动选择对应的原生程序。
-- 不需要 Rosetta、Python、Homebrew、Xcode 或 SDK；运行依赖已随包提供。
-- 名称带 Signed 的安装包已对 Mac 烧录程序、运行库和端口检测程序进行证书签名，
-  详细身份和文件哈希见 signing-info.json。Flash-Mac.command 是启动脚本，不是 .app。
-  Apple Development 开发签名不等于 Developer ID 分发签名，本包未经过苹果公证。
-- 从网络下载后，macOS 可能要求首次允许运行：在“系统设置 → 隐私与安全性”
-  中允许此工具，再重新打开；不要关闭系统的整体安全检查。
-
-Windows
-- 支持 64 位 Windows 10 / 11，使用系统自带 Windows PowerShell。
-- 不需要 Python、SDK、编译工具链或管理员运行。
-- 初次连接 BOOT 下载模式时，等待系统安装 USB 串口驱动，再按回车。
-- 若始终没有端口，在设备管理器中检查该设备是否出现 USB 串行设备（COMx）。
-  有黄色感叹号时先解决驱动问题；不要把其他 COM 口当成该适配器刷入。
-- 单次脚本启动使用进程内 ExecutionPolicy Bypass，不修改电脑的全局执行策略。
+{platform_notes}
 
 固件行为
 - HS 高速版；默认不呈现 USB 声卡。

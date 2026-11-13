@@ -1,0 +1,7 @@
+Windows
+- 支持 64 位 Windows 10 / 11，使用系统自带 Windows PowerShell。
+- 不需要 Python、SDK、编译工具链或管理员运行。
+- 初次连接 BOOT 下载模式时，等待系统安装 USB 串口驱动，再按回车。
+- 若始终没有端口，在设备管理器中检查该设备是否出现 USB 串行设备（COMx）。
+  有黄色感叹号时先解决驱动问题；不要把其他 COM 口当成该适配器刷入。
+- 单次脚本启动使用进程内 ExecutionPolicy Bypass，不修改电脑的全局执行策略。
