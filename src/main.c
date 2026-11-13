@@ -43,10 +43,9 @@
 #define LED_TASK_PRIORITY     (tskIDLE_PRIORITY + 1)
 #define BOOT_HOLD_US         (3ULL * 1000000ULL)
 #define BOOT_CLICK_WINDOW    5    /* 500ms window between clicks */
-#define RECONNECT_TIMEOUT_MS 2000
 #define HANDSHAKE_TIMEOUT_US  (10ULL * 1000000ULL)
 #define CONNECTING_TIMEOUT_TICKS pdMS_TO_TICKS(8000)
-#define L2CAP_FALLBACK_TIMEOUT_TICKS pdMS_TO_TICKS(3000)
+#define L2CAP_CONNECT_TIMEOUT_TICKS pdMS_TO_TICKS(3000)
 
 #define INPUT_QUEUE_ITEM_SZ  DS5_BT_INPUT_REPORT_SIZE
 #define USB_OUTPUT_BUF_SZ    64  /* Report ID (1) + SetStateData (up to 63 for DSE) */
@@ -557,15 +556,8 @@ static void bt_task(void *arg)
         /* Passive reconnect: page scan is enabled, wait for the
          * controller to page us and create L2CAP channels. */
         LOG_INF("[MAIN] Waiting for controller to reconnect...\n");
-        TickType_t start = xTaskGetTickCount();
-        while (!ds5_connected &&
-               (xTaskGetTickCount() - start) < pdMS_TO_TICKS(RECONNECT_TIMEOUT_MS)) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-        if (!ds5_connected) {
-            LOG_WRN("[MAIN] Reconnect timed out, starting scan\n");
-            bt_hid_host_scan_start(0);
-        }
+        /* Enter the task loop immediately: authentication, HID initialization
+         * and output processing run there even during a passive reconnect. */
     } else {
         LOG_INF("[MAIN] No bonded device, starting scan\n");
         bt_hid_host_scan_start(0);
@@ -577,11 +569,6 @@ static void bt_task(void *arg)
     uint16_t loop_count = 0;
     uint64_t disconnecting_since = 0;
     uint64_t stale_conn_since = 0;
-    uint16_t scan_retry_ticks = 0;   /* counts idle ticks since last scan */
-    uint8_t  scan_fail_count = 0;    /* consecutive scans with 0 results */
-#define MAX_SCAN_RETRIES 2           /* stop active inquiry after N failures;
-                                      * bonded controllers reconnect via page scan
-                                      * (like original DS5Dongle) */
 
     /*
      * Button gesture FSM (polled at 10 Hz, independent of loop speed).
@@ -701,7 +688,6 @@ static void bt_task(void *arg)
                             LOG_INF("[BTN] Single click — switching to controller %d\n", next);
                         } else {
                             LOG_INF("[BTN] Single click — only 1 bonded, fresh scan\n");
-                            scan_fail_count = 0;
                             if (ds5_connected) {
                                 scan_after_disconnect = true;
                                 bt_hid_host_disconnect();
@@ -712,7 +698,6 @@ static void bt_task(void *arg)
                         idle_ticks = 0;
                     } else if (clicks >= 2) {
                         LOG_INF("[BTN] Double click — disconnect + fresh scan\n");
-                        scan_fail_count = 0;
                         if (ds5_connected) {
                             scan_after_disconnect = true;
                             bt_hid_host_disconnect();
@@ -787,7 +772,6 @@ static void bt_task(void *arg)
         }
 
         bt_hid_host_poll_security_watchdog();
-        bt_hid_host_poll_incoming_l2cap_fallback();
         bt_hid_host_poll_tx();
 
         if (dse_mode_changed) {
@@ -929,7 +913,7 @@ next_output_iter:;
                     if (l2cap_timeout_start == 0)
                         l2cap_timeout_start = xTaskGetTickCount();
                     TickType_t elapsed = xTaskGetTickCount() - l2cap_timeout_start;
-                    if (elapsed > L2CAP_FALLBACK_TIMEOUT_TICKS) {
+                    if (elapsed > L2CAP_CONNECT_TIMEOUT_TICKS) {
                         LOG_WRN("[MAIN] Connecting timeout (%d) — disconnecting\n", s);
                         connecting_start_tick = 0;
                         l2cap_timeout_start = 0;
@@ -955,9 +939,6 @@ next_output_iter:;
                 enum bt_hid_host_state s = bt_hid_host_get_state();
                 if (s != BT_HID_STATE_IDLE) {
                     stale_conn_since = 0;
-                    scan_retry_ticks = 0;
-                    if (s != BT_HID_STATE_SCANNING)
-                        scan_fail_count = 0;
                 }
             }
 
@@ -973,18 +954,10 @@ next_output_iter:;
                         bt_hid_host_drop_stale_conn();
                         stale_conn_since = 0;
                     }
-                    scan_retry_ticks = 0;
                 } else {
+                    /* DS5Dongle waits for the next controller-initiated ACL.
+                     * Inquiry is started at boot without bonds or by BOOT. */
                     stale_conn_since = 0;
-                    scan_retry_ticks += idle_ticks;
-                    uint16_t retry_interval = ever_connected ? 600 : 300;
-                    if (scan_retry_ticks >= retry_interval) {
-                        scan_retry_ticks = 0;
-                        if (scan_fail_count < MAX_SCAN_RETRIES) {
-                            scan_fail_count++;
-                            bt_hid_host_scan_start(0);
-                        }
-                    }
                 }
                 idle_ticks = 0;
             }

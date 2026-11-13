@@ -139,16 +139,16 @@ enum bt_hid_host_state bt_hid_host_get_state(void);
 bool bt_hid_host_get_connected_addr(uint8_t *addr);
 
 /**
- * Try to reconnect to a previously bonded BR/EDR device.
- * Skips inquiry and directly initiates an ACL connection.
- * @return 0 if a bonded device was found and connection initiated,
+ * Select the saved BR/EDR peer and enable passive reconnection.
+ * The controller initiates ACL and both HID channels; no outgoing paging.
+ * @return 0 if a bonded device was found and page scan enabled,
  *         -1 if no bonded device exists
  */
 int bt_hid_host_try_reconnect(void);
 
 /**
  * Switch to the next bonded controller. Disconnects current, advances
- * active_idx, persists it, and waits for the new target to reconnect.
+ * the selected peer, persists its address, and waits for it to reconnect.
  * @return new active_idx on success, -1 if <= 1 bonded controller
  */
 int bt_hid_host_switch_next(void);
@@ -231,9 +231,8 @@ bool bt_hid_host_poll_scan_early(void);
 
 /**
  * Execute deferred security establishment (auth+encrypt).
- * Must be called from task context because it resets internal
- * bt_conn state and calls bt_conn_set_security (which uses
- * bt_hci_cmd_send_sync — would deadlock in BT callback).
+ * Must be called from task context because bt_conn_set_security uses
+ * bt_hci_cmd_send_sync, which may block in a BT callback.
  * @return true if a deferred security request was processed
  */
 bool bt_hid_host_poll_security(void);
@@ -251,12 +250,6 @@ bool bt_hid_host_poll_sdp(void);
  * @return true if watchdog triggered
  */
 bool bt_hid_host_poll_security_watchdog(void);
-
-/**
- * Fallback for incoming connections: if the controller doesn't open L2CAP
- * HID channels within 2s after security completes, the dongle initiates.
- */
-bool bt_hid_host_poll_incoming_l2cap_fallback(void);
 
 /**
  * Check if a stale ACL connection object exists (e.g. after force
@@ -294,7 +287,7 @@ void bt_hid_host_radio_idle(void);
 
 /**
  * Re-enable page scan + inquiry scan after radio_idle.
- * Also triggers reconnection attempt. Call from task context only.
+ * Resumes passive acceptance of controller connections. Call from task context only.
  */
 void bt_hid_host_radio_wake(void);
 

@@ -302,8 +302,6 @@ static struct {
     volatile TickType_t connect_pending_tick;
     bt_addr_t     pending_addr;
 
-    volatile bool fallback_retry;
-
     volatile bool sdp_pending;
 
     /* Security establishment deferred to task context */
@@ -802,8 +800,7 @@ static void l2cap_intr_connected(struct bt_l2cap_chan *chan)
 
 static void l2cap_ctrl_disconnected(struct bt_l2cap_chan *chan)
 {
-    LOG_INF("[HID] Control channel disconnected (fallback_retry=%d conn=%p)\n",
-           hid_ctx.fallback_retry, hid_ctx.conn);
+    LOG_INF("[HID] Control channel disconnected (conn=%p)\n", hid_ctx.conn);
     hid_ctx.ctrl_accepting = false;
     hid_ctx.ctrl_connected = false;
     if (!hid_ctx.intr_connected && hid_ctx.conn) {
@@ -1069,10 +1066,8 @@ static void conn_connected(struct bt_conn *conn, uint8_t err)
         hid_ctx.conn = bt_conn_ref(conn);
     }
 
-    hid_ctx.fallback_retry = false;
     hid_ctx.connect_pending = false;
     hid_ctx.connect_pending_tick = 0;
-    LOG_INF("[BT] conn_connected: fallback_retry CLEARED (incoming conn)\n");
 
     set_state(BT_HID_STATE_CONNECTING);
 
@@ -1098,20 +1093,13 @@ static volatile bool switch_pending = false;
 static void conn_disconnected(struct bt_conn *conn, uint8_t reason)
 {
     LOG_INF("[BT-CB] conn_disconnected: conn=%p hid_ctx.conn=%p reason=0x%02x "
-           "state=%d fallback_retry=%d\n",
-           conn, hid_ctx.conn, reason, hid_ctx.state, hid_ctx.fallback_retry);
+           "state=%d\n", conn, hid_ctx.conn, reason, hid_ctx.state);
 
     bonded_list_refresh();
     bonded_refresh_pending = true;
     if (conn != hid_ctx.conn) {
         LOG_INF("[BT] Old ACL teardown complete (unowned conn, reason 0x%02x, "
                "state=%d)\n", reason, hid_ctx.state);
-        /* If a fallback outgoing connect is waiting for ACL teardown, fire it now */
-        if (hid_ctx.connect_pending && hid_ctx.connect_pending_tick != 0 &&
-            hid_ctx.state == BT_HID_STATE_IDLE) {
-            hid_ctx.connect_pending_tick = xTaskGetTickCount();
-            LOG_INF("[BT] ACL clear — fallback connect ready\n");
-        }
         return;
     }
 
@@ -1159,15 +1147,6 @@ static void conn_disconnected(struct bt_conn *conn, uint8_t reason)
         LOG_INF("[BT] Switch: old ACL teardown complete, waiting for "
                "controller [%d/%d] to reconnect\n", active_idx, bonded_count);
         return;
-    }
-
-    LOG_INF("[BT] conn_disconnected: fallback_retry=%d bonded_count=%d\n",
-           hid_ctx.fallback_retry, bonded_count);
-    if (hid_ctx.fallback_retry && bonded_list_copy_active(&hid_ctx.pending_addr)) {
-        hid_ctx.fallback_retry = false;
-        hid_ctx.connect_pending = true;
-        hid_ctx.connect_pending_tick = xTaskGetTickCount();
-        LOG_INF("[BT] Fallback: outgoing connect scheduled (ACL already down)\n");
     }
 }
 
@@ -1633,7 +1612,7 @@ bool bt_hid_host_poll_connect(void)
         return false;
 
     /* If controller already reconnected (incoming), cancel outgoing */
-    if (hid_ctx.conn != NULL && hid_ctx.state != BT_HID_STATE_IDLE) {
+    if (hid_ctx.conn != NULL) {
         LOG_INF("[BT] poll_connect: cancelled (controller already connected, "
                "state=%d)\n", hid_ctx.state);
         hid_ctx.connect_pending = false;
@@ -1641,11 +1620,7 @@ bool bt_hid_host_poll_connect(void)
         return false;
     }
 
-    /* connect_pending_tick == UINT32_MAX means "waiting for ACL teardown" */
-    if (hid_ctx.connect_pending_tick == (TickType_t)UINT32_MAX)
-        return false;
-
-    /* After ACL teardown event fires, wait before connecting */
+    /* Pace retries of an explicit inquiry result, never an incoming reconnect. */
     if (hid_ctx.connect_pending_tick != 0) {
         TickType_t elapsed = xTaskGetTickCount() - hid_ctx.connect_pending_tick;
         if (elapsed < pdMS_TO_TICKS(500))
@@ -1672,19 +1647,19 @@ bool bt_hid_host_poll_connect(void)
         set_state(BT_HID_STATE_IDLE);
     }
 
-    LOG_INF("[BT] Fallback: attempting outgoing connect (state=%d conn=%p)\n",
+    LOG_INF("[BT] Discovery: attempting outgoing connect (state=%d conn=%p)\n",
            hid_ctx.state, hid_ctx.conn);
     int rc = bt_hid_host_connect(hid_ctx.pending_addr.val);
     if (rc != 0) {
         static uint8_t retry_count = 0;
         retry_count++;
         if (retry_count >= 3) {
-            LOG_WRN("[BT] Fallback: gave up after %d attempts\n", retry_count);
+            LOG_WRN("[BT] Discovery: gave up after %d attempts\n", retry_count);
             retry_count = 0;
             hid_ctx.connect_pending = false;
             hid_ctx.connect_pending_tick = 0;
         } else {
-            LOG_WRN("[BT] Fallback: attempt %d failed (%d), retry in 500ms\n",
+            LOG_WRN("[BT] Discovery: attempt %d failed (%d), retry in 500ms\n",
                    retry_count, rc);
             hid_ctx.connect_pending_tick = xTaskGetTickCount();
         }
@@ -1740,14 +1715,15 @@ bool bt_hid_host_poll_sdp(void)
 
     hid_ctx.sdp_pending = false;
 
-    if (hid_ctx.state != BT_HID_STATE_CONNECTING) {
+    if (!hid_ctx.outgoing || !hid_ctx.security_done ||
+        hid_ctx.state != BT_HID_STATE_CONNECTING) {
         LOG_DBG("[BT] poll_sdp: state already advanced (%s), skipping\n",
                state_name(hid_ctx.state));
         return false;
     }
 
-    /* Skip SDP for bonded devices — directly create L2CAP channels.
-     * This matches DS5Dongle behavior where reconnection never does SDP. */
+    /* Only discovery-initiated connections create HID channels locally.
+     * Paired incoming reconnects use the two servers, like DS5Dongle. */
     LOG_DBG("[BT] poll_sdp: creating outgoing L2CAP channels\n");
 
     set_state(BT_HID_STATE_L2CAP_CONTROL);
@@ -1806,63 +1782,6 @@ bool bt_hid_host_poll_security_watchdog(void)
     return true;
 }
 
-#define INCOMING_L2CAP_FALLBACK_MS 3000
-
-bool bt_hid_host_poll_incoming_l2cap_fallback(void)
-{
-    if (hid_ctx.state != BT_HID_STATE_CONNECTING)
-        return false;
-    if (!hid_ctx.security_done || hid_ctx.outgoing || !hid_ctx.conn)
-        return false;
-
-    TickType_t elapsed = xTaskGetTickCount() - hid_ctx.security_done_tick;
-    if (elapsed < pdMS_TO_TICKS(INCOMING_L2CAP_FALLBACK_MS))
-        return false;
-
-    /* Control L2CAP handshake stuck (accept fired but connected never came) */
-    if (hid_ctx.ctrl_accepting && !hid_ctx.ctrl_connected) {
-        LOG_INF("[BT] L2CAP fallback: Control handshake stuck, disconnecting "
-               "(ctrl_accept=%d ctrl_conn=%d intr_conn=%d)\n",
-               hid_ctx.ctrl_accepting, hid_ctx.ctrl_connected, hid_ctx.intr_connected);
-        /* Explicitly disconnect the stuck L2CAP channel to cancel RTX timer
-         * before tearing down the ACL — speeds up ACL teardown significantly */
-        bt_l2cap_chan_disconnect(&hid_ctx.ctrl_chan.chan);
-        hid_ctx.fallback_retry = true;
-        LOG_INF("[BT] fallback_retry SET=1 (stuck path)\n");
-        bt_hid_host_disconnect();
-        return true;
-    }
-
-    if (hid_ctx.ctrl_connected) {
-        /* Control is up but Interrupt isn't — open Interrupt only */
-        if (!hid_ctx.intr_connected && !hid_ctx.intr_accepting) {
-            LOG_INF("[BT] L2CAP fallback: Control connected, opening Interrupt\n");
-            hid_ctx.outgoing = true;
-            set_state(BT_HID_STATE_L2CAP_INTERRUPT);
-            memset(&hid_ctx.intr_chan, 0, sizeof(hid_ctx.intr_chan));
-            hid_ctx.intr_chan.chan.ops = &intr_ops;
-            hid_ctx.intr_chan.rx.mtu  = L2CAP_BR_MTU;
-            int err = bt_l2cap_chan_connect(hid_ctx.conn,
-                                            &hid_ctx.intr_chan.chan,
-                                            HID_PSM_INTERRUPT);
-            if (err)
-                LOG_ERR("[BT] Interrupt connect failed: %d\n", err);
-            return true;
-        }
-        return false;
-    }
-
-    /* Neither Control connecting nor connected — controller didn't open L2CAP.
-     * Controller's SDP query may have closed before receiving our response.
-     * Set fallback_retry to actively page controller and open L2CAP from host side
-     * (standard HID Host behavior, same as Pico2W DS5Dongle). */
-    LOG_WRN("[BT] L2CAP fallback: no activity in %dms, retry outgoing\n",
-            (int)(elapsed * portTICK_PERIOD_MS));
-    hid_ctx.fallback_retry = true;
-    bt_hid_host_disconnect();
-    return true;
-}
-
 int bt_hid_host_connect(const uint8_t *addr)
 {
     bt_addr_t bt_addr;
@@ -1880,9 +1799,7 @@ int bt_hid_host_connect(const uint8_t *addr)
 
     if (hid_ctx.conn) {
         LOG_DBG("[BT] connect: already have conn=%p, skip create\n", hid_ctx.conn);
-        hid_ctx.outgoing = true;
-        set_state(BT_HID_STATE_CONNECTING);
-        return 0;
+        return -EBUSY; /* Do not turn an incoming reconnect into an outgoing one. */
     }
 
     hid_ctx.outgoing = true;
@@ -1917,8 +1834,7 @@ int bt_hid_host_connect(const uint8_t *addr)
 
 void bt_hid_host_disconnect(void)
 {
-    LOG_INF("[BT] bt_hid_host_disconnect called (state=%d fallback_retry=%d)\n",
-           hid_ctx.state, hid_ctx.fallback_retry);
+    LOG_INF("[BT] bt_hid_host_disconnect called (state=%d)\n", hid_ctx.state);
     if (hid_ctx.conn) {
         set_state(BT_HID_STATE_DISCONNECTING);
         bt_conn_disconnect(hid_ctx.conn,
@@ -1963,19 +1879,13 @@ void bt_hid_host_force_disconnect(void)
 
     set_state(BT_HID_STATE_IDLE);
 
-    LOG_INF("[BT] force_disconnect: fallback_retry=%d bonded_count=%d\n",
-           hid_ctx.fallback_retry, bonded_count);
     bonded_list_refresh();
     taskENTER_CRITICAL();
     pairing_addr_pending = false;
     bonded_refresh_pending = true;
     taskEXIT_CRITICAL();
-    if (hid_ctx.fallback_retry && bonded_list_copy_active(&hid_ctx.pending_addr)) {
-        hid_ctx.fallback_retry = false;
-        hid_ctx.connect_pending = true;
-        hid_ctx.connect_pending_tick = (TickType_t)UINT32_MAX;
-        LOG_INF("[BT] Fallback: outgoing connect pending (waiting for ACL teardown)\n");
-    }
+    /* Like DS5Dongle, return to passive acceptance after teardown. */
+
 }
 
 bool bt_hid_host_has_pending_conn(void)
@@ -2195,6 +2105,9 @@ int bt_hid_host_try_reconnect(void)
 
     bt_addr_copy(&hid_ctx.target_addr, addr);
     hid_ctx.has_target = true;
+
+    bt_br_set_connectable(true);
+    bt_br_set_discoverable(true);
 
     /* DS5Dongle approach: don't actively page the controller.
      * Stay connectable and let the controller reconnect to us.
