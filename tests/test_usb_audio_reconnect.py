@@ -11,7 +11,7 @@ import tempfile
 root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parents[1]
 source = (root / "src/usb_gamepad.c").read_text()
 start = source.index("void usb_gamepad_process_deferred(void)")
-end = source.index("    if (usb_reset_pending)", start)
+end = source.index("    if (usb_reset_pending", start)
 task = source[start:end] + "}\n"
 
 

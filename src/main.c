@@ -14,6 +14,7 @@
 #include "led_status.h"
 #include "state_mgr.h"
 #include "config.h"
+#include "factory_reset.h"
 #include "dse.h"
 #include "remap.h"
 
@@ -618,7 +619,7 @@ static void bt_task(void *arg)
      * Button gesture FSM (polled at 10 Hz, independent of loop speed).
      *   single click  → switch to next bonded controller
      *   double click  → disconnect + fresh scan (search new controller)
-     *   hold >= 3s    → clear all bonds + blacklist + reset
+     *   hold >= 3s    → request factory reset; release → reboot and clear settings
      */
     enum { BTN_IDLE, BTN_PRESSING, BTN_HELD, BTN_WAIT } btn_fsm = BTN_IDLE;
     uint8_t  btn_press_samples = 0;
@@ -678,9 +679,13 @@ static void bt_task(void *arg)
                     if (btn_press_samples >= BOOT_HOLD_TICKS) {
                         btn_click_count = 0;
                         btn_fsm = BTN_HELD;
-                        LOG_INF("[BTN] IO2 held 3s — clearing all bonds\n");
-                        bt_hid_host_clear_bonds();
-                        led_status_set(LED_BLINK_TRIPLE);
+                        if (factory_reset_request()) {
+                            LOG_INF("[BTN] IO2 held 3s — factory reset requested; release to reboot\n");
+                            led_status_set(LED_BLINK_TRIPLE);
+                        } else {
+                            LOG_ERR("[BTN] Cannot save factory reset request; release and retry\n");
+                            led_status_set(LED_RED_BLINK);
+                        }
                         idle_ticks = 0;
                     }
                 } else {
@@ -700,9 +705,11 @@ static void bt_task(void *arg)
                 if (!pressed) {
                     btn_fsm = BTN_IDLE;
                     btn_press_samples = 0;
-                    LOG_INF("[BTN] IO2 released after hold — resetting\n");
-                    vTaskDelay(pdMS_TO_TICKS(300));
-                    GLB_SW_System_Reset();
+                    if (factory_reset_is_pending()) {
+                        LOG_INF("[BTN] IO2 released — rebooting to clear all settings\n");
+                        vTaskDelay(pdMS_TO_TICKS(300));
+                        GLB_SW_System_Reset();
+                    }
                 }
                 break;
 
@@ -745,6 +752,13 @@ static void bt_task(void *arg)
                 }
                 break;
             }
+        }
+
+        /* Wait for button release; in particular do not let a BT teardown
+         * watchdog reset into the ROM downloader while BOOT is still held. */
+        if (factory_reset_is_pending()) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
         }
 
         bt_hid_host_persist_if_dirty();
@@ -1430,7 +1444,22 @@ int main(void)
     }
 
     bflb_mtd_init();
-    easyflash_init();
+    enum factory_reset_result reset_result = FACTORY_RESET_FAILED;
+    if (easyflash_init() == EF_NO_ERR)
+        reset_result = factory_reset_apply_on_boot();
+    if (reset_result == FACTORY_RESET_FAILED) {
+        /* Keep the durable request and do not load partially cleared settings.
+         * Replugging retries the operation before BT/USB tasks can save data. */
+        LOG_ERR("[B] Settings init/factory reset failed; replug to retry\n");
+        led_status_init();
+        led_status_set(LED_RED_BLINK);
+        while (1) {
+            led_status_tick();
+            bflb_mtimer_delay_ms(50);
+        }
+    }
+    if (reset_result == FACTORY_RESET_DONE)
+        LOG_INF("[B] Factory reset complete — all saved settings cleared\n");
     if (rfparam_init(0, NULL, 0) != 0)
         LOG_ERR("[B] RF init FAIL\n");
     bflb_mtimer_delay_ms(3000);

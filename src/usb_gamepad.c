@@ -7,6 +7,7 @@
 #include "ds5_protocol.h"
 #include "dse.h"
 #include "config.h"
+#include "factory_reset.h"
 #include "state_mgr.h"
 #include "remap.h"
 #include "usbd_core.h"
@@ -25,14 +26,14 @@
 
 #if defined(BOARD_LCTECH_616)
   #ifdef FORCE_FS_MODE
-    #define FIRMWARE_VERSION "LCT616-DS5 3.18-HidAudio-R6"
+    #define FIRMWARE_VERSION "LCT616-DS5 3.18-HidAudio-R7"
   #else
-    #define FIRMWARE_VERSION "LCT616-DS5 3.18H-HidAudio-R6"
+    #define FIRMWARE_VERSION "LCT616-DS5 3.18H-HidAudio-R7"
   #endif
 #elif defined(BOARD_M0S_DOCK)
-#define FIRMWARE_VERSION "M0S-DS5 3.5-HidAudio-R6"
+#define FIRMWARE_VERSION "M0S-DS5 3.5-HidAudio-R7"
 #else
-#define FIRMWARE_VERSION "BL618-DS5 3.5-HidAudio-R6"
+#define FIRMWARE_VERSION "BL618-DS5 3.5-HidAudio-R7"
 #endif
 
 #define USBD_MAX_POWER      250
@@ -846,12 +847,14 @@ void usb_gamepad_process_deferred(void)
         LOG_INF("[USB-AUDIO] Reconnected: audio visibility=%d\n", enabled);
     }
 
-    if (usb_reset_pending) {
+    if (usb_reset_pending && !factory_reset_is_pending()) {
         usb_reset_pending = false;
         config_save();
         LOG_INF("[USB] CMD 0x03: USB reconnect via reset\n");
         vTaskDelay(pdMS_TO_TICKS(100));
-        GLB_SW_System_Reset();
+        /* BOOT may have armed reset during the delay. Wait for its release. */
+        if (!factory_reset_is_pending())
+            GLB_SW_System_Reset();
     }
     if (usb_config_save_pending) {
         usb_config_save_pending = false;

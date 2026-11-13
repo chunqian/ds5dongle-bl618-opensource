@@ -188,7 +188,16 @@ LCTech BL616 has a single blue LED (GPIO27); states are distinguished by blink c
 |---------|--------|
 | **Single click** | Switch to the next paired controller (up to 8 remembered) |
 | **Double click** | Disconnect current controller + scan for a new one (link keys preserved) |
-| **Long press (3s)** | Clear all bonds + start scanning (triple LED flash to confirm) |
+| **Long press (3s)** | Since R7: release after the triple blink to reboot and reset all saved settings, bonds and remap profiles |
+
+Hold BOOT only after normal startup; holding it while plugging in USB still enters download mode.
+Factory reset clears all PSM settings, including audio/LED/polling/touchpad configuration, remap
+profiles, controller-type memory, Bluetooth bonds and blacklist. Re-pair the controller afterward;
+polling returns to the source default of real-time mode. Firmware, partition table and RF calibration remain
+unchanged. R6 and earlier only clear bonds on a long press.
+The durable request is processed before configuration loads or BT/USB tasks start. Its marker is
+deleted last, so interrupted cleanup resumes at the next boot. Storage errors stop normal startup
+with a blinking LED; replug to retry. A failed request write does not reboot; release and hold again.
 
 ## Features
 
@@ -252,7 +261,7 @@ Settings persist via `bt_settings` and are read/written over USB Feature Reports
 | Option | Default |
 |--------|---------|
 | Controller mode | Auto (DS5 / Edge / Auto) |
-| Polling rate | 250Hz (250 / 500 / real-time ~750Hz) |
+| Polling rate | Real-time (250Hz / 500Hz / real-time, following the BT report rate at ~750Hz) |
 | Idle auto-disconnect | 30 min (0–60, 0 = off) |
 | LED auto-off | On (after 1 min) |
 | Custom light-bar color | White |
