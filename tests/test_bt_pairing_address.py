@@ -52,7 +52,7 @@ struct bt_l2cap_br_chan { struct { struct bt_conn *conn; unsigned state, psm; } 
 enum bt_hid_host_state { BT_HID_STATE_IDLE, BT_HID_STATE_SCANNING, BT_HID_STATE_DISCONNECTING };
 static struct {
     struct bt_conn *conn;
-    bool acl_disconnected;
+    bool acl_disconnected, disconnect_requested, disconnect_attempted;
     struct bt_l2cap_br_chan ctrl_chan, intr_chan;
     unsigned connect_pending_tick;
     uint8_t connect_retry_count;
@@ -75,8 +75,7 @@ static bool discovery_stop(void) { return true; } /* Exercised in reconnect test
 static int bt_conn_disconnect(struct bt_conn *conn, int reason) { (void)conn; (void)reason; return 0; }
 static struct bt_conn *bt_conn_ref(struct bt_conn *conn) { ++conn->refs; return conn; }
 static void bt_conn_unref(struct bt_conn *conn) { assert(conn->refs); --conn->refs; }
-static void bt_br_set_connectable(bool enabled) { (void)enabled; }
-static void bt_br_set_discoverable(bool enabled) { (void)enabled; }
+static void request_scan_mode(bool enabled) { (void)enabled; } /* Task retry tested separately. */
 static void feature_cache_clear(void) {}
 static void dse_reset(void) {}
 static void app_tx_fifo_reset(void) {}

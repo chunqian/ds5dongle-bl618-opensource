@@ -347,6 +347,12 @@ static int send_audio_report(uint32_t session, uint32_t stream, uint32_t generat
 #define MIC_TASK_STACK_SIZE STACK_WORDS(1024*12)
 #define MIC_TASK_PRIORITY (configMAX_PRIORITIES - 4)
 
+static StaticTask_t audio_tcb, mic_tcb;
+static StackType_t audio_stack[AUDIO_TASK_STACK_SIZE], mic_stack[MIC_TASK_STACK_SIZE];
+static StaticQueue_t mic_queue_cb;
+static uint8_t mic_queue_storage[MIC_QUEUE_DEPTH * sizeof(struct mic_message)];
+static StaticTimer_t encode_watchdog_cb_storage;
+
 #define ENCODE_TIMEOUT_US  15000  /* 15ms — normal encode takes ~5-7ms */
 #define WATCHDOG_PERIOD_MS 20
 
@@ -377,8 +383,8 @@ bool audio_check_respawn(void)
     if (!audio_tasks_enabled) return false;
     uint64_t now = bflb_mtimer_get_time_us();
     if (!mic_task_started && decoder && mic_queue && now >= mic_restart_us) {
-        mic_task_started = xTaskCreate(audio_mic_task, "mic", MIC_TASK_STACK_SIZE,
-                                       NULL, MIC_TASK_PRIORITY, NULL) == pdPASS;
+        mic_task_started = xTaskCreateStatic(audio_mic_task, "mic", MIC_TASK_STACK_SIZE,
+                                       NULL, MIC_TASK_PRIORITY, mic_stack, &mic_tcb) != NULL;
         if (!mic_task_started) mic_restart_us = now + 1000000;
     }
     uintptr_t irq = bflb_irq_save();
@@ -391,8 +397,13 @@ bool audio_check_respawn(void)
     audio_task_handle = NULL;
     bflb_irq_restore(irq);
     if (old) vTaskDelete(old); /* Delete the suspended owner exactly once. */
-    BaseType_t result = xTaskCreate(audio_task, "audio", AUDIO_TASK_STACK_SIZE,
-                                    NULL, AUDIO_TASK_PRIORITY, &audio_task_handle);
+    /* Deleting a different, suspended task frees its TCB synchronously in
+     * this SDK. Static storage can then be reused without heap allocation. */
+    vTaskSuspendAll(); /* Publish handle before the worker/watchdog can run. */
+    audio_task_handle = xTaskCreateStatic(audio_task, "audio", AUDIO_TASK_STACK_SIZE,
+                                    NULL, AUDIO_TASK_PRIORITY, audio_stack, &audio_tcb);
+    xTaskResumeAll();
+    BaseType_t result = audio_task_handle ? pdPASS : pdFAIL;
     irq = bflb_irq_save();
     if (generation == audio_restart_generation) {
         if (result == pdPASS) audio_task_killed = false;
@@ -456,7 +467,8 @@ int audio_init(void)
         decoder = NULL;
     }
 
-    mic_queue = xQueueCreate(MIC_QUEUE_DEPTH, sizeof(struct mic_message));
+    mic_queue = xQueueCreateStatic(MIC_QUEUE_DEPTH, sizeof(struct mic_message),
+                                  mic_queue_storage, &mic_queue_cb);
     if (!mic_queue) {
         LOG_ERR("[AUDIO] mic_queue create failed\n");
     }
@@ -474,10 +486,12 @@ int audio_init(void)
     memset(opus_slots, 0, sizeof(opus_slots));
     memset(haptic_slots, 0, sizeof(haptic_slots));
 
-    encode_watchdog = xTimerCreate("wd-opus", pdMS_TO_TICKS(WATCHDOG_PERIOD_MS),
-                                   pdTRUE, NULL, encode_watchdog_cb);
-    if (encode_watchdog)
-        xTimerStart(encode_watchdog, 0);
+    encode_watchdog = xTimerCreateStatic("wd-opus", pdMS_TO_TICKS(WATCHDOG_PERIOD_MS),
+                                   pdTRUE, NULL, encode_watchdog_cb, &encode_watchdog_cb_storage);
+    if (!encode_watchdog || xTimerStart(encode_watchdog, 0) != pdPASS) {
+        LOG_ERR("[AUDIO] Watchdog unavailable; refusing unprotected audio task\n");
+        return -1;
+    }
 
     LOG_INF("[AUDIO] Opus static init (enc=%d/%d dec=%d/%d mic_q=%p wd=%p)\n",
            enc_size, OPUS_ENC_MAX_SIZE, dec_size, OPUS_DEC_MAX_SIZE,

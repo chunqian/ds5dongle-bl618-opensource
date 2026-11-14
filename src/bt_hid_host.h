@@ -91,6 +91,7 @@ int bt_hid_host_connect(const uint8_t *addr);
  * Request disconnect; retain the connection until real teardown completes.
  */
 void bt_hid_host_disconnect(void);
+void bt_hid_host_poll_control(void);
 
 /**
  * Finalize cleanup after ACL disconnection and SDK L2CAP release.

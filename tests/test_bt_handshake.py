@@ -77,7 +77,8 @@ static unsigned critical_depth;
 static struct {
     struct bt_conn *conn;
     bt_addr_t target_addr;
-    bool has_target, acl_disconnected;
+    bool has_target, acl_disconnected, disconnect_requested, disconnect_attempted;
+    TickType_t disconnect_retry_tick;
     enum bt_hid_host_state state;
     bool ctrl_connected, intr_connected, check_dse, is_dse;
     bool security_done, outgoing, sdp_pending;
@@ -128,6 +129,7 @@ static struct bt_conn *bt_conn_ref(struct bt_conn *c) { ++c->refs; return c; }
 static void bt_conn_unref(struct bt_conn *c);
 static int bt_conn_disconnect(struct bt_conn *c, uint8_t reason) { assert(c==&current); ++disconnected; return 0; }
 void bt_hid_host_disconnect(void);
+static bool poll_scan_mode(void) { return true; }
 static int l2cap_ctrl_recv(struct bt_l2cap_chan *, struct net_buf *);
 static void handshake_begin(void);
 static void reply(uint8_t id) {
@@ -174,7 +176,7 @@ for signature in (
     "static void handshake_finish_detection(",
     "static void handshake_send_pending(",
     "static int l2cap_ctrl_recv(", "void bt_hid_host_handshake_tick(",
-    "void bt_hid_host_disconnect(", "static void clear_rejected_key(",
+    "void bt_hid_host_disconnect(", "void bt_hid_host_poll_control(", "static void clear_rejected_key(",
     "static void auth_pairing_failed(", "static void security_changed(",
 ):
     support += "\n" + extract(SOURCE, signature) + "\n"
@@ -221,6 +223,7 @@ tests = r'''
 static void auth_event(uint8_t status, uint16_t handle) {
     struct bt_hci_evt_auth_complete event={status,handle};
     struct net_buf b={(uint8_t *)&event,sizeof(event)}; auth_complete(&b);
+    bt_hid_host_poll_control();
 }
 int main(void) {
     setup(); bt_hid_host_handshake_tick();
@@ -285,7 +288,8 @@ int main(void) {
     setup(); for(tick=0;tick<10000;tick+=100) bt_hid_host_handshake_tick();
     assert(sent_count==10 && hid_ctx.handshake.probe_attempts==6);
     assert(primers==1); /* Retries do not replay the initial state/0x32. */
-    assert(hid_ctx.state==BT_HID_STATE_HANDSHAKE && hid_ctx.check_dse); /* never guess DS5 */
+    assert(hid_ctx.state==BT_HID_STATE_DISCONNECTING && hid_ctx.disconnect_requested); /* never guess DS5 */
+    assert(!disconnected); bt_hid_host_poll_control(); assert(disconnected==1 && !deleted_keys);
     setup(); fail_count[0x70]=1; bt_hid_host_handshake_tick();
     assert(primers==1 && hid_ctx.state==BT_HID_STATE_HANDSHAKE);
     tick=1000; immediate_response=true; bt_hid_host_handshake_tick();
@@ -322,9 +326,9 @@ int main(void) {
     setup(); auth_event(BT_HCI_ERR_AUTH_FAIL,2);
     assert(!deleted_keys && !disconnected && other.refs==1);
     setup(); auth_event(0,1); assert(encryptions==1 && !notifications && !deleted_keys);
-    setup(); auth_pairing_failed(&current,BT_SECURITY_ERR_PIN_OR_KEY_MISSING);
+    setup(); auth_pairing_failed(&current,BT_SECURITY_ERR_PIN_OR_KEY_MISSING); bt_hid_host_poll_control();
     assert(deleted_keys==1 && disconnected==1);
-    setup(); auth_pairing_failed(&current,BT_SECURITY_ERR_UNSPECIFIED);
+    setup(); auth_pairing_failed(&current,BT_SECURITY_ERR_UNSPECIFIED); bt_hid_host_poll_control();
     assert(!deleted_keys && disconnected==1);
     setup(); security_changed(&current,BT_SECURITY_L1,0); assert(!hid_ctx.security_done);
     setup(); immediate_response=true; primer_failures=1;

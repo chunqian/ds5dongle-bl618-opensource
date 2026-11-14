@@ -20,10 +20,15 @@ typedef void *TaskHandle_t;
 typedef void *TimerHandle_t;
 typedef int BaseType_t;
 typedef uint32_t StackType_t;
+typedef int StaticTask_t;
+#define pdFAIL 0
 #define pdPASS 1
 #define configMAX_PRIORITIES 8
 #define LOG_INF(...) ((void)0)
 #define LOG_ERR(...) ((void)0)
+static unsigned scheduler_suspended;
+static void vTaskSuspendAll(void) { ++scheduler_suspended; }
+static void xTaskResumeAll(void) { assert(scheduler_suspended); --scheduler_suspended; }
 static uintptr_t masked;
 static uintptr_t bflb_irq_save(void) { uintptr_t old=masked; masked=1; return old; }
 static void bflb_irq_restore(uintptr_t old) { masked=old; }
@@ -43,20 +48,20 @@ static void audio_mic_task(void *p) { (void)p; }
 static void audio_reset_encoder(void) { resets++; }
 static void vTaskSuspend(TaskHandle_t h) { assert(h && !masked); suspended++; }
 static void vTaskDelete(TaskHandle_t h) { assert(h && !masked); deleted++; }
-static int xTaskCreate(void (*task)(void *),const char *name,unsigned stack,void *arg,unsigned priority,TaskHandle_t *handle) {
- (void)name;(void)stack;(void)arg;(void)priority; assert(!masked);
+static TaskHandle_t xTaskCreateStatic(void (*task)(void *),const char *name,unsigned stack,void *arg,unsigned priority,StackType_t *storage,StaticTask_t *tcb) {
+ (void)name;(void)stack;(void)arg;(void)priority; assert(!masked && storage && tcb);
  if(task==audio_task) {
-  audio_creates++;
-  if(audio_failures) { --audio_failures; return 0; }
-  assert(handle); *handle=(void *)(uintptr_t)next_handle++;
+  assert(scheduler_suspended); audio_creates++;
+  if(audio_failures) { --audio_failures; return NULL; }
   if(die_during_create) {
    die_during_create=false; ++audio_restart_generation; audio_task_killed=true;
   }
- } else { assert(task==audio_mic_task); mic_creates++; if(mic_failures) { --mic_failures; return 0; } }
- return pdPASS;
+ } else { assert(task==audio_mic_task); mic_creates++; if(mic_failures) { --mic_failures; return NULL; } }
+ return (void *)(uintptr_t)next_handle++;
 }
 '''
-workers+=audio[audio.index('#define STACK_WORDS'):audio.index('static void encode_watchdog_cb')]
+workers+=audio[audio.index('#define STACK_WORDS'):audio.index('static StaticQueue_t mic_queue_cb')]
+workers+=audio[audio.index('#define ENCODE_TIMEOUT_US'):audio.index('static void encode_watchdog_cb')]
 for sig in ['static void encode_watchdog_cb(', 'bool audio_check_respawn(', 'void audio_start_tasks(']:workers+=extract(audio,sig)
 workers+=r'''
 int main(void) {
@@ -164,6 +169,45 @@ int main(void) {
  puts("PASS: failed BT initialization releases USB clock/wait without inquiry or partial SDK retry");
 }
 '''
+services=r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <errno.h>
+#define LOG_INF(...) ((void)0)
+#define BT_OP(a,b) (b)
+#define BT_OGF_BASEBAND 3
+static int l2cap_hid_ctrl_server,l2cap_hid_intr_server,hid_host_rec;
+static unsigned calls, fail_call, scan_requests;
+struct net_buf { int unused; } buffer;
+static int result(void) { return ++calls==fail_call ? -EIO : 0; }
+static int bt_l2cap_br_server_register(int *server) { (void)server; return result(); }
+static int bt_sdp_register_service(int *rec) { (void)rec; return result(); }
+static struct net_buf *bt_hci_cmd_create(unsigned op,unsigned size) {
+ (void)op;(void)size; return result() ? NULL : &buffer;
+}
+static void net_buf_add_le16(struct net_buf *buf,unsigned value) { (void)buf;(void)value; }
+static int bt_hci_cmd_send_sync(unsigned op,struct net_buf *buf,void *rsp) {
+ (void)op;(void)buf;(void)rsp; return result();
+}
+static void request_scan_mode(bool enabled) { assert(enabled); ++scan_requests; }
+static bool poll_scan_mode(void) { return false; } /* transient failure retained by scan owner */
+static int initialize_services(void) { int err;
+'''
+init=extract(bt,'int bt_hid_host_init(')
+services+=init[init.index('    err = bt_l2cap_br_server_register('):]
+services+=r'''
+int main(void) {
+ for(fail_call=1; fail_call<=5; ++fail_call) {
+  calls=scan_requests=0; assert(initialize_services()<0 && !scan_requests);
+  assert(calls==fail_call);
+ }
+ fail_call=0; calls=scan_requests=0;
+ assert(initialize_services()==0 && calls==5 && scan_requests==1);
+ puts("PASS: mandatory Control/Interrupt/SDP/page-scan setup failures cannot report ready; transient scan-enable stays retryable");
+}
+'''
+
 # Owner routing is part of the production call graph, not just standalone mocks.
 assert 'dse_task();' not in extract(main,'static void usb_task(')
 assert 'usb_gamepad_process_feature_sets();' in extract(main,'static void bt_task(')
@@ -173,7 +217,7 @@ assert 'audio_check_respawn();' in extract(main,'static void usb_task(')
 assert 'if (config_usb_stealth() && !bt_init_failed)' in main
 with tempfile.TemporaryDirectory(prefix='ds5-recovery-') as tmp:
  p=Path(tmp)
- for name,source in [('workers',workers),('blacklist',blacklist),('startup',startup)]:
+ for name,source in [('workers',workers),('blacklist',blacklist),('startup',startup),('services',services)]:
   (p/(name+'.c')).write_text(source)
   subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',str(p/(name+'.c')),'-o',str(p/name)],check=True)
   subprocess.run([str(p/name)],check=True)

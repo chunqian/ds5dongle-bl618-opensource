@@ -95,9 +95,15 @@ static void blacklist_remove(const bt_addr_t *addr) {}
 #define BT_OGF_BASEBAND 3
 #define BT_HCI_ERR_CONN_LIMIT_EXCEEDED 9
 #define BT_HCI_ERR_AUTH_FAIL 5
-static struct net_buf *bt_hci_cmd_create(unsigned op, unsigned size) { return NULL; }
+#define BT_HCI_OP_AUTH_REQUESTED 0x0411
+static int security_error, security_calls, auth_error;
+static bool auth_buffer_available;
+static int bt_conn_set_security(struct bt_conn *conn, int level) {
+    assert(conn==hid_ctx.conn && level==BT_SECURITY_L2); ++security_calls; return security_error;
+}
+static struct net_buf *bt_hci_cmd_create(unsigned op, unsigned size) { static struct net_buf buf; return auth_buffer_available ? &buf : NULL; }
 static void net_buf_add_le16(struct net_buf *buf, unsigned value) {}
-static int bt_hci_cmd_send_sync(unsigned op, struct net_buf *buf, void *rsp) { return 0; }
+static int bt_hci_cmd_send_sync(unsigned op, struct net_buf *buf, void *rsp) { return auth_error; }
 static TickType_t xTaskGetTickCount(void) { return tick; }
 static void set_state(enum bt_hid_host_state state) { hid_ctx.state=state; }
 static struct bt_conn *bt_conn_ref(struct bt_conn *conn) { ++conn->refs; return conn; }
@@ -121,8 +127,20 @@ static int bt_br_discovery_stop(void) {
     if (complete_during_stop) { complete_during_stop=false; discovery_complete(discovery_results,1); }
     return stop_error;
 }
-static void bt_br_set_connectable(bool enabled) { connectable=enabled; }
-static void bt_br_set_discoverable(bool enabled) { discoverable=enabled; }
+static int scan_mode_error, scan_mode_calls;
+static void (*during_scan)(void);
+static int bt_br_set_connectable(bool enabled) {
+    ++scan_mode_calls;
+    if(during_scan) { void (*fn)(void)=during_scan; during_scan=NULL; fn(); }
+    if(scan_mode_error) return scan_mode_error;
+    if(connectable==enabled) return -EALREADY;
+    connectable=enabled; return 0;
+}
+static int bt_br_set_discoverable(bool enabled) {
+    if(scan_mode_error) return scan_mode_error;
+    if(discoverable==enabled) return -EALREADY;
+    discoverable=enabled; return 0;
+}
 static struct bt_conn *bt_conn_create_br(const bt_addr_t *addr, void *params) { ++pages; return fail_create ? NULL : &current; }
 static int bt_conn_disconnect(struct bt_conn *conn, uint8_t reason) { ++disconnects; return disconnect_error; }
 static int bt_l2cap_chan_connect(struct bt_conn *conn, struct bt_l2cap_chan *chan, unsigned psm) {
@@ -138,6 +156,7 @@ static int bt_hid_host_try_reconnect(void) { return reconnect_result; }
 static void vTaskDelay(TickType_t delay) { ++delays; tick+=delay; }
 void bt_hid_host_disconnect(void);
 '''
+harness += SOURCE[SOURCE.index('static struct {\n    bool desired, dirty, attempted;'):SOURCE.index('/* ---------- feature report cache')]
 for signature in (
     "static bool selection_accepts(",
     "static void handshake_maybe_begin(",
@@ -153,10 +172,12 @@ for signature in (
     "static int l2cap_intr_server_accept(",
     "static void l2cap_ctrl_connected(",
     "static void l2cap_intr_connected(",
+    "bool bt_hid_host_poll_security(",
     "bool bt_hid_host_poll_sdp(",
     "int bt_hid_host_connect(",
     "bool bt_hid_host_poll_connect(",
     "void bt_hid_host_disconnect(",
+    "void bt_hid_host_poll_control(",
     "static void conn_disconnected(",
     "static bool hid_channel_released(",
     "bool bt_hid_host_poll_disconnect(",
@@ -180,7 +201,9 @@ assert "bt_hid_host_scan_start" not in idle
 harness += r'''
 static void setup(void) {
     memset(&hid_ctx,0,sizeof(hid_ctx));
+    memset(&scan_mode,0,sizeof(scan_mode)); scan_mode_error=scan_mode_calls=0; during_scan=NULL;
     current.refs=2; other.refs=1; hid_ctx.conn=&current;
+    security_error=security_calls=auth_error=0; auth_buffer_available=false;
     hid_ctx.state=BT_HID_STATE_CONNECTING;
     pages=channel_count=disconnects=scan_calls=delays=0;
     fifo_resets=cache_resets=dse_resets=0; disconnect_error=0;
@@ -202,6 +225,7 @@ static void discover_new_peer(bool early) {
     assert(hid_ctx.connect_pending && hid_ctx.pending_addr.val[0]==2);
     assert(!hid_ctx.connect_retry_count && !hid_ctx.connect_pending_tick);
 }
+static void reverse_scan_request(void) { request_scan_mode(false); }
 int main(void) {
     assert(l2cap_hid_ctrl_server.sec_level==BT_SECURITY_L2 &&
            l2cap_hid_intr_server.sec_level==BT_SECURITY_L2);
@@ -292,12 +316,14 @@ int main(void) {
     /* Local HID create failure follows the normal disconnect event path. */
     setup(); hid_ctx.outgoing=true; channel_error=-ENOBUFS;
     security_changed(&current,BT_SECURITY_L2,0);
-    assert(bt_hid_host_poll_sdp() && channel_count==1 && disconnects==1);
+    assert(bt_hid_host_poll_sdp() && channel_count==1);
+    bt_hid_host_poll_control(); assert(disconnects==1);
     assert(hid_ctx.state==BT_HID_STATE_DISCONNECTING && !hid_ctx.ctrl_accepting);
     assert(hid_ctx.conn==&current && !handshakes && !fifo_resets);
     setup(); hid_ctx.outgoing=true; hid_ctx.security_done=true; channel_error=-ENOBUFS;
     hid_ctx.ctrl_chan.chan.conn=&current;
     l2cap_ctrl_connected(&hid_ctx.ctrl_chan.chan);
+    bt_hid_host_poll_control();
     assert(disconnects==1 && !hid_ctx.intr_accepting && !handshakes);
 
     /* Preserve a peer-opened Interrupt when the outgoing Control is deferred. */
@@ -373,6 +399,7 @@ int main(void) {
     chan->conn=&current; l2cap_ctrl_connected(chan);
     assert(hid_ctx.ctrl_connected && !channel_count && !hid_ctx.outgoing);
     tick+=4000; assert(!bt_hid_host_poll_sdp() && !bt_hid_host_poll_connect());
+    bt_hid_host_poll_control();
     assert(!pages && !channel_count && !disconnects);
     assert(l2cap_intr_server_accept(&current,&chan)==0);
     assert(chan==&hid_ctx.intr_chan.chan && hid_ctx.intr_accepting);
@@ -391,7 +418,9 @@ int main(void) {
     setup(); hid_ctx.ctrl_connected=hid_ctx.intr_connected=true;
     hid_ctx.ctrl_chan.chan.conn=hid_ctx.intr_chan.chan.conn=&current;
     bt_hid_host_disconnect(); bt_hid_host_disconnect();
+    bt_hid_host_poll_control();
     assert(disconnects==1 && current.refs==2 && hid_ctx.conn==&current);
+    bt_hid_host_poll_control();
     assert(!fifo_resets && !cache_resets && !dse_resets && !connectable);
     assert(!bt_hid_host_poll_disconnect());
     conn_disconnected(&current,0x13);
@@ -416,7 +445,9 @@ int main(void) {
     hid_ctx.intr_chan.chan.rtx_work.timer.timer.hdl=NULL;
     assert(bt_hid_host_poll_disconnect());
     assert(!hid_ctx.conn && hid_ctx.state==BT_HID_STATE_IDLE && current.refs==1);
+    bt_hid_host_poll_control();
     assert(fifo_resets==1 && cache_resets==1 && dse_resets==1 && disconnects==1);
+    bt_hid_host_poll_control();
     assert(connectable && discoverable && !hid_ctx.connect_pending);
     conn_disconnected(&current,0x13); assert(!bt_hid_host_poll_disconnect());
     assert(current.refs==1 && fifo_resets==1 && !bt_hid_host_poll_connect() && !pages);
@@ -425,11 +456,14 @@ int main(void) {
     setup(); hid_ctx.ctrl_connected=hid_ctx.intr_connected=true;
     hid_ctx.ctrl_chan.chan.conn=hid_ctx.intr_chan.chan.conn=&current;
     l2cap_intr_disconnected(&hid_ctx.intr_chan.chan); hid_ctx.intr_chan.chan.conn=NULL;
+    bt_hid_host_poll_control();
     assert(!disconnects && !bt_hid_host_poll_disconnect());
     l2cap_ctrl_disconnected(&hid_ctx.ctrl_chan.chan); hid_ctx.ctrl_chan.chan.conn=NULL;
+    bt_hid_host_poll_control();
     assert(disconnects==1 && hid_ctx.conn==&current && !fifo_resets);
     assert(!bt_hid_host_poll_disconnect());
     conn_disconnected(&current,0x08); assert(bt_hid_host_poll_disconnect());
+    bt_hid_host_poll_control();
     assert(fifo_resets==1 && connectable && discoverable && current.refs==1);
 
     /* A late event from a rejected/older ACL cannot tear down the owner. */
@@ -437,13 +471,16 @@ int main(void) {
     struct bt_l2cap_chan old_channel={.conn=&other};
     l2cap_ctrl_disconnected(&old_channel); l2cap_intr_disconnected(&old_channel);
     assert(hid_ctx.conn==&current && !hid_ctx.acl_disconnected && !fifo_resets);
+    bt_hid_host_poll_control();
     assert(!bt_hid_host_poll_disconnect() && !disconnects && current.refs==2);
 
     /* Failed HCI submission keeps ownership and permits a later retry. */
     setup(); disconnect_error=-ENOBUFS; bt_hid_host_disconnect();
+    assert(!disconnects); bt_hid_host_poll_control(); assert(disconnects==1);
     assert(hid_ctx.conn==&current && current.refs==2 && !fifo_resets);
-    assert(hid_ctx.state==BT_HID_STATE_CONNECTING);
-    disconnect_error=0; bt_hid_host_disconnect();
+    assert(hid_ctx.state==BT_HID_STATE_DISCONNECTING && hid_ctx.disconnect_requested);
+    disconnect_error=0; tick+=100; bt_hid_host_disconnect();
+    bt_hid_host_poll_control();
     assert(disconnects==2 && hid_ctx.state==BT_HID_STATE_DISCONNECTING);
     conn_disconnected(&current,0x13); assert(bt_hid_host_poll_disconnect());
 
@@ -471,6 +508,7 @@ int main(void) {
     current.addr.val[0]=1; other.addr.val[0]=2;
     hid_ctx.selection_only=true; hid_ctx.selection_addr=other.addr;
     conn_connected(&current,0);
+    bt_hid_host_poll_control();
     assert(!hid_ctx.conn && disconnects==1 && hid_ctx.selection_only);
     struct bt_l2cap_chan *selected_channel=NULL;
     assert(l2cap_ctrl_server_accept(&current,&selected_channel)==-EACCES);
@@ -481,6 +519,38 @@ int main(void) {
     hid_ctx.selection_only=true; hid_ctx.selection_addr=other.addr;
     assert(bt_hid_host_scan_start(0)==0 && !hid_ctx.selection_only);
     conn_connected(&current,0); assert(hid_ctx.conn==&current);
+    /* Failed page-scan restore is retried without active inquiry/paging. */
+    setup(); scan_mode_error=-ENOBUFS;
+    conn_disconnected(&current,0x13); assert(bt_hid_host_poll_disconnect());
+    bt_hid_host_poll_control(); assert(!connectable && !discoverable && scan_mode.dirty);
+    unsigned attempts=scan_mode_calls;
+    bt_hid_host_poll_control(); assert(scan_mode_calls==attempts);
+    scan_mode_error=0; tick+=100; bt_hid_host_poll_control();
+    assert(connectable && discoverable && !scan_mode.dirty && !pages && !scan_calls);
+    /* Paging must wait for both scan bits to be disabled successfully. */
+    setup(); hid_ctx.conn=NULL; scan_mode_error=-ENOBUFS;
+    assert(bt_hid_host_connect(addr)==-EAGAIN && !pages);
+    scan_mode_error=0; tick+=100;
+    assert(bt_hid_host_connect(addr)==0 && pages==1);
+    /* A callback that changes desired mode during HCI cannot be lost. */
+    setup(); request_scan_mode(true); during_scan=reverse_scan_request;
+    assert(!poll_scan_mode() && scan_mode.dirty && !scan_mode.desired);
+    assert(poll_scan_mode() && !connectable && !discoverable);
+    /* Security submission failures are paced; accepted operations aren't replayed. */
+    setup(); hid_ctx.security_pending=true; security_error=-ENOMEM;
+    assert(bt_hid_host_poll_security() && security_calls==1 && hid_ctx.security_pending);
+    assert(!bt_hid_host_poll_security() && security_calls==1);
+    tick+=100; auth_buffer_available=true; auth_error=-ENOBUFS;
+    assert(bt_hid_host_poll_security() && hid_ctx.security_pending);
+    tick+=100; auth_error=0;
+    assert(bt_hid_host_poll_security() && !hid_ctx.security_pending);
+    assert(!bt_hid_host_poll_security() && current.refs==2);
+    setup(); hid_ctx.security_pending=true; security_error=-EBUSY;
+    assert(bt_hid_host_poll_security() && !hid_ctx.security_pending);
+    setup(); hid_ctx.security_pending=true; security_error=-ENOMEM;
+    for(unsigned i=0;i<5;i++) { assert(bt_hid_host_poll_security()); tick+=100; }
+    assert(bt_hid_host_poll_security() && hid_ctx.disconnect_requested && !disconnects);
+    bt_hid_host_poll_control(); assert(disconnects==1 && current.refs==2);
     puts("PASS: startup inquiry, Peripheral filtering, cancel barriers/races, isolated retries, ordered encrypted HID, passive reconnect and teardown");
 }
 '''

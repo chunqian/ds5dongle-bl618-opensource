@@ -48,6 +48,13 @@ struct output_message { uint32_t session; uint8_t data[USB_OUTPUT_BUF_SZ]; };
 
 static QueueHandle_t input_queue;
 static QueueHandle_t output_queue;
+/* Critical workers and queues never depend on runtime heap availability. */
+static StaticTask_t bt_tcb, usb_tcb, led_tcb;
+static StackType_t bt_stack[BT_TASK_STACK_SIZE], usb_stack[USB_TASK_STACK_SIZE],
+                   led_stack[LED_TASK_STACK_SIZE];
+static StaticQueue_t input_queue_cb, output_queue_cb;
+static uint8_t input_queue_storage[INPUT_QUEUE_ITEM_SZ];
+static uint8_t output_queue_storage[5 * sizeof(struct output_message)];
 static volatile bool ds5_connected = false;
 static volatile bool bt_disconnect_pending_usb = false;
 static volatile bool battery_low = false;
@@ -544,6 +551,7 @@ static void bt_task(void *arg)
         }
 
         bt_hid_host_poll_disconnect();
+        bt_hid_host_poll_control();
 
         if (bt_hid_host_poll_scan_early()) {
             continue;
@@ -1059,34 +1067,53 @@ int main(void)
     bool audio_ok = (audio_init() == 0);
     LOG_INF("[B] audio: %s\n", audio_ok ? "OK" : "FAIL");
 
-    input_queue = xQueueCreate(1, INPUT_QUEUE_ITEM_SZ);
+    input_queue = xQueueCreateStatic(1, INPUT_QUEUE_ITEM_SZ, input_queue_storage, &input_queue_cb);
     /* Depth-1: USB ISR always delivers the latest report to usb_task.
      * The 10-deep app_tx_fifo in bt_hid_host.c provides the actual buffering
      * and CAN_SEND_NOW flow control (one BT packet in-flight at a time). */
-    output_queue = xQueueCreate(5, sizeof(struct output_message));
+    output_queue = xQueueCreateStatic(5, sizeof(struct output_message), output_queue_storage, &output_queue_cb);
     if (!input_queue || !output_queue) {
         LOG_ERR("[B] queue alloc FAIL\n");
-        while (1) {}
+        vAssertCalled();
     }
 
-    if (xTaskCreate(bt_task, "bt", BT_TASK_STACK_SIZE,
-                    NULL, BT_TASK_PRIORITY, NULL) != pdPASS) {
-        bt_init_failed = bt_init_done = true;
-        LOG_ERR("[B] BT task allocation failed; USB configuration remains available\n");
-    }
-    xTaskCreate(usb_task,  "usb",   USB_TASK_STACK_SIZE,
-                NULL, USB_TASK_PRIORITY, NULL);
+    if (!xTaskCreateStatic(bt_task, "bt", BT_TASK_STACK_SIZE, NULL,
+                           BT_TASK_PRIORITY, bt_stack, &bt_tcb) ||
+        !xTaskCreateStatic(usb_task, "usb", USB_TASK_STACK_SIZE, NULL,
+                           USB_TASK_PRIORITY, usb_stack, &usb_tcb) ||
+        !xTaskCreateStatic(led_task, "led", LED_TASK_STACK_SIZE, NULL,
+                           LED_TASK_PRIORITY, led_stack, &led_tcb))
+        vAssertCalled();
     if (audio_ok) audio_start_tasks();
-    xTaskCreate(led_task,  "led",   LED_TASK_STACK_SIZE,
-                NULL, LED_TASK_PRIORITY, NULL);
     LOG_INF("[B] init done, starting scheduler\n");
     vTaskStartScheduler();
 
-    while (1) {}
+    vAssertCalled(); /* Scheduler returning means startup failed. */
     return 0;
 }
 
 void vApplicationIdleHook(void)
 {
     __asm volatile("wfi");
+}
+
+/* The SDK defaults abort here, leaving the dongle stuck. Never return into
+ * callers that may dereference a failed allocation. These hooks also work
+ * before the scheduler starts and with interrupts masked. */
+__attribute__((noreturn)) void vAssertCalled(void)
+{
+    GLB_SW_System_Reset();
+    for (;;) {} /* Reset is not expected to return. */
+}
+
+void vApplicationMallocFailedHook(void)
+{
+    vAssertCalled();
+}
+
+void vApplicationStackOverflowHook(TaskHandle_t task, char *name)
+{
+    (void)task;
+    (void)name;
+    vAssertCalled();
 }

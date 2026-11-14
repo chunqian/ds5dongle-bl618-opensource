@@ -180,5 +180,5 @@ EfErrCode ef_del_env(const char*);
 
 startup = main[main.index('int main(void)'):]
 assert startup.index('factory_reset_apply_pending()') < startup.index('config_load()')
-assert startup.index('factory_reset_apply_pending()') < startup.index('xTaskCreate(')
+assert startup.index('factory_reset_apply_pending()') < startup.index('xTaskCreateStatic(')
 print('PASS: pending reset completes before settings are loaded and tasks are created')

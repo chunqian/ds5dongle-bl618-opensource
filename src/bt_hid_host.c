@@ -27,6 +27,55 @@
 #define BT_MAX_DISCOVERED      8
 #define L2CAP_BR_MTU           672
 
+/* Scan commands are task-owned. RX callbacks only change the desired mode.
+ * A newer request during a synchronous HCI call must not be acknowledged by
+ * the older call. EALREADY means the SDK has already applied that bit. */
+static struct {
+    bool desired, dirty, attempted;
+    uint32_t version;
+    TickType_t last;
+} scan_mode;
+
+static void request_scan_mode(bool enabled)
+{
+    taskENTER_CRITICAL();
+    if (scan_mode.desired != enabled || !scan_mode.version) {
+        scan_mode.desired = enabled;
+        scan_mode.dirty = true;
+        scan_mode.attempted = false;
+        ++scan_mode.version;
+    }
+    taskEXIT_CRITICAL();
+}
+
+static bool poll_scan_mode(void)
+{
+    TickType_t now = xTaskGetTickCount();
+    taskENTER_CRITICAL();
+    bool desired = scan_mode.desired;
+    uint32_t version = scan_mode.version;
+    bool due = scan_mode.dirty && (!scan_mode.attempted ||
+        (TickType_t)(now - scan_mode.last) >= pdMS_TO_TICKS(100));
+    if (due) { scan_mode.attempted = true; scan_mode.last = now; }
+    taskEXIT_CRITICAL();
+    if (!due) {
+        taskENTER_CRITICAL();
+        bool done = !scan_mode.dirty;
+        taskEXIT_CRITICAL();
+        return done;
+    }
+    int err = bt_br_set_connectable(desired);
+    if (!err || err == -EALREADY) err = bt_br_set_discoverable(desired);
+    taskENTER_CRITICAL();
+    if (scan_mode.version == version && (!err || err == -EALREADY))
+        scan_mode.dirty = false;
+    bool done = !scan_mode.dirty;
+    taskEXIT_CRITICAL();
+    if (err && err != -EALREADY)
+        LOG_WRN("[BT] Scan mode %u failed (%d); retry pending\n", desired, err);
+    return done;
+}
+
 /* ---------- feature report cache ---------- */
 
 #define FEATURE_CACHE_SLOTS  24
@@ -348,11 +397,16 @@ static struct {
     /* Security establishment deferred to task context */
     volatile bool security_pending;
     volatile bool security_done;
+    uint8_t security_attempts;
+    TickType_t security_retry_tick;
+    volatile bool disconnect_requested;
+    bool disconnect_attempted;
+    TickType_t disconnect_retry_tick;
     volatile TickType_t acl_connect_tick;
     volatile TickType_t security_done_tick;
 
     struct {
-        TickType_t last_attempt, probe_tick;
+        TickType_t last_attempt, probe_tick, started;
         bool attempted;
         volatile bool primer_done, detection_ready;
         volatile uint8_t sent;
@@ -618,6 +672,7 @@ static const uint8_t handshake_ids[] = {
 static void handshake_begin(void)
 {
     memset(&hid_ctx.handshake, 0, sizeof(hid_ctx.handshake));
+    hid_ctx.handshake.started = xTaskGetTickCount();
     hid_ctx.check_dse = false; /* Enable immediately before GET 0x70, as DS5Dongle does. */
     set_state(BT_HID_STATE_HANDSHAKE);
 }
@@ -668,6 +723,11 @@ static void handshake_send_pending(void)
         !hid_ctx.ctrl_connected || !hid_ctx.intr_connected)
         return;
     TickType_t now = xTaskGetTickCount();
+    if ((TickType_t)(now - hid_ctx.handshake.started) >= pdMS_TO_TICKS(8000)) {
+        LOG_WRN("[HID] Initialization incomplete after 8s; returning to passive wait\n");
+        bt_hid_host_disconnect();
+        return;
+    }
     if (hid_ctx.handshake.attempted &&
         (TickType_t)(now - hid_ctx.handshake.last_attempt) < HANDSHAKE_RETRY_TICKS)
         return;
@@ -887,8 +947,7 @@ static void l2cap_intr_connected(struct bt_l2cap_chan *chan)
 
     /* Stop accepting further connections while connected (matches
      * DS5Dongle's gap_connectable_control(false) on HID open). */
-    bt_br_set_connectable(false);
-    bt_br_set_discoverable(false);
+    request_scan_mode(false);
 
     /* The BT task sends the initial GET batch followed by the 0x32 primer. */
     handshake_maybe_begin();
@@ -1155,9 +1214,8 @@ static void conn_connected(struct bt_conn *conn, uint8_t err)
             return;
         hid_ctx.conn = NULL;
         hid_ctx.outgoing = false;
-        bt_br_set_connectable(true);
-        bt_br_set_discoverable(true);
-        LOG_INF("[BT] Re-enabled page scan after failed connection\n");
+        request_scan_mode(true);
+        LOG_INF("[BT] Page scan restore requested after failed connection\n");
         set_state(BT_HID_STATE_IDLE);
         return;
     }
@@ -1211,6 +1269,9 @@ static void conn_connected(struct bt_conn *conn, uint8_t err)
     /* Start authentication from the BT task, not an RX callback. The SDK
      * initializes new connections and owns required_sec_level while pairing. */
     hid_ctx.security_pending = true;
+    hid_ctx.security_attempts = 0;
+    hid_ctx.disconnect_requested = false;
+    hid_ctx.disconnect_attempted = false;
     hid_ctx.security_done = false;
     hid_ctx.acl_connect_tick = xTaskGetTickCount();
 
@@ -1294,14 +1355,15 @@ bool bt_hid_host_poll_disconnect(void)
         clear_bond_storage();
 
     hid_ctx.conn = NULL;
+    hid_ctx.disconnect_requested = false;
+    hid_ctx.disconnect_attempted = false;
     hid_ctx.acl_disconnected = false;
     bt_conn_unref(conn);
     /* IDLE notifies the application to reset audio/input and send neutral
      * state. Preserve switch_pending until that notification is complete. */
     set_state(BT_HID_STATE_IDLE);
     switch_pending = false;
-    bt_br_set_connectable(true);
-    bt_br_set_discoverable(true);
+    request_scan_mode(true);
     LOG_INF("[BT] Disconnect cleanup complete; waiting for controller\n");
     return true;
 }
@@ -1595,11 +1657,13 @@ int bt_hid_host_init(const struct bt_hid_host_config *config)
     net_buf_init(&hid_rx_pool, 4, BT_L2CAP_BUF_SIZE(L2CAP_BR_MTU), NULL);
 
     bt_conn_cb_register(&conn_callbacks);
-    bt_conn_auth_cb_register(&auth_callbacks);
+    int err = bt_conn_auth_cb_register(&auth_callbacks);
+    if (err) return err;
 
     bt_ready_sem = xSemaphoreCreateBinaryStatic(&bt_ready_sem_buf);
+    if (!bt_ready_sem) return -ENOMEM;
 
-    int err = bt_enable(bt_ready_cb);
+    err = bt_enable(bt_ready_cb);
     if (err) {
         LOG_ERR("[BT] bt_enable failed: %d\n", err);
         return err;
@@ -1637,7 +1701,9 @@ int bt_hid_host_init(const struct bt_hid_host_config *config)
             bd.val[4] = chipid[4];
             bd.val[5] = chipid[5] | 0xC0;
             int r1 = bt_set_bd_addr(&bd);
+            if (r1) return r1;
             int r2 = bt_set_local_public_address(bd.val);
+            if (r2) return r2;
             LOG_INF("[BT] Set BD_ADDR from chipid: %02X:%02X:%02X:%02X:%02X:%02X "
                    "(hci=%d host=%d)\n",
                    bd.val[5], bd.val[4], bd.val[3],
@@ -1656,16 +1722,13 @@ int bt_hid_host_init(const struct bt_hid_host_config *config)
     /* Register L2CAP servers so the controller can initiate reconnection
      * (matching DS5Dongle's l2cap_register_service for both PSMs). */
     err = bt_l2cap_br_server_register(&l2cap_hid_ctrl_server);
-    if (err)
-        LOG_ERR("[BT] Warning: register control server failed: %d\n", err);
+    if (err) return err;
 
     err = bt_l2cap_br_server_register(&l2cap_hid_intr_server);
-    if (err)
-        LOG_ERR("[BT] Warning: register interrupt server failed: %d\n", err);
+    if (err) return err;
 
     err = bt_sdp_register_service(&hid_host_rec);
-    if (err)
-        LOG_ERR("[BT] Warning: register SDP HID record failed: %d\n", err);
+    if (err) return err;
     else
         LOG_INF("[BT] SDP HID service record registered\n");
 
@@ -1676,28 +1739,20 @@ int bt_hid_host_init(const struct bt_hid_host_config *config)
     {
         struct net_buf *ps_buf = bt_hci_cmd_create(
             BT_OP(BT_OGF_BASEBAND, 0x001c), 4);
-        if (ps_buf) {
+        if (!ps_buf) return -ENOBUFS;
+        {
             net_buf_add_le16(ps_buf, 0x0012);  /* interval: 11.25ms */
             net_buf_add_le16(ps_buf, 0x0012);  /* window:   11.25ms */
             int ps_err = bt_hci_cmd_send_sync(
                 BT_OP(BT_OGF_BASEBAND, 0x001c), ps_buf, NULL);
             LOG_INF("[BT] Write Page Scan Activity: interval=0x0012 "
                    "window=0x0012 err=%d\n", ps_err);
+            if (ps_err) return ps_err;
         }
     }
 
-    /* Make device discoverable so the controller can find us if needed */
-    err = bt_br_set_connectable(true);
-    LOG_INF("[BT] set_connectable: %d\n", err);
-
-    err = bt_br_set_discoverable(true);
-    LOG_INF("[BT] set_discoverable: %d\n", err);
-
-    /* Diagnostic: check if BR/EDR write_scan_enable succeeded.
-     * If both return 0, the controller accepted BR/EDR commands,
-     * confirming that BR/EDR HCI path is functional. */
-    LOG_INF("[BT] BR/EDR init complete — phone should see \"%s\"\n",
-           CONFIG_BT_DEVICE_NAME);
+    request_scan_mode(true);
+    poll_scan_mode(); /* Temporary HCI submission failures remain pending. */
 
     return 0;
 }
@@ -1839,6 +1894,11 @@ bool bt_hid_host_poll_connect(void)
         if (hid_ctx.connect_retry_count >= 3) {
             LOG_WRN("[BT] Discovery: gave up after %d attempts\n",
                     hid_ctx.connect_retry_count);
+            if (!hid_ctx.conn) {
+                hid_ctx.outgoing = false;
+                request_scan_mode(true);
+                set_state(BT_HID_STATE_IDLE);
+            }
             hid_ctx.connect_retry_count = 0;
             hid_ctx.connect_pending = false;
             hid_ctx.connect_pending_tick = 0;
@@ -1860,37 +1920,33 @@ bool bt_hid_host_poll_security(void)
     if (!hid_ctx.security_pending || !hid_ctx.conn ||
         hid_ctx.state == BT_HID_STATE_DISCONNECTING)
         return false;
-
-    hid_ctx.security_pending = false;
-
-    struct bt_conn *conn = hid_ctx.conn;
-
-    LOG_DBG("[BT] poll_security: conn=%p handle=0x%04x state=%s "
-           "sec_level=%d required_sec=%d encrypt=%d outgoing=%d\n",
-           conn, conn->handle, state_name(hid_ctx.state),
-           conn->sec_level, conn->required_sec_level, conn->encrypt,
-           hid_ctx.outgoing);
-
+    if (hid_ctx.security_done) { hid_ctx.security_pending = false; return false; }
+    TickType_t now = xTaskGetTickCount();
+    if (hid_ctx.security_attempts &&
+        (TickType_t)(now - hid_ctx.security_retry_tick) < pdMS_TO_TICKS(100))
+        return false;
+    if (hid_ctx.security_attempts >= 5) {
+        LOG_WRN("[BT] Authentication submission exhausted; disconnecting\n");
+        bt_hid_host_disconnect();
+        return true;
+    }
+    hid_ctx.security_retry_tick = now;
+    ++hid_ctx.security_attempts;
+    struct bt_conn *conn = bt_conn_ref(hid_ctx.conn);
     int err = bt_conn_set_security(conn, BT_SECURITY_L2);
-    LOG_DBG("[BT] poll_security: bt_conn_set_security(L2) = %d "
-           "(now sec=%d req=%d)\n",
-           err, conn->sec_level, conn->required_sec_level);
-
-    if (err == -EBUSY) {
-        LOG_DBG("[BT] poll_security: pairing already in progress, waiting\n");
-    } else if (err && err != -EALREADY) {
-        LOG_DBG("[BT] poll_security: set_security failed (%d), "
-               "trying HCI Auth_Requested directly\n", err);
-        struct net_buf *buf = bt_hci_cmd_create(
-            BT_HCI_OP_AUTH_REQUESTED, 2);
+    /* EBUSY is an accepted in-progress authentication, not a failed send. */
+    if (err && err != -EBUSY && err != -EALREADY) {
+        struct net_buf *buf = bt_hci_cmd_create(BT_HCI_OP_AUTH_REQUESTED, 2);
         if (buf) {
             net_buf_add_le16(buf, conn->handle);
-            int hci_err = bt_hci_cmd_send_sync(
-                BT_HCI_OP_AUTH_REQUESTED, buf, NULL);
-            LOG_DBG("[BT] poll_security: HCI Auth_Requested = %d\n", hci_err);
-        }
+            err = bt_hci_cmd_send_sync(BT_HCI_OP_AUTH_REQUESTED, buf, NULL);
+        } else err = -ENOBUFS;
     }
-
+    if (hid_ctx.conn == conn && (!err || err == -EBUSY || err == -EALREADY))
+        hid_ctx.security_pending = false;
+    if (err && err != -EBUSY && err != -EALREADY)
+        LOG_WRN("[BT] Authentication submission failed (%d); retry pending\n", err);
+    bt_conn_unref(conn);
     return true;
 }
 
@@ -1975,6 +2031,10 @@ int bt_hid_host_connect(const uint8_t *addr)
         return -EBUSY; /* Do not turn an incoming reconnect into an outgoing one. */
     }
 
+    request_scan_mode(false);
+    if (!poll_scan_mode()) return -EAGAIN;
+    if (hid_ctx.conn || hid_ctx.discovery_active) return -EBUSY;
+
     hid_ctx.outgoing = true;
     set_state(BT_HID_STATE_CONNECTING);
     LOG_DBG("[BT] connect [3] state=CONNECTING, outgoing=true\n");
@@ -1984,16 +2044,14 @@ int bt_hid_host_connect(const uint8_t *addr)
 
     LOG_DBG("[BT] connect [4] bt_conn_create_br...\n");
     /* Disable page scan before paging — BL616 HCI controller can't do both */
-    bt_br_set_connectable(false);
-    bt_br_set_discoverable(false);
+    request_scan_mode(false);
     struct bt_conn *conn = bt_conn_create_br(&bt_addr,
                                               BT_BR_CONN_PARAM_DEFAULT);
     LOG_DBG("[BT] connect [5] returned %p\n", conn);
     if (!conn) {
         LOG_WRN("[BT] bt_conn_create_br failed — re-enabling page scan\n");
         hid_ctx.outgoing = false;
-        bt_br_set_connectable(true);
-        bt_br_set_discoverable(true);
+        request_scan_mode(true);
         set_state(BT_HID_STATE_IDLE);
         return -1;
     }
@@ -2008,26 +2066,37 @@ int bt_hid_host_connect(const uint8_t *addr)
 void bt_hid_host_disconnect(void)
 {
     taskENTER_CRITICAL();
-    if (!hid_ctx.conn || hid_ctx.state == BT_HID_STATE_DISCONNECTING) {
+    if (hid_ctx.conn && !hid_ctx.acl_disconnected &&
+        hid_ctx.state != BT_HID_STATE_DISCONNECTING && !hid_ctx.disconnect_requested) {
+        hid_ctx.disconnect_requested = true;
+        hid_ctx.disconnect_attempted = false;
+        hid_ctx.state = BT_HID_STATE_DISCONNECTING;
+    }
+    taskEXIT_CRITICAL();
+}
+
+/* Only the BT task submits disconnects. Ownership is kept until the real ACL
+ * event and SDK channel teardown; a failed send never fabricates completion. */
+void bt_hid_host_poll_control(void)
+{
+    poll_scan_mode();
+    TickType_t now = xTaskGetTickCount();
+    taskENTER_CRITICAL();
+    if (!hid_ctx.conn || hid_ctx.acl_disconnected || !hid_ctx.disconnect_requested ||
+        (hid_ctx.disconnect_attempted &&
+         (TickType_t)(now - hid_ctx.disconnect_retry_tick) < pdMS_TO_TICKS(100))) {
         taskEXIT_CRITICAL();
         return;
     }
     struct bt_conn *conn = bt_conn_ref(hid_ctx.conn);
-    enum bt_hid_host_state previous = hid_ctx.state;
-    hid_ctx.state = BT_HID_STATE_DISCONNECTING;
+    hid_ctx.disconnect_attempted = true;
+    hid_ctx.disconnect_retry_tick = now;
     taskEXIT_CRITICAL();
-
-    /* Request only. Cleanup and releasing our owner reference require the
-     * actual disconnect event, exactly as DS5Dongle's bt_disconnect(). */
     int err = bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-    if (err && err != -ENOTCONN) {
-        LOG_WRN("[BT] Disconnect request failed (%d), retaining connection\n", err);
-        taskENTER_CRITICAL();
-        if (hid_ctx.conn == conn && !hid_ctx.acl_disconnected &&
-            hid_ctx.state == BT_HID_STATE_DISCONNECTING)
-            hid_ctx.state = previous; /* Allow a later request to retry. */
-        taskEXIT_CRITICAL();
-    }
+    taskENTER_CRITICAL();
+    if (hid_ctx.conn == conn && !err) hid_ctx.disconnect_requested = false;
+    taskEXIT_CRITICAL();
+    if (err) LOG_WRN("[BT] Disconnect submission failed (%d); retry pending\n", err);
     bt_conn_unref(conn);
 }
 
@@ -2275,8 +2344,7 @@ int bt_hid_host_try_reconnect(void)
     bt_addr_copy(&hid_ctx.target_addr, addr);
     hid_ctx.has_target = true;
 
-    bt_br_set_connectable(true);
-    bt_br_set_discoverable(true);
+    request_scan_mode(true);
 
     /* DS5Dongle approach: don't actively page the controller.
      * Stay connectable and let the controller reconnect to us.
@@ -2341,8 +2409,7 @@ int bt_hid_host_switch_next(void)
         dse_reset();
         cached_rssi = 1;
 
-        bt_br_set_connectable(true);
-        bt_br_set_discoverable(true);
+        request_scan_mode(true);
 
         LOG_INF("[BT] Switched to controller [%d/%d] %s — waiting for reconnect\n",
                active_idx, bonded_count, addr_str);
@@ -2398,8 +2465,7 @@ void bt_hid_host_clear_bonds(void)
     }
     clear_bond_storage();
     set_state(BT_HID_STATE_IDLE);
-    bt_br_set_connectable(true);
-    bt_br_set_discoverable(true);
+    request_scan_mode(true);
 }
 
 bool bt_hid_host_copy_feature(uint8_t report_id, uint8_t *data,
