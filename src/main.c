@@ -66,7 +66,6 @@ static volatile uint64_t conn_led_start_us = 0;
 static volatile bool conn_led_off = false;
 static volatile uint64_t handshake_start_us;
 static volatile TickType_t connecting_start_tick = 0;
-static volatile bool dse_mode_changed = false;
 static volatile bool prev_led_disabled = false;
 static volatile bool scan_after_disconnect = false;
 static uint8_t output_seq = 0;  /* sequence counter for 0x31 BT output */
@@ -267,10 +266,11 @@ static void on_hid_state(enum bt_hid_host_state state)
             bool need_dse = is_dse;
             if (need_dse != (bool)config_dse_detected()) {
                 config_get()->dse_detected = need_dse ? 1 : 0;
-                dse_mode_changed = true;
+                usb_gamepad_request_config_save();
             }
         }
 
+        usb_gamepad_set_dse_mode(mode == 1 || (mode == 2 && is_dse));
         handshake_start_us = 0;
 
         /* DS5Dongle reattaches only while the host is awake. Keeping the
@@ -563,14 +563,6 @@ static void bt_task(void *arg)
 
         bt_hid_host_poll_security_ready();
         bt_hid_host_poll_tx();
-
-        if (dse_mode_changed) {
-            dse_mode_changed = false;
-            config_save();
-            LOG_WRN("[MAIN] Controller type changed, resetting...\n");
-            vTaskDelay(pdMS_TO_TICKS(100));
-            GLB_SW_System_Reset();
-        }
 
         /* React to disable_led config toggle in real-time */
         bool cur_led_disabled = config_led_disabled();

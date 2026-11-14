@@ -11,7 +11,7 @@ import tempfile
 root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parents[1]
 source = (root / "src/usb_gamepad.c").read_text()
 start = source.index("void usb_gamepad_process_deferred(void)")
-end = source.index("    if (usb_reset_pending)", start)
+end = source.index("    if (usb_config_save_pending)", start)
 task = source[start:end] + "}\n"
 
 
@@ -45,6 +45,11 @@ harness = r"""
 static struct usb_audio_control audio_control;
 static bool usb_configured, ep_in_busy, kbd_ep_busy, pending_valid, pending_active;
 static bool first_usb_send_logged, usb_bt_hidden, usb_reenumerating;
+static bool usb_profile_pending, usb_reset_pending, host_asleep, profile_restored;
+static uint64_t usb_profile_request_us;
+static bool usb_profile_matches_config(void) { return !usb_profile_pending || profile_restored; }
+static bool usb_wake_host_suspended(void) { return host_asleep; }
+static void request_usb_profile(void) { usb_profile_pending=true; }
 static uint32_t usb_regs[0x118/4];
 #define USB_BASE ((uintptr_t)usb_regs)
 #define detached (usb_regs[0x114/4] & 1u)
@@ -85,6 +90,7 @@ static void apply_audio_profile(void) {
     }
 }
 """
+harness += "static void apply_usb_profile(void) { apply_audio_profile(); }\n"
 harness += extract("void usb_soft_disconnect(") + "\n"
 harness += extract("void usb_soft_connect(").replace("void usb_soft_connect", "static void actual_usb_soft_connect") + "\n"
 harness += "static void usb_soft_connect(void) { bool was_detached=detached; actual_usb_soft_connect(); if(was_detached && !detached) ++connects; }\n"
@@ -114,6 +120,7 @@ static void setup(void) {
     ep_in_busy = kbd_ep_busy = pending_valid = pending_active = first_usb_send_logged = false;
     memset(usb_regs,0,sizeof(usb_regs));
     usb_bt_hidden=usb_reenumerating=false; suspends=0;
+    usb_profile_pending=usb_reset_pending=host_asleep=profile_restored=false; usb_profile_request_us=0;
     profile = profile_changes = connects = inject = 0;
     critical_depth = unprotected_time_samples = 0;
     inject_command_on_enter = false;
@@ -139,6 +146,12 @@ static void enable(void) {
     configured();
 }
 int main(void) {
+    /* Cancelled profile changes must release a BT reattach held at the gate. */
+    setup(); usb_gamepad_set_bt_visible(false); usb_profile_pending=true;
+    usb_gamepad_set_bt_visible(true); assert(detached);
+    profile_restored=true; usb_gamepad_process_deferred();
+    assert(!detached && !usb_profile_pending && connects==1);
+
     /* No command: no reconnect and no audio, even if time advances. */
     setup(); now_us = 10000000;
     usb_gamepad_process_deferred();
@@ -201,6 +214,21 @@ int main(void) {
     setup(); request(true); now_us+=100001; inject=4;
     usb_gamepad_process_deferred();
     assert(!detached && connects==1 && audio_control.visible);
+    /* Explicit USB reconnect keeps an existing audio grant and never asks
+     * for a chip reset or an implicit flash write. */
+    setup(); enable();
+    usb_reset_pending=true; usb_profile_request_us=now_us;
+    now_us+=99999; usb_gamepad_process_deferred(); assert(usb_reset_pending);
+    now_us++; usb_gamepad_process_deferred();
+    assert(!usb_reset_pending && audio_control.visible && !detached);
+    bus_reset(); configured(); assert(audio_control.visible);
+    setup(); usb_profile_pending=true; host_asleep=true; now_us=100001;
+    usb_gamepad_process_deferred(); assert(!detached && usb_profile_pending);
+    host_asleep=false; usb_gamepad_process_deferred(); assert(!usb_profile_pending);
+    /* Expiration wins over a coincident profile reconnect. */
+    setup(); request(true); now_us=100001; usb_gamepad_process_deferred();
+    usb_reset_pending=true; now_us=audio_control.grant_until_us;
+    usb_gamepad_process_deferred(); assert(!audio_control.visible);
     puts("PASS: BT visibility, suspend filtering, descriptor detach interval, atomic time/request snapshot, full command grace, reset/unplug recovery, no reconnect loop");
 }
 """

@@ -33,7 +33,7 @@ static uint64_t conn_led_start_us;
 static unsigned usb_fwd_count;
 static uint8_t cached_battery_level, cached_battery_state;
 static bool ds5_connected, battery_low, first_input_logged;
-static bool bt_disconnect_pending_usb, conn_led_off, scan_after_disconnect, dse_mode_changed;
+static bool bt_disconnect_pending_usb, conn_led_off, scan_after_disconnect;
 static bool wake_enabled, suspended, visible;
 static unsigned visibility_calls, wake_connects, wake_disconnects, neutral_reports;
 static struct { uint8_t dse_detected; } config;
@@ -55,6 +55,8 @@ static void audio_reset(void) {}
 static void remap_on_disconnect(void) {}
 static void led_status_set(unsigned value) { (void)value; }
 static void bt_hid_host_scan_start(unsigned value) { (void)value; }
+static void usb_gamepad_set_dse_mode(bool value) { (void)value; }
+static void usb_gamepad_request_config_save(void) {}
 static bool bt_hid_host_is_dse(void) { return true; }
 static uint8_t config_controller_mode(void) { return 2; }
 static uint8_t config_dse_detected(void) { return config.dse_detected; }

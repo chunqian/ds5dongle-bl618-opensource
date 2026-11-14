@@ -49,6 +49,14 @@
 #define KBD_REPORT_DESC_SIZE 138  /* Keyboard + Consumer + Mouse */
 
 static bool current_dse_mode = false;
+static bool requested_dse_mode, usb_initialized;
+static bool usb_profile_pending;
+static uint64_t usb_profile_request_us;
+static uint8_t applied_polling_mode;
+static void apply_polling_rate(uint8_t mode);
+static void apply_usb_profile(void);
+static bool usb_profile_matches_config(void);
+static void request_usb_profile(void);
 
 static volatile bool usb_config_save_pending = false;
 static struct usb_audio_control audio_control;
@@ -498,7 +506,6 @@ static uint8_t config_desc[USB_HID_CONFIG_SIZE] = {
 static const uint8_t *desc_device_cb(uint8_t speed)
 {
     (void)speed;
-    device_desc[16] = config_get()->enable_usb_sn ? 0x03 : 0x00;
     return device_desc;
 }
 
@@ -628,11 +635,16 @@ static struct usbd_endpoint  hid_ep_in;
 static struct usbd_interface kbd_intf;
 static struct usbd_endpoint  kbd_ep_in;
 
+static bool kbd_registered = false;
+
 /* Only called before enumeration, during reset, or while detached. */
 static void apply_audio_profile(void)
 {
     hid_intf.intf_num = audio_control.visible ? USB_INTF_GAMEPAD : 0;
-    kbd_intf.intf_num = audio_control.visible ? USB_INTF_KBD : 1;
+    usbd_hid_init_intf(0, &kbd_intf, kbd_report_desc, sizeof(kbd_report_desc));
+    kbd_intf.intf_num = kbd_registered ? (audio_control.visible ? USB_INTF_KBD : 1) : 0xff;
+    if (!kbd_registered)
+        kbd_intf.class_interface_handler = NULL;
     usb_audio_set_visible(audio_control.visible);
 }
 
@@ -643,7 +655,6 @@ static volatile bool usb_reenumerating = false;
 static volatile bool ep_in_busy = false;
 static volatile bool kbd_ep_busy = false;
 static volatile uint64_t kbd_ep_busy_since_us = 0;
-static bool kbd_registered = false;
 static usb_gamepad_output_cb_t output_callback = NULL;
 
 /* Suspend/resume hooks for wake module */
@@ -798,7 +809,7 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
     }
 }
 
-void usb_gamepad_set_dse_mode(bool dse)
+static void apply_dse_mode(bool dse)
 {
     current_dse_mode = dse;
 
@@ -810,8 +821,66 @@ void usb_gamepad_set_dse_mode(bool dse)
     config_desc[CONFIG_DESC_WDLEN_OFF]     = rdl & 0xFF;
     config_desc[CONFIG_DESC_WDLEN_OFF + 1] = (rdl >> 8) & 0xFF;
 
+    hid_intf.hid_report_descriptor = dse ? hid_report_desc_dse : hid_report_desc_ds;
+    hid_intf.hid_report_descriptor_len = rdl;
     LOG_INF("[USB] DSE mode: %s (PID=0x%04X, rdl=%u)\n",
            dse ? "Edge" : "Standard", pid, rdl);
+}
+
+static bool profile_needs_keyboard(void)
+{
+    const struct config_body *cfg = config_get();
+    return cfg->enable_wake || cfg->ps_shortcut_enabled || remap_has_kbd_targets() ||
+           cfg->tp_mode == 2 || cfg->tp_mode == 3;
+}
+
+static bool usb_profile_matches_config(void)
+{
+    const struct config_body *cfg = config_get();
+    return current_dse_mode == requested_dse_mode &&
+           kbd_registered == profile_needs_keyboard() &&
+           !!(config_desc[7] & 0x20) == !!cfg->enable_wake &&
+           device_desc[16] == (cfg->enable_usb_sn ? 3 : 0) &&
+           applied_polling_mode == cfg->polling_rate_mode;
+}
+
+static void request_usb_profile(void)
+{
+    if (!usb_profile_pending) usb_profile_request_us = bflb_mtimer_get_time_us();
+    usb_profile_pending = true;
+}
+
+/* Apply one coherent descriptor set only before startup or while detached. */
+static void apply_usb_profile(void)
+{
+    const struct config_body *cfg = config_get();
+    apply_dse_mode(requested_dse_mode);
+    kbd_registered = profile_needs_keyboard();
+    uint16_t total = USB_HID_CONFIG_SIZE - (kbd_registered ? 0 : USB_KBD_DESC_SIZE);
+    config_desc[2] = total & 0xff;
+    config_desc[3] = total >> 8;
+    config_desc[4] = kbd_registered ? 5 : 4;
+    config_desc[7] = cfg->enable_wake ? 0xe0 : 0xc0;
+    config_desc[KBD_SUBCLASS_OFF] = 0;
+    config_desc[KBD_PROTOCOL_OFF] = 0;
+    device_desc[16] = cfg->enable_usb_sn ? 3 : 0;
+    apply_polling_rate(cfg->polling_rate_mode);
+    applied_polling_mode = cfg->polling_rate_mode;
+    apply_audio_profile();
+}
+
+void usb_gamepad_set_dse_mode(bool dse)
+{
+    taskENTER_CRITICAL();
+    requested_dse_mode = dse;
+    if (!usb_initialized) apply_dse_mode(dse);
+    else if (current_dse_mode != dse) request_usb_profile();
+    taskEXIT_CRITICAL();
+}
+
+void usb_gamepad_request_config_save(void)
+{
+    usb_config_save_pending = true;
 }
 
 ATTR_TCM_SECTION
@@ -820,18 +889,31 @@ void usb_gamepad_process_deferred(void)
     taskENTER_CRITICAL();
     /* Sample time and ISR-written request state in the same critical section. */
     uint64_t now = bflb_mtimer_get_time_us();
+    if (!usb_profile_matches_config()) request_usb_profile();
+    else if (usb_profile_pending) {
+        /* A second request may restore the already-applied profile after a
+         * BT reconnect was held off. Release that gate without resetting USB. */
+        usb_profile_pending = false;
+        if (!usb_wake_host_suspended()) usb_soft_connect();
+    }
+    bool profile_change = (usb_profile_pending || usb_reset_pending) &&
+                          !usb_wake_host_suspended() && now >= usb_profile_request_us &&
+                          now - usb_profile_request_us >= 100000ULL &&
+                          (!audio_control.pending || usb_audio_control_ready(&audio_control, now));
     bool change = (usb_configured || audio_control.revoke_pending) &&
                   usb_audio_control_ready(&audio_control, now);
     bool expired = usb_audio_control_expired(&audio_control, now);
-    bool enabled = change && audio_control.requested;
+    bool enabled = !expired &&
+                   (change ? audio_control.requested : (profile_change && audio_control.visible));
     uint32_t generation = audio_control.generation;
-    if (change || expired) {
+    if (change || expired || profile_change) {
+        usb_reset_pending = false;
         usb_reenumerating = true;
         usb_soft_disconnect();
         usb_configured = false;
     }
     taskEXIT_CRITICAL();
-    if (change || expired) {
+    if (change || expired || profile_change) {
         usb_audio_stop();
         usb_audio_mic_stop();
         audio_set_mic_active(false);
@@ -840,7 +922,8 @@ void usb_gamepad_process_deferred(void)
         taskENTER_CRITICAL();
         usb_audio_control_apply(&audio_control, enabled, generation,
                                 bflb_mtimer_get_time_us());
-        apply_audio_profile();
+        apply_usb_profile();
+        usb_profile_pending = false;
         ep_in_busy = false;
         kbd_ep_busy = false;
         pending_valid = false;
@@ -853,17 +936,16 @@ void usb_gamepad_process_deferred(void)
                 enabled, usb_bt_hidden);
     }
 
-    if (usb_reset_pending) {
-        usb_reset_pending = false;
-        config_save();
-        LOG_INF("[USB] CMD 0x03: USB reconnect via reset\n");
-        vTaskDelay(pdMS_TO_TICKS(100));
-        GLB_SW_System_Reset();
-    }
     if (usb_config_save_pending) {
-        usb_config_save_pending = false;
-        config_save();
-        LOG_INF("[USB] CMD 0x02: config saved\n");
+        static uint64_t retry_at;
+        uint64_t now = bflb_mtimer_get_time_us();
+        if (now >= retry_at) {
+            usb_config_save_pending = false;
+            if (!config_save()) {
+                usb_config_save_pending = true;
+                retry_at = now + 1000000ULL;
+            } else retry_at = 0;
+        }
     }
     if (usb_remap_save_pending) {
         usb_remap_save_pending = false;
@@ -904,31 +986,9 @@ int usb_gamepad_init(usb_gamepad_output_cb_t output_cb)
     LOG_INF("[USB-INIT] Audio desc injected: %u bytes at offset %d\n",
            audio_len, AUDIO_DESC_OFFSET);
 
-    /* Include keyboard interface ONLY when ps_shortcut needs to send key combos.
-     * enable_wake now uses USB remote-wake signal only (F15 key removed) —
-     * no keyboard interface needed. remap KBD type is disabled for now.
-     * REMOTE-WAKEUP bit stays in bmAttributes when wake is enabled. */
-    const bool need_kbd = remap_has_kbd_targets() ||
-                          config_get()->ps_shortcut_enabled ||
-                          (config_get()->tp_mode == 2 || config_get()->tp_mode == 3);
-    const bool need_remote_wake = config_get()->enable_wake || need_kbd;
-    if (need_kbd) {
-        config_desc[KBD_SUBCLASS_OFF] = 0x00; /* No subclass (multi-TLC, not pure boot) */
-        config_desc[KBD_PROTOCOL_OFF] = 0x00; /* None — keyboard + consumer control */
-        LOG_INF("[USB-INIT] Keyboard+CC intf: INCLUDED\n");
-        config_desc[7] = need_remote_wake ? 0xE0 : 0xC0;
-        /* wTotalLength and bNumInterfaces stay at compiled-in max */
-    } else {
-        /* Shrink descriptor to exclude keyboard — adjust header only,
-         * the trailing 25 bytes are simply invisible to the host. */
-        uint16_t total = USB_HID_CONFIG_SIZE - USB_KBD_DESC_SIZE;
-        config_desc[2] = total & 0xFF;
-        config_desc[3] = (total >> 8) & 0xFF;
-        config_desc[4] = 0x04; /* bNumInterfaces: AC + AS_SPK + AS_MIC + Gamepad */
-        config_desc[7] = need_remote_wake ? 0xE0 : 0xC0;
-        LOG_INF("[USB-INIT] Keyboard intf: EXCLUDED (wake=%d ps=%d)\n",
-               config_get()->enable_wake, config_get()->ps_shortcut_enabled);
-    }
+    /* Register optional interfaces once; their visibility/IDs are selected
+     * atomically with the descriptor profile on each USB re-enumeration. */
+    apply_usb_profile();
 
     usbd_desc_register(0, &usb_desc);
     LOG_INF("[USB-INIT] Descriptors registered (dev=%uB, cfg=%uB)\n",
@@ -945,26 +1005,17 @@ int usb_gamepad_init(usb_gamepad_output_cb_t output_cb)
     LOG_INF("[USB-INIT] Gamepad HID intf added (report_desc=%uB, DSE=%d)\n",
            rd_len, current_dse_mode);
 
-    /* Interface 4: Keyboard — only register when needed (DS5Dongle style) */
-    kbd_registered = need_kbd;
-    if (need_kbd) {
-        usbd_add_interface(0, usbd_hid_init_intf(
-            0, &kbd_intf, kbd_report_desc, sizeof(kbd_report_desc)));
-        LOG_INF("[USB-INIT] Keyboard HID intf added\n");
-    }
+    usbd_add_interface(0, usbd_hid_init_intf(
+        0, &kbd_intf, kbd_report_desc, sizeof(kbd_report_desc)));
 
     hid_ep_in.ep_addr = USB_GAMEPAD_EP_IN;
     hid_ep_in.ep_cb = hid_ep_in_handler;
     usbd_add_endpoint(0, &hid_ep_in);
 
 
-    if (need_kbd) {
-        kbd_ep_in.ep_addr = USB_KBD_EP_IN;
-        kbd_ep_in.ep_cb = kbd_ep_in_handler;
-        usbd_add_endpoint(0, &kbd_ep_in);
-    }
-    LOG_INF("[USB-INIT] Endpoints: GP_IN=0x%02x KBD_IN=0x%02x (OUT via EP0)\n",
-           USB_GAMEPAD_EP_IN, need_kbd ? USB_KBD_EP_IN : 0);
+    kbd_ep_in.ep_addr = USB_KBD_EP_IN;
+    kbd_ep_in.ep_cb = kbd_ep_in_handler;
+    usbd_add_endpoint(0, &kbd_ep_in);
 
     /* Read registers BEFORE usbd_initialize */
     {
@@ -978,6 +1029,7 @@ int usb_gamepad_init(usb_gamepad_output_cb_t output_cb)
            (unsigned long)USB_BASE);
     usb_audio_control_disconnect(&audio_control);
     apply_audio_profile();
+    usb_initialized = true;
     usbd_initialize(0, USB_BASE, usbd_event_handler);
     LOG_INF("[USB-INIT] usbd_initialize returned\n");
 
@@ -1042,7 +1094,7 @@ void usb_gamepad_set_suspend_hooks(void (*on_suspend)(void),
     hook_configured = on_configured;
 }
 
-void usb_gamepad_set_polling_rate(uint8_t mode)
+static void apply_polling_rate(uint8_t mode)
 {
     uint8_t interval;
 #ifdef FORCE_FS_MODE
@@ -1062,6 +1114,14 @@ void usb_gamepad_set_polling_rate(uint8_t mode)
 #endif
     config_desc[BINTERVAL_GAMEPAD_EP_IN_OFF]  = interval;
     LOG_INF("[USB] Polling rate: mode=%d bInterval=%d\n", mode, interval);
+}
+
+void usb_gamepad_set_polling_rate(uint8_t mode)
+{
+    taskENTER_CRITICAL();
+    if (!usb_initialized) apply_polling_rate(mode);
+    else if (applied_polling_mode != mode) request_usb_profile();
+    taskEXIT_CRITICAL();
 }
 
 ATTR_TCM_SECTION
@@ -1391,7 +1451,12 @@ void usbd_hid_set_report(uint8_t busid, uint8_t intf, uint8_t report_id,
             struct config_body *cfg = config_get();
             state_mgr_apply_config(cfg->speaker_volume, cfg->headset_volume,
                                    cfg->speaker_gain, cfg->trigger_reduce);
-            usb_gamepad_set_polling_rate(config_get()->polling_rate_mode);
+            uint8_t mode = cfg->controller_mode;
+            bool edge = mode == 1 || (mode == 2 &&
+                (bt_hid_host_get_state() == BT_HID_STATE_CONNECTED ?
+                 bt_hid_host_is_dse() : cfg->dse_detected));
+            usb_gamepad_set_dse_mode(edge);
+            request_usb_profile();
             if (config_get()->lock_volume)
                 state_mgr_restore_config_volume();
             LOG_INF("[USB] CMD 0x01: config updated\n");
@@ -1401,6 +1466,7 @@ void usbd_hid_set_report(uint8_t busid, uint8_t intf, uint8_t report_id,
             usb_audio_control_command(&audio_control, payload, payload_len,
                                       bflb_mtimer_get_time_us());
         } else if (cmd == 0x03) {
+            if (!usb_reset_pending) usb_profile_request_us = bflb_mtimer_get_time_us();
             usb_reset_pending = true;
         }
         return;
@@ -1488,7 +1554,7 @@ void usb_soft_disconnect(void)
 
 void usb_soft_connect(void)
 {
-    if (usb_bt_hidden || usb_reenumerating || audio_control.revoke_pending)
+    if (usb_bt_hidden || usb_reenumerating || usb_profile_pending || audio_control.revoke_pending)
         return;
     volatile uint32_t *phy_tst = (volatile uint32_t *)(USB_BASE + 0x114);
     *phy_tst &= ~1u;
