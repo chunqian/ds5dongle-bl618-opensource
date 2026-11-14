@@ -38,6 +38,12 @@ harness = r'''
 static uint8_t usb_in_buf[64];
 static volatile uint8_t pending_payload[63];
 static volatile bool pending_valid, pending_active, usb_configured, ep_in_busy;
+static uint32_t pending_session, generation=1;
+static bool pending_session_checked;
+#define BT_HID_STATE_DISCONNECTING 9
+static unsigned bt_state;
+static uint32_t bt_hid_host_session(void) { return generation; }
+static unsigned bt_hid_host_get_state(void) { return bt_state; }
 static struct config_body test_config;
 struct config_body *config_get(void) { return &test_config; }
 static bool first_usb_send_logged, kbd_ep_busy;
@@ -86,6 +92,7 @@ static int usbd_ep_start_write(uint8_t bus, uint8_t ep, const uint8_t *data, uin
 static uint64_t bflb_mtimer_get_time_us(void) { return 1000000; }
 static void usb_soft_disconnect(void) {}
 static void apply_audio_profile(void) {}
+static void aux_reset(void) {}
 static void usb_audio_stop(void) {}
 static void usb_audio_mic_stop(void) {}
 static void audio_set_mic_active(bool enabled) { (void)enabled; }
@@ -94,13 +101,15 @@ static void audio_reset_encoder(void) {}
 '''
 for signature in ('static void try_send_pending(void)',
                   'static void hid_ep_in_handler(uint8_t',
-                  'int usb_gamepad_send_raw_input(const uint8_t'):
+                  'int usb_gamepad_send_raw_input(const uint8_t',
+                  'int usb_gamepad_send_input_session(const uint8_t'):
     harness += function(signature)
 for name in ('CONFIGURED', 'RESET', 'SUSPEND', 'RESUME', 'DISCONNECTED'):
     harness += '\nstatic void event_' + name + '(void) {\n' + event('USBD_EVENT_' + name) + '}\n'
 harness += r'''
 #undef memcpy
 static void setup(void) {
+    generation=1; bt_state=0; pending_session_checked=false;
     memset(&audio_control, 0, sizeof(audio_control));
     memset((void *)pending_payload, 0, sizeof(pending_payload));
     memset(usb_in_buf, 0, sizeof(usb_in_buf));
@@ -117,6 +126,16 @@ static void expect_frame(unsigned index, const uint8_t *payload) {
     assert(!memcmp(accepted[index] + 1, payload, 63));
 }
 int main(void) {
+    uint8_t stale[63]={0x11}, fresh[63]={0x22};
+    setup(); assert(usb_gamepad_send_input_session(stale,0)<0 && !queued);
+    assert(usb_gamepad_send_input_session(stale,1)==0 && queued==1);
+    usb_gamepad_send_input_session(fresh,1); generation++;
+    complete(); assert(queued==1 && !pending_valid);
+    assert(usb_gamepad_send_input_session(fresh,1)<0);
+    assert(usb_gamepad_send_input_session(fresh,2)==0 && queued==2);
+    usb_gamepad_send_input_session(stale,2); bt_state=BT_HID_STATE_DISCONNECTING;
+    complete(); assert(queued==2 && !pending_valid);
+
     /* Keep the IRQ doubles referenced when regression-testing older source. */
     (void)bflb_irq_save; (void)bflb_irq_restore;
     uint8_t a[63], b[63], c[63], neutral[63] = {0};

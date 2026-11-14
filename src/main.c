@@ -718,7 +718,8 @@ static void usb_task(void *arg)
     bool     tp_mode_combo_fired = false;
 
     /* Volume combo: Options + D-pad Up/Down → Consumer Control Volume */
-    bool     vol_key_active = false;
+    bool     vol_key_active = false, vol_releasing = false, vol_repeat_again = false;
+    uint16_t vol_sent_usage = 0;
     uint64_t vol_repeat_us  = 0;
     #define VOL_REPEAT_FIRST_MS  400
     #define VOL_REPEAT_NEXT_MS   120
@@ -743,7 +744,9 @@ static void usb_task(void *arg)
         if (session != usb_session) {
             usb_session = session;
             prev_mic_bit = 0xFF;
-            ps_debounced = ps_was_pressed = ps_key_scheduled = false;
+            ps_debounced = ps_was_pressed = ps_key_scheduled = ps_key_pending = false;
+            remap_on_disconnect(); /* reset local remap state after any stale work */
+            vol_releasing = vol_repeat_again = false;
             remap_combo_fired = tp_mode_combo_fired = false;
             if (vol_key_active) {
                 usb_gamepad_send_consumer_report(0);
@@ -777,22 +780,25 @@ static void usb_task(void *arg)
                 }
 
                 uint64_t vt = bflb_mtimer_get_time_us();
-                if (vu && usb_gamepad_kbd_ready()) {
-                    if (!vol_key_active) {
-                        usb_gamepad_send_consumer_report(vu);
-                        vol_key_active = true;
-                        vol_repeat_us = vt + VOL_REPEAT_FIRST_MS * 1000ULL;
-                    } else if (vt >= vol_repeat_us) {
-                        usb_gamepad_send_consumer_report(0);
-                        for (int w = 0; w < 15 && !usb_gamepad_kbd_ready(); w++)
-                            vTaskDelay(pdMS_TO_TICKS(1));
-                        usb_gamepad_send_consumer_report(vu);
-                        vol_repeat_us = bflb_mtimer_get_time_us() + VOL_REPEAT_NEXT_MS * 1000ULL;
+                if (!vu) vol_repeat_again = false;
+                if (vol_key_active && (vu != vol_sent_usage || vt >= vol_repeat_us)) {
+                    vol_releasing = true;
+                    if (vu == vol_sent_usage) vol_repeat_again = true;
+                }
+                if (vol_releasing) {
+                    if (usb_gamepad_send_consumer_session(0, input.session) == 0) {
+                        vol_key_active = vol_releasing = false;
                     }
-                } else if (vol_key_active) {
-                    if (usb_gamepad_kbd_ready())
-                        usb_gamepad_send_consumer_report(0);
-                    vol_key_active = false;
+                } else if (vu && !vol_key_active) {
+                    if (usb_gamepad_send_consumer_session(vu, input.session) == 0) {
+                        vol_key_active = true;
+                        vol_sent_usage = vu;
+                        vol_repeat_us = vt + (vol_repeat_again ? VOL_REPEAT_NEXT_MS :
+                                              VOL_REPEAT_FIRST_MS) * 1000ULL;
+                    }
+                } else if (!vu) {
+                    /* Release a press that has not yet reached the host, too. */
+                    usb_gamepad_send_consumer_session(0, input.session);
                 }
 
                 if (vol_key_active) {
@@ -858,11 +864,11 @@ static void usb_task(void *arg)
                 }
             }
 
-            if (!vol_key_active)
-                remap_kbd_tick(raw_report + 2);
-            remap_mouse_tick(raw_report + 2);
+            remap_kbd_tick(raw_report + 2, input.session);
+            remap_mouse_tick(raw_report + 2, input.session);
             remap_apply(raw_report + 2);
-            usb_gamepad_send_raw_input(raw_report + 2);
+            if (usb_gamepad_send_input_session(raw_report + 2, input.session) != 0)
+                continue;
 
             /* Headset plug detection for audio tag switching (0x93 vs 0x96) */
             audio_set_headset((raw_report[2 + DS5_HEADSET_BYTE] & 1) != 0);
@@ -910,24 +916,6 @@ static void usb_task(void *arg)
                 {
                     uint64_t now_us = bflb_mtimer_get_time_us();
 
-                    if (ps_key_scheduled && now_us >= ps_key_sched_us &&
-                        usb_gamepad_kbd_ready()) {
-                        uint8_t kbd[8] = {0x08, 0, 0x0A, 0, 0, 0, 0, 0};
-                        usb_gamepad_send_kbd_report(kbd, sizeof(kbd));
-                        LOG_INF("[PS] Short press -> Win+G (delayed)\n");
-                        ps_key_pending = true;
-                        ps_key_rel_us = now_us + 30000ULL;
-                        ps_key_scheduled = false;
-                    }
-
-                    if (ps_key_pending && now_us >= ps_key_rel_us) {
-                        if (usb_gamepad_kbd_ready()) {
-                            uint8_t up[8] = {0};
-                            usb_gamepad_send_kbd_report(up, sizeof(up));
-                            ps_key_pending = false;
-                        }
-                    }
-
                     /*
                      * PS shortcut: short press → Win+G (Game Bar)
                      * Long press removed — conflicts with controller disconnect.
@@ -964,16 +952,25 @@ static void usb_task(void *arg)
             }
         }
 
-        if (!ds5_connected) {
-            ps_debounced = false;
-            ps_key_scheduled = false;
-            ps_was_pressed = false;
-            if (ps_key_pending) {
-                if (usb_gamepad_kbd_ready()) {
-                    uint8_t up[8] = {0};
-                    usb_gamepad_send_kbd_report(up, sizeof(up));
-                }
+        uint64_t ps_now = bflb_mtimer_get_time_us();
+        if (!ds5_connected || !config_ps_shortcut()) {
+            ps_debounced = ps_key_scheduled = ps_was_pressed = false;
+            uint8_t up[8] = {0};
+            if (usb_gamepad_send_keys(HID_AUX_PS, up, 8, usb_session) == 0)
                 ps_key_pending = false;
+        } else {
+            if (ps_key_scheduled && ps_now >= ps_key_sched_us && !ps_key_pending) {
+                uint8_t kbd[8] = {0x08, 0, 0x0A, 0, 0, 0, 0, 0};
+                if (usb_gamepad_send_keys(HID_AUX_PS, kbd, 8, usb_session) == 0) {
+                    ps_key_pending = true;
+                    ps_key_rel_us = ps_now + 30000ULL;
+                    ps_key_scheduled = false;
+                }
+            }
+            if (ps_key_pending && ps_now >= ps_key_rel_us) {
+                uint8_t up[8] = {0};
+                if (usb_gamepad_send_keys(HID_AUX_PS, up, 8, usb_session) == 0)
+                    ps_key_pending = false;
             }
         }
 

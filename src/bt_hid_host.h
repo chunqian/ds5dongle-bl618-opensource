@@ -192,14 +192,15 @@ void bt_hid_host_clear_bonds(void);
 bool bt_hid_host_is_dse(void);
 
 /**
- * Get a cached feature report received from the connected controller.
+ * Copy a coherent cached Feature snapshot; no borrowed storage escapes.
  * @param report_id  HID report ID
- * @param data       output: pointer to cached data (excludes report_id)
+ * @param data       caller-owned output buffer (excludes report_id)
+ * @param capacity   size of output buffer
  * @param len        output: cached data length
  * @return true if found in cache
  */
-bool bt_hid_host_get_cached_feature(uint8_t report_id,
-                                    const uint8_t **data, uint16_t *len);
+bool bt_hid_host_copy_feature(uint8_t report_id, uint8_t *data,
+                               uint16_t capacity, uint16_t *len);
 
 /**
  * Send a SET_REPORT (Feature) with BT CRC to the connected controller.

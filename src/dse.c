@@ -37,9 +37,9 @@ void dse_on_edge_detected(void)
 {
     /* 1) SET 0x65: verbatim echo of the 0x20 firmware report body
      *    (no CRC recompute, matches native host behaviour). */
-    const uint8_t *fw_body;
+    uint8_t fw_body[61];
     uint16_t fw_len;
-    if (bt_hid_host_get_cached_feature(0x20, &fw_body, &fw_len) &&
+    if (bt_hid_host_copy_feature(0x20, fw_body, sizeof(fw_body), &fw_len) &&
         fw_len >= 61) {
         bt_hid_host_set_feature(0x65, fw_body, 61);
     }

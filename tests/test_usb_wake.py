@@ -16,7 +16,7 @@ static uintptr_t masked;
 static unsigned requests, forced, poweroffs, reports;
 static bool ready, send_fail, suspend_during_request, resume_during_request;
 static int wake_result;
-static uint8_t keys[16];
+static uint8_t keys[16], last_key;
 uint64_t bflb_mtimer_get_time_us(void) { return clock_us; }
 uintptr_t bflb_irq_save(void) { uintptr_t old=masked; masked=1; return old; }
 void bflb_irq_restore(uintptr_t old) { masked=old; }
@@ -32,7 +32,9 @@ void usbd_set_remote_wakeup(uint8_t bus) { assert(!masked && bus==0); forced++; 
 bool usb_gamepad_kbd_ready(void) { assert(!masked); return ready; }
 int usb_gamepad_send_kbd_report(const uint8_t *data,uint8_t len) {
     assert(!masked && len==8);
-    if(send_fail) return -1;
+    if(data[2]==last_key) return 0;
+    if(send_fail || !ready) return -1;
+    last_key=data[2];
     assert(reports<16); keys[reports++]=data[2]; return 0;
 }
 int bt_hid_host_set_feature_crc(uint8_t id,const uint8_t *data,uint16_t len) {
@@ -43,7 +45,7 @@ harness += '#include "'+str(ROOT/'src/usb_wake.c')+'"\n'
 harness+=r'''
 static void setup(void) {
     clock_us=0; masked=0; cfg.enable_wake=1;
-    requests=forced=poweroffs=reports=0;
+    requests=forced=poweroffs=reports=0; last_key=0;
     ready=true; send_fail=suspend_during_request=resume_during_request=false;
     wake_result=0; memset(keys,0,sizeof(keys)); usb_wake_init();
 }

@@ -2,6 +2,7 @@
 #include "ds5_protocol.h"
 #include "dse.h"
 #include "config.h"
+#include "bflb_irq.h"
 
 #include <bluetooth/bluetooth.h>
 #include <bluetooth/conn.h>
@@ -39,7 +40,9 @@ static struct {
 
 static void feature_cache_clear(void)
 {
+    uintptr_t irq = bflb_irq_save();
     memset(feature_cache, 0, sizeof(feature_cache));
+    bflb_irq_restore(irq);
 }
 
 static void feature_cache_store(uint8_t report_id,
@@ -48,6 +51,7 @@ static void feature_cache_store(uint8_t report_id,
     if (len > FEATURE_DATA_MAX)
         len = FEATURE_DATA_MAX;
 
+    uintptr_t irq = bflb_irq_save();
     int slot = -1;
     for (int i = 0; i < FEATURE_CACHE_SLOTS; i++) {
         if (feature_cache[i].report_id == report_id && feature_cache[i].len > 0) {
@@ -69,6 +73,7 @@ static void feature_cache_store(uint8_t report_id,
     feature_cache[slot].report_id = report_id;
     memcpy(feature_cache[slot].data, data, len);
     feature_cache[slot].len = len;
+    bflb_irq_restore(irq);
 }
 
 /* ---------- persistent blacklist ----------
@@ -2307,17 +2312,22 @@ void bt_hid_host_clear_bonds(void)
     bt_br_set_discoverable(true);
 }
 
-bool bt_hid_host_get_cached_feature(uint8_t report_id,
-                                    const uint8_t **data, uint16_t *len)
+bool bt_hid_host_copy_feature(uint8_t report_id, uint8_t *data,
+                               uint16_t capacity, uint16_t *len)
 {
+    uintptr_t irq = bflb_irq_save();
+    *len = 0;
     for (int i = 0; i < FEATURE_CACHE_SLOTS; i++) {
-        if (feature_cache[i].report_id == report_id &&
-            feature_cache[i].len > 0) {
-            *data = feature_cache[i].data;
-            *len  = feature_cache[i].len;
+        if (feature_cache[i].report_id == report_id && feature_cache[i].len > 0) {
+            uint16_t n = feature_cache[i].len;
+            if (n > capacity) n = capacity;
+            memcpy(data, feature_cache[i].data, n);
+            *len = n;
+            bflb_irq_restore(irq);
             return true;
         }
     }
+    bflb_irq_restore(irq);
     return false;
 }
 

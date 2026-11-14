@@ -77,6 +77,7 @@ static uint64_t bflb_mtimer_get_time_us(void) {
 }
 
 static void usb_wake_note_usb_reconnect(void) {}
+static void aux_reset(void) {}
 static void usb_audio_stop(void) {}
 static void usb_audio_mic_stop(void) {}
 static void audio_set_mic_active(bool enabled) { (void)enabled; }

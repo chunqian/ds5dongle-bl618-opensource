@@ -46,7 +46,6 @@ static const struct { uint8_t off; uint8_t mask; } BTN_LOC[REMAP_LEGACY_BTN_COUN
 static remap_entry_t g_profiles[REMAP_PROFILE_COUNT][REMAP_BTN_COUNT];
 static uint8_t active_profile = 0;
 static bool g_remap_is_identity = true;
-static uint8_t last_kbd_report[8];
 
 /* Mouse mode state */
 static int16_t  tp_mouse_last_x = -1;
@@ -227,7 +226,6 @@ void remap_init(void)
         reset_table(g_profiles[p]);
     active_profile = 0;
     g_remap_is_identity = true;
-    memset(last_kbd_report, 0, sizeof(last_kbd_report));
 }
 
 void remap_load(void)
@@ -399,7 +397,7 @@ void remap_apply(uint8_t *p)
          | (dst[REMAP_BTN_MUTE]     ? 0x04 : 0);
 }
 
-void remap_kbd_tick(const uint8_t *p)
+void remap_kbd_tick(const uint8_t *p, uint32_t session)
 {
     const remap_entry_t *remap = g_profiles[active_profile];
     uint8_t report[8] = { 0 };
@@ -420,29 +418,15 @@ void remap_kbd_tick(const uint8_t *p)
         }
     }
 
-    if (memcmp(report, last_kbd_report, 8) == 0)
-        return;
-
-    memcpy(last_kbd_report, report, 8);
-    if (usb_gamepad_kbd_ready())
-        usb_gamepad_send_kbd_report(report, 8);
+    /* Publish every input, including after USB reset. The arbiter merges
+     * sources and retries independently of further controller reports. */
+    usb_gamepad_send_keys(HID_AUX_REMAP, report, 8, session);
 }
 
 void remap_on_disconnect(void)
 {
-    bool had_keys = (last_kbd_report[0] != 0);
-    for (int k = 2; !had_keys && k < 8; k++)
-        had_keys = (last_kbd_report[k] != 0);
+    usb_gamepad_release_aux();
 
-    if (had_keys && usb_gamepad_kbd_ready()) {
-        uint8_t zero[8] = { 0 };
-        usb_gamepad_send_kbd_report(zero, 8);
-    }
-    memset(last_kbd_report, 0, sizeof(last_kbd_report));
-
-    /* Reset mouse state */
-    if (last_mouse_buttons && usb_gamepad_kbd_ready())
-        usb_gamepad_send_mouse_report(0, 0, 0, 0);
     tp_mouse_last_x = -1;
     tp_mouse_last_y = -1;
     tp_click_held = false;
@@ -481,14 +465,17 @@ static inline int8_t clamp8(int16_t v)
     return (int8_t)v;
 }
 
-void remap_mouse_tick(const uint8_t *p)
+void remap_mouse_tick(const uint8_t *p, uint32_t session)
 {
     uint8_t mode = config_get()->tp_mode;
-    /* Mouse only active in mode 2 (left mouse) or mode 3 (right mouse) */
-    if (mode != 2 && mode != 3) return;
+    /* Touchpad motion uses modes 2/3; mapped mouse buttons work in any mode. */
+    if (mode != 2 && mode != 3) {
+        tp_mouse_last_x = tp_mouse_last_y = -1;
+        tp_click_held = tp_right_triggered = false;
+    }
 
     const uint8_t *tp = &p[32];
-    bool finger_active = !(tp[0] & 0x80);
+    bool finger_active = (mode == 2 || mode == 3) && !(tp[0] & 0x80);
     int16_t x = 0, y = 0;
     if (finger_active) {
         x = tp[1] | ((tp[2] & 0x0F) << 8);
@@ -561,11 +548,8 @@ void remap_mouse_tick(const uint8_t *p)
         buttons |= btn_bit;
     }
 
-    if (dx != 0 || dy != 0 || buttons != last_mouse_buttons) {
-        if (usb_gamepad_kbd_ready())
-            usb_gamepad_send_mouse_report(buttons, dx, dy, 0);
+    if (usb_gamepad_send_mouse_session(buttons, dx, dy, 0, session) == 0)
         last_mouse_buttons = buttons;
-    }
 }
 
 void remap_tp_cycle_mode(void)
@@ -586,7 +570,7 @@ void remap_tp_cycle_mode(void)
     tp_mouse_last_y = -1;
     tp_click_held = false;
     tp_right_triggered = false;
-    if (last_mouse_buttons && usb_gamepad_kbd_ready())
+    if (last_mouse_buttons)
         usb_gamepad_send_mouse_report(0, 0, 0, 0);
     last_mouse_buttons = 0;
 }

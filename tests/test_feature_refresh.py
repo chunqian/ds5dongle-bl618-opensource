@@ -21,8 +21,8 @@ static unsigned requests, requested;
 static bool dse_is_profile_report(uint8_t id) { return id>=0x70 && id<=0x7b; }
 static bool dse_profiles_ready(void) { return ready; }
 static void bt_hid_host_refresh_feature(uint8_t id) { ++requests; requested=id; }
-static bool bt_hid_host_get_cached_feature(uint8_t id,const uint8_t **data,uint16_t *len) {
-    (void)id; *data=cache; *len=sizeof(cache); return cached;
+static bool bt_hid_host_copy_feature(uint8_t id,uint8_t *data,uint16_t cap,uint16_t *len) {
+    (void)id; assert(cap>=sizeof(cache)); memcpy(data,cache,sizeof(cache)); *len=sizeof(cache); return cached;
 }
 static bool ds5_feature_fallback(uint8_t id,uint8_t *data,uint32_t *len) {
     data[0]=id; data[1]=0x55; *len=2; return fallback;

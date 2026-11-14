@@ -159,7 +159,6 @@ void usb_wake_task(void)
     uint64_t entered = state_entered_us;
     uint32_t generation = wake_generation;
     bool resumed = host_resumed || !host_suspended;
-    bool release = key_down_on_host;
     uint8_t attempts = key_attempts;
     bflb_irq_restore(irq);
 
@@ -169,11 +168,10 @@ void usb_wake_task(void)
         /* Keep page scan available: a PS press can reconnect and wake USB. */
     }
     if (!config_wake_enabled() || current == WAKE_IDLE || current == WAKE_DONE) {
-        if (release && usb_gamepad_kbd_ready()) {
-            uint8_t up[8] = {0};
-            if (usb_gamepad_send_kbd_report(up, sizeof(up)) == 0) {
-                irq = bflb_irq_save(); key_down_on_host = false; bflb_irq_restore(irq);
-            }
+        /* Publish release even after a failed keydown; retry it while busy. */
+        uint8_t up[8] = {0};
+        if (usb_gamepad_send_kbd_report(up, sizeof(up)) == 0) {
+            irq = bflb_irq_save(); key_down_on_host = false; bflb_irq_restore(irq);
         }
         return;
     }

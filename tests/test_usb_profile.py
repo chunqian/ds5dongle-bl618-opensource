@@ -42,7 +42,8 @@ struct usbd_interface {
 static struct usbd_interface hid_intf, kbd_intf;
 static struct config_body cfg;
 struct config_body *config_get(void) { return &cfg; }
-static bool remap_keys, audio_visible;
+static bool remap_keys, remap_mouse, audio_visible;
+static bool remap_has_mouse_targets(void) { return remap_mouse; }
 static bool remap_has_kbd_targets(void) { return remap_keys; }
 void usb_audio_set_visible(bool value) { audio_visible = value; }
 static void usbd_hid_init_intf(int bus, struct usbd_interface *p, const uint8_t *rd, size_t len) {
@@ -60,6 +61,7 @@ static struct usb_audio_control audio_control;
 harness += source[source.index('#define USBD_MAX_POWER'):source.index('static bool current_dse_mode')]
 harness += source[source.index('static const uint8_t hid_report_desc_ds'):source.index('/* ---- Advance-mode descriptor callbacks ---- */')]
 harness += audio[audio.index('#define AUDIO_IT_SPK_ID'):audio.index('\n};')+4]
+harness += 'static uint8_t other_speed_desc[USB_HID_CONFIG_SIZE];\n'
 for signature in (
     'static void apply_polling_rate(uint8_t mode)',
     'static void apply_audio_profile(void)',
@@ -72,6 +74,7 @@ for signature in (
     'void usb_gamepad_request_config_save(void)',
     'static const uint8_t *desc_device_cb(uint8_t speed)',
     'static const uint8_t *desc_config_cb(uint8_t speed)',
+    'static const uint8_t *desc_other_speed_cb(uint8_t speed)',
 ):
     harness += function(signature)
 start = source.index('    if (usb_config_save_pending) {', source.index('void usb_gamepad_process_deferred'))
@@ -113,6 +116,7 @@ static void check_descriptors(bool edge, bool with_audio, bool keyboard, bool wa
                 assert(last_intf==kbd_intf.intf_num);
                 assert(kbd_intf.class_interface_handler);
                 assert(u16(desc+i+7)==sizeof(kbd_report_desc));
+                assert(desc[i+9+6]==USB_KBD_INTERVAL_MS);
             }
         }
     }
@@ -126,27 +130,38 @@ int main(void) {
     /* Real descriptor matrix: both PIDs, audio profiles, keyboard and polling modes. */
     for (unsigned edge=0;edge<2;edge++)
     for (unsigned aud=0;aud<2;aud++)
-    for (unsigned keys=0;keys<6;keys++)
+    for (unsigned keys=0;keys<7;keys++)
     for (unsigned mode=0;mode<3;mode++) {
         memset(&cfg,0,sizeof(cfg));
         cfg.polling_rate_mode=mode;
         cfg.enable_wake=keys==1;
         cfg.ps_shortcut_enabled=keys==2;
-        remap_keys=keys==3;
+        remap_keys=keys==3; remap_mouse=keys==6;
         cfg.tp_mode=keys==4?2:keys==5?3:0;
         requested_dse_mode=edge;
         audio_control.visible=aud;
         apply_usb_profile();
 #ifdef FORCE_FS_MODE
-        unsigned poll=mode?1:2;
+        unsigned poll=mode==0?4:mode==1?2:1;
 #else
-        unsigned poll=5-mode;
+        unsigned poll=mode==0?6:mode==1?5:3;
 #endif
         check_descriptors(edge,aud,keys!=0,keys==1,poll);
         assert(usb_profile_matches_config());
+        const uint8_t *other=desc_other_speed_cb(0);
+        assert(other && other[1]==7);
+        for(unsigned i=9;i<u16(other+2);i+=other[i]) {
+            if(other[i+1]!=5 || (other[i+3]&3)!=3) continue;
+            bool kbd=other[i+2]==USB_KBD_EP_IN;
+#ifdef FORCE_FS_MODE
+            assert(other[i+6]==(kbd?7:mode==0?6:mode==1?5:3));
+#else
+            assert(other[i+6]==(kbd?10:mode==0?4:mode==1?2:1));
+#endif
+        }
     }
     /* A pending host setting must not mutate an attached descriptor set. */
-    memset(&cfg,0,sizeof(cfg)); remap_keys=false; requested_dse_mode=false;
+    memset(&cfg,0,sizeof(cfg)); remap_keys=remap_mouse=false; requested_dse_mode=false;
     audio_control.visible=false; apply_usb_profile();
     uint8_t old_device[sizeof(device_desc)], old_config[sizeof(config_desc)];
     memcpy(old_device,device_desc,sizeof(old_device));

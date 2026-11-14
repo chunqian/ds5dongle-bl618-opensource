@@ -556,8 +556,16 @@ static const uint8_t *desc_other_speed_cb(uint8_t speed)
             uint8_t bmAttr = other_speed_desc[i + 3];
             if ((bmAttr & 0x03) == 0x01)
                 other_speed_desc[i + 6] = 1;   /* ISO: FS bInterval=1 (1ms) */
-            else if ((bmAttr & 0x03) == 0x03)
-                other_speed_desc[i + 6] = other_speed_desc[i + 6]; /* INT: keep as-is */
+            else if ((bmAttr & 0x03) == 0x03) {
+                bool keyboard = other_speed_desc[i + 2] == USB_KBD_EP_IN;
+#ifdef FORCE_FS_MODE
+                other_speed_desc[i + 6] = keyboard ? 7 :
+                    (applied_polling_mode == 0 ? 6 : applied_polling_mode == 1 ? 5 : 3);
+#else
+                other_speed_desc[i + 6] = keyboard ? 10 :
+                    (applied_polling_mode == 0 ? 4 : applied_polling_mode == 1 ? 2 : 1);
+#endif
+            }
         }
         i += len;
     }
@@ -654,7 +662,10 @@ static volatile bool usb_bt_hidden = false;
 static volatile bool usb_reenumerating = false;
 static volatile bool ep_in_busy = false;
 static volatile bool kbd_ep_busy = false;
-static volatile uint64_t kbd_ep_busy_since_us = 0;
+static struct hid_aux aux;
+static uint32_t aux_session;
+static void aux_flush(void);
+static void aux_reset(void);
 static usb_gamepad_output_cb_t output_callback = NULL;
 
 /* Suspend/resume hooks for wake module */
@@ -670,6 +681,8 @@ static volatile uint8_t pending_payload[DS5_USB_INPUT_PAYLOAD_LEN];
  * valid frame, while real-time mode consumes each newly published update. */
 static volatile bool    pending_valid = false;
 static volatile bool    pending_active = false;
+static uint32_t pending_session;
+static bool pending_session_checked;
 
 ATTR_TCM_SECTION
 static void try_send_pending(void)
@@ -679,6 +692,11 @@ static void try_send_pending(void)
     uint8_t first_report[10];
     bool log_first = false;
     uintptr_t irq_state = bflb_irq_save();
+    if (pending_session_checked &&
+        (pending_session != bt_hid_host_session() ||
+         bt_hid_host_get_state() == BT_HID_STATE_DISCONNECTING)) {
+        pending_valid = pending_active = false;
+    }
     bool realtime = config_polling_mode() == 2;
     if (!pending_valid || (realtime && !pending_active) ||
         !usb_configured || ep_in_busy) {
@@ -724,7 +742,7 @@ static void kbd_ep_in_handler(uint8_t busid, uint8_t ep, uint32_t nbytes)
 {
     (void)busid; (void)ep; (void)nbytes;
     kbd_ep_busy = false;
-    kbd_ep_busy_since_us = 0;
+    aux_flush();
 }
 
 static void usbd_event_handler(uint8_t busid, uint8_t event)
@@ -753,6 +771,7 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
         pending_active = false;
         kbd_ep_busy = false;
         first_usb_send_logged = false;
+        aux_reset();
         usb_audio_stop();
         usb_audio_mic_stop();
         audio_set_mic_active(false);
@@ -786,6 +805,7 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
         LOG_INF("[USB-EVT] CONNECTED (VBUS detected)\n");
         break;
     case USBD_EVENT_DISCONNECTED:
+        aux_reset();
         usb_audio_control_disconnect(&audio_control);
         apply_audio_profile();
         usb_configured = false;
@@ -830,7 +850,7 @@ static void apply_dse_mode(bool dse)
 static bool profile_needs_keyboard(void)
 {
     const struct config_body *cfg = config_get();
-    return cfg->enable_wake || cfg->ps_shortcut_enabled || remap_has_kbd_targets() ||
+    return cfg->enable_wake || cfg->ps_shortcut_enabled || remap_has_kbd_targets() || remap_has_mouse_targets() ||
            cfg->tp_mode == 2 || cfg->tp_mode == 3;
 }
 
@@ -923,6 +943,7 @@ void usb_gamepad_process_deferred(void)
         usb_audio_control_apply(&audio_control, enabled, generation,
                                 bflb_mtimer_get_time_us());
         apply_usb_profile();
+        aux_reset();
         usb_profile_pending = false;
         ep_in_busy = false;
         kbd_ep_busy = false;
@@ -963,12 +984,15 @@ void usb_gamepad_process_deferred(void)
             dse_on_profile_write(entry.report_id);
     }
 
+    aux_flush();
+
     /* Recover a failed queue attempt even when the controller stops sending. */
     try_send_pending();
 }
 
 int usb_gamepad_init(usb_gamepad_output_cb_t output_cb)
 {
+    aux_reset();
     output_callback = output_cb;
     memset(usb_in_buf, 0, sizeof(usb_in_buf));
     memset(kbd_buf, 0, sizeof(kbd_buf));
@@ -1098,17 +1122,17 @@ static void apply_polling_rate(uint8_t mode)
 {
     uint8_t interval;
 #ifdef FORCE_FS_MODE
-    /* FS: bInterval = N ms (linear), USB polls 2x target for headroom */
+    /* FS: bInterval is the actual polling period in milliseconds. */
     switch (mode) {
-    case 0:  interval = 2; break;  /* FS 2ms = 500Hz USB → ~250Hz effective */
-    case 1:  interval = 1; break;  /* FS 1ms = 1000Hz USB → ~500Hz effective */
+    case 0:  interval = 4; break;  /* FS 250Hz */
+    case 1:  interval = 2; break;  /* FS 500Hz */
     default: interval = 1; break;  /* FS 1ms = 1000Hz USB (BT-limited ~750Hz) */
     }
 #else
     /* HS: bInterval = 2^(N-1) microframes */
     switch (mode) {
-    case 0:  interval = 5; break;  /* HS 2^4=16µf = 2ms → 500Hz, effective ~250Hz */
-    case 1:  interval = 4; break;  /* HS 2^3=8µf  = 1ms → 1000Hz, effective ~500Hz */
+    case 0:  interval = 6; break;  /* HS 4ms = 250Hz */
+    case 1:  interval = 5; break;  /* HS 2ms = 500Hz */
     default: interval = 3; break;  /* HS 2^2=4µf  = 0.5ms → 2000Hz, effective ~750Hz */
     }
 #endif
@@ -1130,11 +1154,29 @@ int usb_gamepad_send_raw_input(const uint8_t *payload)
     /* Never let the endpoint ISR read a partly updated pending report.
      * While busy, newer frames replace older unsent ones to avoid a backlog. */
     uintptr_t irq_state = bflb_irq_save();
+    pending_session_checked = false; /* explicit neutral/maintenance report */
     memcpy((void *)pending_payload, payload, DS5_USB_INPUT_PAYLOAD_LEN);
     pending_valid = true;
     pending_active = true;
     bflb_irq_restore(irq_state);
     try_send_pending();
+    return 0;
+}
+
+int usb_gamepad_send_input_session(const uint8_t *payload, uint32_t session)
+{
+    uintptr_t irq = bflb_irq_save();
+    if (session != bt_hid_host_session() ||
+        bt_hid_host_get_state() == BT_HID_STATE_DISCONNECTING) {
+        bflb_irq_restore(irq);
+        return -1;
+    }
+    memcpy((void *)pending_payload, payload, DS5_USB_INPUT_PAYLOAD_LEN);
+    pending_session = session;
+    pending_session_checked = true;
+    pending_valid = pending_active = true;
+    try_send_pending();
+    bflb_irq_restore(irq);
     return 0;
 }
 
@@ -1144,64 +1186,111 @@ bool usb_gamepad_is_ready(void)
 }
 
 
+/* All auxiliary producers share one immutable in-flight DMA buffer. The
+ * arbiter retains desired states/motion on busy or driver failure. */
+static int aux_write(const uint8_t *report, uint8_t len)
+{
+    if (!usb_configured || !kbd_registered || kbd_ep_busy) return -1;
+    memcpy(kbd_buf, report, len);
+    kbd_ep_busy = true;
+    int ret = usbd_ep_start_write(0, USB_KBD_EP_IN, kbd_buf, len);
+    if (ret < 0) kbd_ep_busy = false; /* no transfer was accepted */
+    return ret;
+}
+static void aux_sync_session(void)
+{
+    uint32_t session = bt_hid_host_session();
+    if (session != aux_session || bt_hid_host_get_state() == BT_HID_STATE_DISCONNECTING) {
+        hid_aux_release(&aux);
+        aux_session = session;
+    }
+}
+static void aux_flush(void)
+{
+    uintptr_t irq = bflb_irq_save();
+    aux_sync_session();
+    hid_aux_flush(&aux, aux_write);
+    bflb_irq_restore(irq);
+}
+static void aux_reset(void)
+{
+    uintptr_t irq = bflb_irq_save();
+    hid_aux_reset(&aux);
+    aux_session = bt_hid_host_session();
+    kbd_ep_busy = false; /* bus reset/detach has cancelled endpoint ownership */
+    bflb_irq_restore(irq);
+}
+void usb_gamepad_release_aux(void)
+{
+    uintptr_t irq = bflb_irq_save();
+    hid_aux_release(&aux);
+    aux_session = bt_hid_host_session();
+    hid_aux_flush(&aux, aux_write);
+    bflb_irq_restore(irq);
+}
+int usb_gamepad_send_keys(enum hid_aux_source source, const uint8_t *report,
+                          uint8_t len, uint32_t session)
+{
+    if ((unsigned)source >= HID_AUX_SOURCES || !report) return -1;
+    uintptr_t irq = bflb_irq_save();
+    aux_sync_session();
+    if (session != aux_session || bt_hid_host_get_state() == BT_HID_STATE_DISCONNECTING) {
+        bflb_irq_restore(irq); return -1;
+    }
+    uint8_t keys[8] = {0};
+    memcpy(keys, report, len > 8 ? 8 : len);
+    hid_aux_keyboard(&aux, source, keys);
+    hid_aux_flush(&aux, aux_write);
+    int ret = usb_configured && kbd_registered && hid_aux_keyboard_sent(&aux) ? 0 : -1;
+    bflb_irq_restore(irq);
+    return ret;
+}
 int usb_gamepad_send_kbd_report(const uint8_t *report, uint8_t len)
 {
-    if (!usb_configured || !kbd_registered || kbd_ep_busy)
-        return -1;
-    kbd_buf[0] = 0x01; /* Report ID 1 = Keyboard */
-    uint8_t copy = (len > 8) ? 8 : len;
-    memcpy(kbd_buf + 1, report, copy);
-    if (copy < 8)
-        memset(kbd_buf + 1 + copy, 0, 8 - copy);
-    kbd_ep_busy = true;
-    kbd_ep_busy_since_us = bflb_mtimer_get_time_us();
-    int ret = usbd_ep_start_write(0, USB_KBD_EP_IN, kbd_buf, 9);
-    if (ret < 0)
-        kbd_ep_busy = false;
+    return usb_gamepad_send_keys(HID_AUX_WAKE, report, len, bt_hid_host_session());
+}
+int usb_gamepad_send_consumer_session(uint16_t bits, uint32_t session)
+{
+    uintptr_t irq = bflb_irq_save();
+    aux_sync_session();
+    if (session != aux_session || bt_hid_host_get_state() == BT_HID_STATE_DISCONNECTING) {
+        bflb_irq_restore(irq); return -1;
+    }
+    hid_aux_consumer(&aux, bits & 0xff);
+    hid_aux_flush(&aux, aux_write);
+    int ret = usb_configured && kbd_registered && aux.consumer == aux.sent_consumer ? 0 : -1;
+    bflb_irq_restore(irq);
     return ret;
 }
-
 int usb_gamepad_send_consumer_report(uint16_t bits)
 {
-    if (!usb_configured || !kbd_registered || kbd_ep_busy)
-        return -1;
-    kbd_buf[0] = 0x02; /* Report ID 2 = Consumer Control */
-    kbd_buf[1] = bits & 0xFF; /* bit0=VolUp, bit1=VolDn, bit2=Mute */
-    kbd_ep_busy = true;
-    kbd_ep_busy_since_us = bflb_mtimer_get_time_us();
-    int ret = usbd_ep_start_write(0, USB_KBD_EP_IN, kbd_buf, 2);
-    if (ret < 0)
-        kbd_ep_busy = false;
-    return ret;
+    return usb_gamepad_send_consumer_session(bits, bt_hid_host_session());
 }
-
+/* Motion is accumulated once per input, then drained by the arbiter. A zero
+ * return here means ownership transferred, not that the host has polled it. */
+int usb_gamepad_send_mouse_session(uint8_t buttons, int8_t dx, int8_t dy, int8_t wheel,
+                                   uint32_t session)
+{
+    uintptr_t irq = bflb_irq_save();
+    aux_sync_session();
+    if (session != aux_session || bt_hid_host_get_state() == BT_HID_STATE_DISCONNECTING) {
+        bflb_irq_restore(irq); return -1;
+    }
+    hid_aux_mouse(&aux, buttons, dx, dy, wheel);
+    hid_aux_flush(&aux, aux_write);
+    bflb_irq_restore(irq);
+    return 0;
+}
 int usb_gamepad_send_mouse_report(uint8_t buttons, int8_t dx, int8_t dy, int8_t wheel)
 {
-    if (!usb_configured || !kbd_registered || kbd_ep_busy)
-        return -1;
-    kbd_buf[0] = 0x03; /* Report ID 3 = Mouse */
-    kbd_buf[1] = buttons;
-    kbd_buf[2] = (uint8_t)dx;
-    kbd_buf[3] = (uint8_t)dy;
-    kbd_buf[4] = (uint8_t)wheel;
-    kbd_ep_busy = true;
-    kbd_ep_busy_since_us = bflb_mtimer_get_time_us();
-    int ret = usbd_ep_start_write(0, USB_KBD_EP_IN, kbd_buf, 5);
-    if (ret < 0)
-        kbd_ep_busy = false;
-    return ret;
+    return usb_gamepad_send_mouse_session(buttons, dx, dy, wheel, bt_hid_host_session());
 }
-
 bool usb_gamepad_kbd_ready(void)
 {
-    /* Timeout: if kbd_ep_busy has been set for >20ms without completion,
-     * the host is not reading the endpoint. Force-clear to keep reporting. */
-    if (kbd_ep_busy && kbd_ep_busy_since_us &&
-        (bflb_mtimer_get_time_us() - kbd_ep_busy_since_us) > 20000ULL) {
-        kbd_ep_busy = false;
-        kbd_ep_busy_since_us = 0;
-    }
-    return usb_configured && kbd_registered && !kbd_ep_busy;
+    uintptr_t irq = bflb_irq_save();
+    bool ready = usb_configured && kbd_registered && !kbd_ep_busy;
+    bflb_irq_restore(irq);
+    return ready;
 }
 
 /* ---------- HID class request callbacks (Feature Report forwarding) ---------- */
@@ -1396,9 +1485,9 @@ void usbd_hid_get_report(uint8_t busid, uint8_t intf, uint8_t report_id,
     }
 
     /* DualSense Feature Reports — forwarded to/from BT */
-    const uint8_t *cached;
+    uint8_t *cached = feature_resp_buf + 1;
     uint16_t cached_len;
-    bool has_cache = bt_hid_host_get_cached_feature(report_id, &cached, &cached_len);
+    bool has_cache = bt_hid_host_copy_feature(report_id, cached, FEATURE_DATA_MAX, &cached_len);
     /* DS5Dongle returns cached data immediately and refreshes mutable reports
      * in the background. Cache misses also fetch, even if a fallback is used. */
     if (!has_cache || report_id == 0x81 || report_id == 0x63 ||
@@ -1408,7 +1497,7 @@ void usbd_hid_get_report(uint8_t busid, uint8_t intf, uint8_t report_id,
         if (cached_len > FEATURE_DATA_MAX)
             cached_len = FEATURE_DATA_MAX;
         feature_resp_buf[0] = report_id;
-        memcpy(feature_resp_buf + 1, cached, cached_len);
+        /* Snapshot was copied directly into the response buffer. */
         *data = feature_resp_buf;
         *len  = 1 + cached_len;
         LOG_INF("[USB] GET_REPORT(Feature 0x%02x) → %u bytes from cache\n",
