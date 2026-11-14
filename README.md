@@ -122,7 +122,7 @@ bash build_macos.sh flash /dev/tty.usbserial-xxx
 ## Usage
 
 1. Connect the LCTech BL616 board's Type-C port to the target host (power + USB data). For serial debug, additionally connect a USB-TTL adapter (CH340/CH341, 3.3V)
-2. Put the controller in pairing mode (hold **PS + Create** for 3 seconds, light bar flashes)
+2. At startup the adapter blinks slowly and waits; press PS on a paired controller to reconnect. To pair a new controller, **double-click the adapter BOOT button** to start fast-blinking discovery, then hold **PS + Create** on the controller for 3 seconds until its light bar flashes.
 3. Watch the on-board blue LED for status (see LED table below)
 4. The host should see "DualSense Wireless Controller"
 
@@ -147,7 +147,7 @@ LCTech BL616 has a single blue LED (GPIO27); states are distinguished by blink c
 
 | Gesture | Action |
 |---------|--------|
-| **Single click** | Switch to the next paired controller (up to 8 remembered) |
+| **Single click** | Switch to the next paired controller (up to 8 remembered; no action with fewer than two, never starts pairing) |
 | **Double click** | Disconnect current controller + scan for a new one (link keys preserved) |
 | **Long press (3s)** | Clear all user settings and bonds; reboot on release after the triple flash |
 

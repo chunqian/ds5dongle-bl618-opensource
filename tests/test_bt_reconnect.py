@@ -187,9 +187,9 @@ for signature in (
     harness += "\n" + extract(SOURCE, signature) + "\n"
 harness += SOURCE[SOURCE.index("static struct bt_l2cap_server l2cap_hid_ctrl_server ="):
                   SOURCE.index("/* ---------- SDP Service Record")]
-start = MAIN.index('    LOG_INF("[BT_TASK] Startup inquiry')
+start = MAIN.index('    LOG_INF("[BT_TASK] led OK')
 end = MAIN.index('    LOG_INF("[BT_TASK] Entering main loop', start)
-harness += "\nstatic void startup(void) { int err=0;\n" + MAIN[start:end] + "\n}\n"
+harness += "\nstatic void startup(void) {\n" + MAIN[start:end] + "\n}\n"
 # The main loop must not invoke a hidden reverse-connect/periodic-inquiry path.
 assert "bt_hid_host_poll_incoming_l2cap_fallback" not in MAIN
 assert "bt_hid_host_force_disconnect" not in MAIN
@@ -229,15 +229,14 @@ static void reverse_scan_request(void) { request_scan_mode(false); }
 int main(void) {
     assert(l2cap_hid_ctrl_server.sec_level==BT_SECURITY_L2 &&
            l2cap_hid_intr_server.sec_level==BT_SECURITY_L2);
-    /* One startup inquiry, with or without a remembered peer; no blocking wait. */
+    /* Startup preserves remembered peers and never initiates discovery. */
     for (unsigned saved=0; saved<2; ++saved) {
         setup(); hid_ctx.conn=NULL; hid_ctx.state=BT_HID_STATE_IDLE;
         hid_ctx.has_target=saved; startup();
-        assert(scan_calls==1 && !delays && !pages && hid_ctx.discovery_active);
-        discovery_complete(discovery_results,0);
-        assert(hid_ctx.state==BT_HID_STATE_IDLE && !hid_ctx.discovery_active);
+        assert(!scan_calls && !delays && !pages && !hid_ctx.discovery_active);
+        assert(hid_ctx.state==BT_HID_STATE_IDLE && hid_ctx.has_target==saved);
         assert(!bt_hid_host_poll_scan_early() && !bt_hid_host_poll_connect());
-        assert(scan_calls==1); /* No repeated inquiry after an empty result. */
+        assert(!scan_calls); /* Waiting must not start periodic discovery. */
     }
 
     /* Peripheral without the extra Gamepad bit is now accepted by both paths. */
@@ -285,9 +284,9 @@ int main(void) {
     assert(!bt_hid_host_poll_scan_early() && hid_ctx.connect_pending);
     assert(bt_hid_host_poll_connect() && pages==1);
 
-    /* Startup can also race incoming ACL; stop the inquiry from the task. */
+    /* Manual inquiry can race incoming ACL; stop it from the task. */
     setup(); hid_ctx.conn=NULL; hid_ctx.state=BT_HID_STATE_IDLE;
-    incoming_during_start=true; startup();
+    incoming_during_start=true; assert(bt_hid_host_scan_start(0)==0);
     assert(hid_ctx.conn==&current && hid_ctx.discovery_active && !stops);
     assert(!bt_hid_host_poll_scan_early() && stops==1 && !hid_ctx.discovery_active);
     assert(!pages && hid_ctx.security_pending);
@@ -344,7 +343,8 @@ int main(void) {
     assert(!channel_count && !handshakes);
 
     setup(); hid_ctx.conn=NULL; hid_ctx.state=BT_HID_STATE_IDLE; scan_error=-EIO;
-    startup(); assert(!hid_ctx.discovery_active && hid_ctx.state==BT_HID_STATE_IDLE);
+    assert(bt_hid_host_scan_start(0)==-EIO);
+    assert(!hid_ctx.discovery_active && hid_ctx.state==BT_HID_STATE_IDLE);
     assert(!bt_hid_host_poll_connect() && !pages);
 
     /* Both inquiry paths must allow B after A was saved, without clearing A. */
@@ -551,7 +551,7 @@ int main(void) {
     for(unsigned i=0;i<5;i++) { assert(bt_hid_host_poll_security()); tick+=100; }
     assert(bt_hid_host_poll_security() && hid_ctx.disconnect_requested && !disconnects);
     bt_hid_host_poll_control(); assert(disconnects==1 && current.refs==2);
-    puts("PASS: startup inquiry, Peripheral filtering, cancel barriers/races, isolated retries, ordered encrypted HID, passive reconnect and teardown");
+    puts("PASS: passive startup, manual inquiry, Peripheral filtering, cancel barriers/races, isolated retries, ordered encrypted HID, passive reconnect and teardown");
 }
 '''
 with tempfile.TemporaryDirectory(prefix="ds5-reconnect-") as directory:

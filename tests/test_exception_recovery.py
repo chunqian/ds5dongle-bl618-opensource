@@ -157,7 +157,7 @@ static int init_result,cfg;
 static int bt_hid_host_init(int *p) { assert(p==&cfg); return init_result; }
 static void GLB_Set_USB_CLK_From_WIFIPLL(int on) { assert(on && !bt_init_done); clocks++; }
 static void led_status_set(unsigned value) { led=value; }
-static void bt_hid_host_scan_start(unsigned n) { assert(!n && !bt_init_failed); scans++; }
+void bt_hid_host_scan_start(unsigned n) { assert(!n && !bt_init_failed); scans++; }
 static void start(void) {
 '''
 a=main.index('    int err = bt_hid_host_init(&cfg);');b=main.index('    LOG_INF("[BT_TASK] Entering main loop',a)
@@ -165,7 +165,7 @@ startup+=main[a:b]+r'''
 }
 int main(void) {
  init_result=-1; start(); assert(bt_init_failed && bt_init_done && clocks==1 && !scans && led==LED_RED_BLINK);
- bt_init_done=false; init_result=0; start(); assert(!bt_init_failed && bt_init_done && clocks==2 && scans==1 && led==LED_PURPLE_BLINK_SLOW);
+ bt_init_done=false; init_result=0; start(); assert(!bt_init_failed && bt_init_done && clocks==2 && !scans && led==LED_PURPLE_BLINK_SLOW);
  puts("PASS: failed BT initialization releases USB clock/wait without inquiry or partial SDK retry");
 }
 '''

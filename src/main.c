@@ -406,7 +406,7 @@ static void process_button_events(void)
         }
         if (event == BOOT_BUTTON_SINGLE && bt_hid_host_get_bonded_count() > 1) {
             bt_hid_host_switch_next();
-        } else if (event == BOOT_BUTTON_SINGLE || event == BOOT_BUTTON_DOUBLE) {
+        } else if (event == BOOT_BUTTON_DOUBLE) {
             if (ds5_connected) {
                 scan_after_disconnect = true;
                 bt_hid_host_disconnect();
@@ -450,11 +450,9 @@ static void bt_task(void *arg)
     led_status_set(err ? LED_RED_BLINK : LED_PURPLE_BLINK_SLOW);
     LOG_INF("[BT_TASK] led OK\n");
 
-    /* DS5Dongle performs one startup inquiry, including with saved bonds.
-     * Page scan remains enabled so a paired controller may reconnect first.
-     * Enter the task loop immediately to process authentication and HID. */
-    LOG_INF("[BT_TASK] Startup inquiry\n");
-    if (!err) bt_hid_host_scan_start(0);
+    /* Wait for paired controllers to reconnect through the page scan enabled
+     * by bt_hid_host_init(). New pairing inquiry requires a BOOT double click. */
+    LOG_INF("[BT_TASK] Waiting for controller; double-click BOOT to pair\n");
     LOG_INF("[BT_TASK] Entering main loop\n");
 
     uint8_t output_wake;
