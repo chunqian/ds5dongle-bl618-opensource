@@ -1,6 +1,6 @@
 """Exercise launchers with a fake flasher; never opens or writes a real device.
 
-python3 tools/easy_flash/test_package.py --package build/easy_flash/DS5Dongle-LCTech616-HS-HidAudio-R5-Flash-Windows --pwsh /path/to/pwsh
+python3 tools/easy_flash/test_package.py --package build/easy_flash/DS5Dongle-LCTech616-HS-HidAudio-R6-Flash-Windows --pwsh /path/to/pwsh
 PowerShell on macOS validates script logic, not Windows drivers/native flashing.
 """
 from pathlib import Path

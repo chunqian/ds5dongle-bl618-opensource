@@ -26,7 +26,7 @@
 #include "queue.h"
 
 /* Retained for startup identification and firmware-package verification. */
-#define FIRMWARE_VERSION "LCT616-DS5 3.18H-HidAudio-R5"
+#define FIRMWARE_VERSION "LCT616-DS5 3.18H-HidAudio-R6"
 
 #define USBD_MAX_POWER      250
 #define USBD_LANGID         0x0409

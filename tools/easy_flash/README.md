@@ -1,11 +1,11 @@
 # LCTech BL616 简易烧录包
 
-为已编译并通过离线测试的 `3.18H-HidAudio-R5` HS 固件生成两个独立离线 ZIP，运行文件按平台隔离：
+为已编译并通过离线测试的 `3.18H-HidAudio-R6` HS 固件生成两个独立离线 ZIP，运行文件按平台隔离：
 
 | 包 | 启动入口 | 内置程序 |
 | --- | --- | --- |
-| `DS5Dongle-LCTech616-HS-HidAudio-R5-Flash-Windows.zip` | `Flash-Windows.bat` | Windows x64 |
-| `DS5Dongle-LCTech616-HS-HidAudio-R5-Flash-Mac.zip` | `Flash-Mac.command` | macOS ARM64、Intel x86_64 |
+| `DS5Dongle-LCTech616-HS-HidAudio-R6-Flash-Windows.zip` | `Flash-Windows.bat` | Windows x64 |
+| `DS5Dongle-LCTech616-HS-HidAudio-R6-Flash-Mac.zip` | `Flash-Mac.command` | macOS ARM64、Intel x86_64 |
 
 用户完整解压对应 ZIP，按住 BOOT 插入设备，双击启动器并按回车，
 即可自动选择下载端口、烧录和校验。每包附本平台使用说明、固件、校验清单和源码。
@@ -89,7 +89,7 @@ Windows 保留 SDK 原厂 1.4.2 程序；Intel Mac 与 Apple 芯片均使用开�
 脚本从固定 SDK 提交读取原厂程序及配置；Git 部分克隆缺少对象时，首次生成可能需要联网。既有芯片运行日志、
 生成的 Flash 镜像和本地 loader 配置不会被复制。
 
-脚本固定校验 R5 固件 SHA-256（尚未实机烧录验证），避免把普通版或错误版本误装进包。
+脚本固定校验 R6 固件 SHA-256（尚未实机烧录验证），避免把普通版或错误版本误装进包。
 新固件发布时须明确更新 `VERSION`、`FIRMWARE_SHA`、`NAME` 和使用说明，并重新验证；使用说明的固件版本由打包器自动填充。
 默认要求固件源码已提交。若需要打包未提交的改动，可显式传 `--snapshot-worktree`：
 使用临时 Git 索引收集已跟踪文件改动，以及 src/lib/tests/tools/easy_flash 下未忽略的新文件，
@@ -111,7 +111,7 @@ App 启动器源码和 `Sign-Mac.command`。签名机器只需 Xcode Command Lin
 
 ```sh
 python3 tools/easy_flash/build_signing_kit.py \
-  --package build/easy_flash/DS5Dongle-LCTech616-HS-HidAudio-R5-Flash-Mac
+  --package build/easy_flash/DS5Dongle-LCTech616-HS-HidAudio-R6-Flash-Mac
 ```
 
 把 `*-Mac-Signing-Kit.zip` 完整解压到另一台 Mac，双击 `Sign-Mac.command`。
@@ -126,7 +126,7 @@ App 会在 Terminal 中启动烧录流程，日志放在 `~/Library/Logs/DS5Dong
 
 ```sh
 python3 tools/easy_flash/test_sign_macos.py \
-  --package build/easy_flash/DS5Dongle-LCTech616-HS-HidAudio-R5-Flash-Mac
+  --package build/easy_flash/DS5Dongle-LCTech616-HS-HidAudio-R6-Flash-Mac
 ```
 
 ## 检查
@@ -134,9 +134,9 @@ python3 tools/easy_flash/test_sign_macos.py \
 ```sh
 bash -n tools/easy_flash/*.sh tools/easy_flash/Flash-Mac.command
 python3 tools/easy_flash/test_package.py \
-  --package build/easy_flash/DS5Dongle-LCTech616-HS-HidAudio-R5-Flash-Mac
+  --package build/easy_flash/DS5Dongle-LCTech616-HS-HidAudio-R6-Flash-Mac
 python3 tools/easy_flash/test_package.py \
-  --package build/easy_flash/DS5Dongle-LCTech616-HS-HidAudio-R5-Flash-Windows \
+  --package build/easy_flash/DS5Dongle-LCTech616-HS-HidAudio-R6-Flash-Windows \
   --pwsh /path/to/pwsh
 ```
 

@@ -16,9 +16,9 @@ import zipfile
 REPO = Path(__file__).resolve().parents[2]
 TEMPLATES = Path(__file__).resolve().parent
 SDK_COMMIT = "b3532953322194233f80436701e7fb6bb4ad8275"
-FIRMWARE_SHA = "0f0452accc29497ebdc7b7a24f73281a0fb678388bea161652280d3511a7524c"
-VERSION = "LCT616-DS5 3.18H-HidAudio-R5"
-NAME = "DS5Dongle-LCTech616-HS-HidAudio-R5-Flash"
+FIRMWARE_SHA = "bd7903cec8d0456c567bb4696de1e1c5b9f7c071847c283e7b56df857b635496"
+VERSION = "LCT616-DS5 3.18H-HidAudio-R6"
+NAME = "DS5Dongle-LCTech616-HS-HidAudio-R6-Flash"
 
 PLATFORMS = {
     "windows": {
@@ -215,7 +215,7 @@ def main():
     platforms = ("windows", "macos") if args.platform == "both" else (args.platform,)
     firmware = args.firmware_dir / "ds5dongle-lctech616-hs.bin"
     if sha(firmware) != FIRMWARE_SHA or VERSION.encode() not in firmware.read_bytes():
-        raise SystemExit("Expected the pinned R5 HS binary; update version/hash deliberately for a new release.")
+        raise SystemExit("Expected the pinned R6 HS binary; update version/hash deliberately for a new release.")
     revision, source_tree = source_snapshot(args.snapshot_worktree)
     if VERSION.encode() not in git(REPO, "show", source_tree + ":src/usb_gamepad.c"):
         raise SystemExit("Source snapshot firmware version differs from the packaged binary.")

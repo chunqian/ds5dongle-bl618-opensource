@@ -99,7 +99,7 @@ build_windows.bat flash COM5   rem 串口烧录
 
 已有固件可制作 **macOS 和 Windows 两个独立简易离线烧录包**：完整解压后双击对应启动器，
 按住 BOOT 插入设备，再按回车即可自动查找端口、烧录和校验，无需安装 SDK 或 Python。
-当前包针对 LCTech BL616 的 `3.18H-HidAudio-R5` HS 固件；Windows 包面向 x64，macOS 包自动选择 Apple 芯片 / Intel 原生程序，无需 Rosetta。
+当前包针对 LCTech BL616 的 `3.18H-HidAudio-R6` HS 固件；Windows 包面向 x64，macOS 包自动选择 Apple 芯片 / Intel 原生程序，无需 Rosetta。
 使用与打包说明见 [tools/easy_flash/README.md](tools/easy_flash/README.md)。
 macOS 另提供可复制到另一台 Mac 的 Developer ID 签名、公证工具包，步骤见 [SIGNING.txt](tools/easy_flash/SIGNING.txt)。
 
