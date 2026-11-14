@@ -37,7 +37,6 @@ void usb_gamepad_set_suspend_hooks(void (*on_suspend)(void),
 void usb_gamepad_set_polling_rate(uint8_t mode);
 
 void usb_gamepad_set_dse_mode(bool dse);
-void usb_gamepad_request_config_save(void);
 
 void usb_gamepad_process_deferred(void);
 

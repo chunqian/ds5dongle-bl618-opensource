@@ -275,17 +275,4 @@ bool bt_hid_host_poll_sdp(void);
  */
 bool bt_hid_host_poll_security_ready(void);
 
-/**
- * Read RSSI from the connected device via HCI.
- * Must be called from task context (uses bt_hci_cmd_send_sync).
- * @return 0 on success, negative on error
- */
-int bt_hid_host_read_rssi(int8_t *rssi);
-
-/**
- * Get the last cached RSSI value (safe to call from ISR context).
- * @return last RSSI in dBm, or 0 if not available
- */
-int8_t bt_hid_host_get_cached_rssi(void);
-
 #endif /* BT_HID_HOST_H */

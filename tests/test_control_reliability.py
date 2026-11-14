@@ -182,7 +182,7 @@ int main(void) {
     assert(state_mgr_volume_snapshot(out,63,&b) && b!=a && (out[9]&0x60)==0x60);
     state_mgr_vol_ack(b); assert(!state_mgr_vol_dirty());
     state_mgr_set_volume(46,56); state_mgr_volume_snapshot(out,63,&a);
-    state_mgr_init(initial,47); state_mgr_restore_config_volume(); state_mgr_vol_ack(a);
+    state_mgr_init(initial,47); state_mgr_set_volume(cfg.speaker_volume,cfg.headset_volume); state_mgr_vol_ack(a);
     assert(state_mgr_volume_snapshot(out,63,&b) && out[4]==56 && out[5]==46);
     masked=1; state_mgr_vol_ack(b); assert(masked==1); masked=0;
     puts("PASS: Edge command failures/real responses/refetch/session reset, deferred SET retry/order/overflow/EP0 errors and versioned volume ACK");

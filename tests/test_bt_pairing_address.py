@@ -67,7 +67,7 @@ static struct {
 } hid_ctx;
 #define BT_HCI_ERR_REMOTE_USER_TERM_CONN 0x13
 #define BT_ADDR_STR_LEN 18
-static int blacklist_count, cached_rssi;
+static int blacklist_count;
 static bool switch_pending, first_intr_logged, first_output_logged, clear_bonds_pending;
 static void clear_bond_storage(void);
 void bt_hid_host_disconnect(void);

@@ -5,7 +5,7 @@
 #include <string.h>
 #define STORE_MAX_BYTES 128
 static const char *const keys[STORE_COUNT] = {
-    "dongle_cfg", "detected_type", "btn_remap", "btn_remap_1", "remap_prof"
+    "detected_type", "remap_prof"
 };
 static struct {
     uint8_t data[STORE_MAX_BYTES];

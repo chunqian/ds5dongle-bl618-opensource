@@ -38,7 +38,6 @@ static uint8_t last_output[142];
 static int bt_hid_host_send_output_reliable_session(const uint8_t *data, uint16_t len, uint32_t session) {
     assert(session==7 && len==142); memcpy(last_output,data,len); ++output_count; return 0;
 }
-static bool usb_audio_is_active(void) { return false; }
 '''
 production += extract(main, 'static const uint8_t init_set_state[') + ';\n'
 for name in ('build_bt_output_ext', 'send_led_primer', 'on_hid_primer'):

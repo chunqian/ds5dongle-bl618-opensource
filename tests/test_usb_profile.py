@@ -70,6 +70,21 @@ for signature in (
     harness += function(signature)
 harness += r'''
 static unsigned u16(const uint8_t *p) { return p[0] | (p[1]<<8); }
+static void check_private_reports(void) {
+    unsigned ids[256]={0};
+    const uint8_t *r=hid_intf.hid_report_descriptor;
+    unsigned n=hid_intf.hid_report_descriptor_len;
+    for (unsigned i=0;i<n;) {
+        uint8_t tag=r[i++];
+        assert(tag && tag!=0xfe); /* no implicit zero padding or long items */
+        unsigned size=tag&3; if(size==3) size=4;
+        assert(i+size<=n);
+        if(tag==0x85) { assert(size==1); ids[r[i]]++; }
+        i+=size;
+    }
+    for(unsigned id=0xf6;id<256;id++)
+        assert(ids[id]==(unsigned)(id==0xf6 || id==0xf9));
+}
 static void check_descriptors(bool edge, bool with_audio, bool wake, unsigned poll) {
     const uint8_t *dev=desc_device_cb(0), *desc=desc_config_cb(0);
     assert(u16(dev+10)==(edge?0x0df2:0x0ce6));
@@ -97,6 +112,7 @@ static void check_descriptors(bool edge, bool with_audio, bool wake, unsigned po
     }
     assert(seen==expected && hid_count==1);
     assert(audio_visible==with_audio);
+    check_private_reports();
 }
 int main(void) {
     memcpy(config_desc+AUDIO_DESC_OFFSET, audio_desc, sizeof(audio_desc));

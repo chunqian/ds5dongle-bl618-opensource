@@ -169,14 +169,14 @@ LCTech BL616 为单颗蓝色 LED（GPIO27），不同状态以闪烁节奏区分
 - 完整输出透传：震动、RGB 灯条、玩家指示灯、自适应扳机
 - 双向音频透传：UAC1 4ch 48kHz OUT → Opus 编码 → BT 0x39 双帧报告（547B，扬声器/耳机）；BT 麦克风 Opus → 解码 → UAC1 2ch 48kHz IN
 - HD 触觉反馈：USB Audio Ch2/Ch3 → 16:1 降采样 → BT 0x92 触觉 tag
-- DualSense Edge 完整支持：自动识别 → unlock 握手 → profile 预取 → 437B 描述符，PID 自动切换（0DF2）
+- DualSense Edge 完整支持：自动识别 → unlock 握手 → profile 预取 → 421B 描述符，PID 自动切换（0DF2）
 - 多手柄记忆：最多记忆 8 个已配对手柄，单击按键快速切换
 - 手柄主动回连：L2CAP 服务端注册（被动模式）
 - 稳健重连：周期性扫描重试（~30s）、连接看门狗（3s 无输入检测）、链路监督超时（5s）、陈旧 ACL 清理的系统复位兜底
 - 空闲超时：可配置 0–60 分钟自动断开（默认 30 分钟）
 - 仅呈现手柄 HID：不提供辅助键盘、鼠标、音量键、PS 键盘快捷键或 F15 模拟唤醒
 - 轮询率可配置：250Hz / 500Hz / 实时档（~750Hz，跟随 BT 报告率）
-- 按键映射：可将手柄任意按键重映射为其他手柄按键（Feature Report 0xFB）
+- 按键映射：可将手柄任意按键重映射为其他手柄按键（加载已有 Flash 映射）
 - MuteLight：通过手柄静音键开关麦克风指示灯
 - USB 远程唤醒：仅发送远程唤醒信号；挂起 3 秒后请求手柄关机
 - USB 隐身模式：可配置为手柄连接前不枚举 USB 设备
@@ -198,7 +198,7 @@ LCTech BL616 为单颗蓝色 LED（GPIO27），不同状态以闪烁节奏区分
 
 ### 手柄功能兼容性
 
-USB 端提供 DualSense 兼容的 HID 描述符（DS 与 Edge 自动切换；标准有线布局 + dongle 配置 Feature Report 0xF6–0xF9 / 0xFB），主机将其视为有线手柄。
+USB 端提供 DualSense 兼容的 HID 描述符（DS 与 Edge 自动切换；标准有线布局 + DAUD 声卡控制 Feature Report 0xF6 / 0xF9），主机将其视为有线手柄。
 
 | 功能 | 数据路径 | 支持 |
 |------|----------|------|
@@ -217,7 +217,7 @@ USB 端提供 DualSense 兼容的 HID 描述符（DS 与 Edge 自动切换；标
 
 ## 配置项
 
-配置通过 `bt_settings` 持久化，经 USB Feature Report 0xF6–0xF9 读写，可通过网页免重编译修改（见"网页配置"）。主要配置项（默认值）：
+网页配置及其 HID 读写接口已移除。固件使用源码默认值，并兼容加载已有 Flash 设置；长按 BOOT 3 秒可清除全部设置。修改默认参数需要重新编译。主要配置项（默认值）：
 
 | 配置项 | 默认值 |
 |--------|--------|
@@ -246,7 +246,7 @@ src/
 ├── audio.c/h           音频处理管线（sinc 重采样 + Opus 编解码 + 触觉 + 麦克风）
 ├── usb_wake.c/h        USB 远程唤醒 FSM
 ├── state_mgr.c/h       SetStateData 条件合并管理器
-├── config.c/h          配置系统（bt_settings + 0xF6-0xF9）
+├── config.c/h          默认值与旧 Flash 配置加载（bt_settings）
 ├── dse.c/h             DualSense Edge Profile 管理
 ├── remap.c/h           按键映射
 ├── led_status.c/h      LED 状态指示（LCTech 单蓝灯）
@@ -278,7 +278,7 @@ firmware/               板级烧录配置 + 本地编译产物（二进制已 g
 - **音频输入（手柄 → 主机）**：BT 0x31 麦克风 Opus 帧 → 队列 → Opus 解码（48kHz 单声道）→ 单声道转立体声 → 环形缓冲 → USB Audio ISO IN（2ch 48kHz）
 - **Feature（双向）**：GET_REPORT 从 BT 侧缓存返回（DSE profile 支持 NAK gating）| SET_REPORT 附加 CRC32 后经 L2CAP 控制通道转发
 
-## 网页配置
+## USB 声卡控制
 
 ### 本地 HidAudio 固件：由 Mac 应用开启声卡
 
@@ -304,14 +304,14 @@ Mac 应用需要重新发送命令。关闭声卡时音频驱动的 HD 震动和
 枚举，手柄重连后会重新发送麦克风启停指令，发送失败继续重试。USB reset、拔插和
 HID 关闭声卡仍撤销接口状态。编码器及其帧缓存只由音频任务重置，过期会话的数据不再提交。
 
-Auto 模式的手柄类型使用独立的 `detected_type` 记录，不再自动保存整份用户配置。
-普通设置在收到 `0xF6/0x02` 保存命令时复制快照；重映射写入、重置和档位选择命令也
-分别排队，由任务写 Flash，失败后间隔一秒重试。连续修改两个重映射档位不会相互覆盖
-待保存请求。`0xF9` 音频活动标志同时考虑连接状态及扬声器／麦克风禁用设置。
+Auto 模式的手柄类型使用独立的 `detected_type` 记录。手柄类型记忆和手柄按键选择的
+重映射档位由任务写入 Flash，失败后间隔一秒重试，不会保存整份用户配置。
+网页参数读写、保存、重枚举、版本与遥测查询、重映射编辑接口均已删除。
+仅保留 CR 使用的 DAUD 声卡控制协议；原生手柄 HID 输入、输出和 Feature 透传仍然保留。
 
 协议（下列偏移均包含 Report ID）：
 
-- `GET_FEATURE 0xF9`：原有前 14 字节保持不变；字节 14–17 为 ASCII `DAUD`，
+- `GET_FEATURE 0xF9`：字节 0 为 `F9`，字节 1–13 保留并置零；字节 14–17 为 ASCII `DAUD`，
   字节 18 为协议版本 `1`，字节 19 为当前声卡可见状态，20 为请求状态，21 为待切换状态。
 - `SET_FEATURE 0xF6`：发送 `F6 04 44 41 55 44 01 XX` 并补零到 64 字节；
   `XX=01` 开启，`XX=00` 关闭。主机必须先检查上述专用标记，不能仅凭 Sony VID/PID
@@ -329,8 +329,6 @@ python3 tests/test_usb_audio_reconnect.py
 python3 tests/test_audio_lifecycle.py
 python3 tests/test_config_persistence.py
 ```
-
-配套的网页配置工具出于维护早期用户利益考虑，**不开源**。当前网页地址：[ps5.ds5678.top](https://ps5.ds5678.top)。开源固件仍可通过网页调整各项配置（USB Feature Report 0xF6–0xF9 / 0xFB），但**本开源版本不支持在线 OTA**。有一定动手能力的开发者可以自行实现自己的网页配置页——结合 AI 辅助，实现起来非常简单。
 
 ## 致谢
 
@@ -354,5 +352,5 @@ python3 tests/test_config_persistence.py
 
 辅助 HID 功能已移除。旧配置中的键盘／鼠标映射恢复为对应的原手柄按键，
 触摸板鼠标模式关闭；普通手柄按键重映射和触摸板方向映射仍可使用。
-旧版网页的 PS 快捷键、键鼠映射和鼠标模式选项不会生效。配置数据长度和字段偏移保持兼容。
+配置数据长度和字段偏移保持兼容，以便加载旧 Flash 设置。
 唤醒不再发送 F15，依赖模拟键盘按键的主机唤醒行为需要重新实测。

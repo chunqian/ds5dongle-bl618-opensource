@@ -50,11 +50,6 @@ void audio_mic_feed(const uint8_t *opus_data, uint16_t len);
 void audio_set_mic_active(bool active);
 
 /**
- * Check if mic streaming is active.
- */
-bool audio_mic_active(void);
-
-/**
  * Mic decode task entry point (FreeRTOS).
  * Blocks on mic_queue, decodes Opus frames, writes to USB mic ring buffer.
  * Must run at lower priority than audio_task to avoid blocking speaker path.

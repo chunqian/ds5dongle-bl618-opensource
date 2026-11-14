@@ -10,7 +10,6 @@
 #include "config.h"
 #include "deferred_store.h"
 #include "state_mgr.h"
-#include "remap.h"
 #include "usbd_core.h"
 #include "usbd_hid.h"
 #include "bl616_glb.h"
@@ -19,12 +18,14 @@
 #include "bflb_mtimer.h"
 #include "board.h"
 #include <string.h>
+#include <stdio.h>
 #include "board_config.h"
 #include "debug_log.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
 
+/* Retained for startup identification and firmware-package verification. */
 #define FIRMWARE_VERSION "LCT616-DS5 3.18H-HidAudio-R5"
 
 #define USBD_MAX_POWER      250
@@ -34,8 +35,8 @@
 #define USB_HID_ONLY_SIZE (9 + 9 + 7)
 #define USB_AUDIO_DESC_SIZE 186
 #define USB_HID_CONFIG_SIZE (9 + USB_AUDIO_DESC_SIZE + USB_HID_ONLY_SIZE)
-#define HID_REPORT_DESC_SIZE_DS  329
-#define HID_REPORT_DESC_SIZE_DSE 445
+#define HID_REPORT_DESC_SIZE_DS  305
+#define HID_REPORT_DESC_SIZE_DSE 421
 
 static bool current_dse_mode = false;
 static bool requested_dse_mode, usb_initialized;
@@ -49,8 +50,6 @@ static void request_usb_profile(void);
 
 static struct usb_audio_control audio_control;
 
-static volatile bool usb_reset_pending = false;
-static uint8_t remap_read_profile = 0;
 static bool first_usb_send_logged = false;
 
 #define SET_REPORT_MAX_DATA    64
@@ -78,13 +77,13 @@ static int gamepad_class_request(uint8_t busid, struct usb_setup_packet *setup,
     if (feature_set_rejected) return -1;
     if (setup->bRequest == HID_REQUEST_GET_REPORT &&
         (setup->wValue >> 8) == 3 &&
-        dse_is_profile_report(setup->wValue & 0xff) && *len == 0)
-        return -1; /* No fabricated empty profile when the snapshot is absent. */
+        (dse_is_profile_report(setup->wValue & 0xff) ||
+         (setup->wValue & 0xff) >= 0xF6) && *len == 0)
+        return -1; /* Unavailable profiles and unsupported private reads stall. */
     return result;
 }
 
-
-/* DualSense USB HID Report Descriptor (321 bytes) */
+/* DualSense USB HID Report Descriptor (305 bytes) */
 static const uint8_t hid_report_desc_ds[HID_REPORT_DESC_SIZE_DS] = {
     0x05, 0x01,       /* Usage Page (Generic Desktop Ctrls) */
     0x09, 0x05,       /* Usage (Game Pad) */
@@ -237,27 +236,15 @@ static const uint8_t hid_report_desc_ds[HID_REPORT_DESC_SIZE_DS] = {
     0x09, 0x37,
     0x95, 0x3F,
     0xB1, 0x02,
-    0x85, 0xF7,       /*   Report ID (247) */
-    0x09, 0x38,
-    0x95, 0x3F,
-    0xB1, 0x02,
-    0x85, 0xF8,       /*   Report ID (248) */
-    0x09, 0x39,
-    0x95, 0x3F,
-    0xB1, 0x02,
     0x85, 0xF9,       /*   Report ID (249) */
     0x09, 0x3A,
     0x95, 0x3F,
-    0xB1, 0x02,
-    0x85, 0xFB,       /*   Report ID (251) — button remap table */
-    0x09, 0x3C,
-    0x95, 0x7F,       /*   Report Count (127) — 31 entries * 4 + header */
     0xB1, 0x02,
 
     0xC0,             /* End Collection */
 };
 
-/* DualSense Edge USB HID Report Descriptor (437 bytes)
+/* DualSense Edge USB HID Report Descriptor (421 bytes)
  * Differences from DS: Output 0x02 count 63 (vs 47), Feature 0xF2 count 52
  * (vs 15), plus DSE-specific Feature Reports 0x60-0x65, 0x68, 0x70-0x7B. */
 static const uint8_t hid_report_desc_dse[HID_REPORT_DESC_SIZE_DSE] = {
@@ -321,12 +308,9 @@ static const uint8_t hid_report_desc_dse[HID_REPORT_DESC_SIZE_DSE] = {
     0x85, 0x79, 0x09, 0x51, 0xB1, 0x02,
     0x85, 0x7A, 0x09, 0x52, 0xB1, 0x02,
     0x85, 0x7B, 0x09, 0x53, 0xB1, 0x02,
-    /* Dongle config Feature Reports (shared) */
+    /* Private DAUD audio control/status reports (shared with CR). */
     0x85, 0xF6, 0x09, 0x37, 0x95, 0x3F, 0xB1, 0x02,
-    0x85, 0xF7, 0x09, 0x38, 0x95, 0x3F, 0xB1, 0x02,
-    0x85, 0xF8, 0x09, 0x39, 0x95, 0x3F, 0xB1, 0x02,
     0x85, 0xF9, 0x09, 0x3A, 0x95, 0x3F, 0xB1, 0x02,
-    0x85, 0xFB, 0x09, 0x3C, 0x95, 0x7F, 0xB1, 0x02,  /* button remap table (127B) */
     0xC0,
 };
 
@@ -519,9 +503,6 @@ static const struct usb_descriptor usb_desc = {
     .device_quality_descriptor_callback  = desc_qualifier_cb,
     .other_speed_descriptor_callback     = desc_other_speed_cb,
     .string_descriptor_callback          = desc_string_cb,
-    .msosv1_descriptor                   = NULL,
-    .msosv2_descriptor                   = NULL,
-    .webusb_url_descriptor               = NULL,
     .bos_descriptor                      = NULL,
 };
 
@@ -789,11 +770,6 @@ void usb_gamepad_set_dse_mode(bool dse)
     taskEXIT_CRITICAL();
 }
 
-void usb_gamepad_request_config_save(void)
-{
-    config_request_save();
-}
-
 /* One consumer. Peek keeps failed work ahead of later writes; the USB ISR
  * may append but never removes/reorders it. Bound each task pass. */
 void usb_gamepad_process_feature_sets(void)
@@ -837,7 +813,7 @@ void usb_gamepad_process_deferred(void)
         usb_profile_pending = false;
         if (!usb_wake_host_suspended()) usb_soft_connect();
     }
-    bool profile_change = (usb_profile_pending || usb_reset_pending) &&
+    bool profile_change = usb_profile_pending &&
                           !usb_wake_host_suspended() && now >= usb_profile_request_us &&
                           now - usb_profile_request_us >= 100000ULL &&
                           (!audio_control.pending || usb_audio_control_ready(&audio_control, now));
@@ -848,7 +824,6 @@ void usb_gamepad_process_deferred(void)
                    (change ? audio_control.requested : (profile_change && audio_control.visible));
     uint32_t generation = audio_control.generation;
     if (change || expired || profile_change) {
-        usb_reset_pending = false;
         usb_reenumerating = true;
         usb_soft_disconnect();
         usb_configured = false;
@@ -878,7 +853,6 @@ void usb_gamepad_process_deferred(void)
 
     deferred_store_process();
 
-
     usb_audio_poll();
 
     /* Recover a failed queue attempt even when the controller stops sending. */
@@ -887,6 +861,7 @@ void usb_gamepad_process_deferred(void)
 
 int usb_gamepad_init(usb_gamepad_output_cb_t output_cb)
 {
+    printf("[USB] Firmware: %s\n", FIRMWARE_VERSION);
     output_callback = output_cb;
     memset(usb_in_buf, 0, sizeof(usb_in_buf));
 
@@ -928,7 +903,6 @@ int usb_gamepad_init(usb_gamepad_output_cb_t output_cb)
     hid_ep_in.ep_addr = USB_GAMEPAD_EP_IN;
     hid_ep_in.ep_cb = hid_ep_in_handler;
     usbd_add_endpoint(0, &hid_ep_in);
-
 
     /* Read registers BEFORE usbd_initialize */
     {
@@ -1057,16 +1031,10 @@ bool usb_gamepad_is_ready(void)
     return usb_configured && !ep_in_busy;
 }
 
-
 /* ---------- HID class request callbacks (Feature Report forwarding) ---------- */
 
 /* +1 for Report ID prefix required by CherryUSB */
 static uint8_t feature_resp_buf[FEATURE_DATA_MAX + 1];
-
-static bool is_dongle_cmd(uint8_t report_id)
-{
-    return (report_id >= 0xF6 && report_id <= 0xF9) || report_id == 0xFB;
-}
 
 /*
  * Static fallback for DualSense feature reports 0x09/0x20/0x05.
@@ -1161,73 +1129,17 @@ void usbd_hid_get_report(uint8_t busid, uint8_t intf, uint8_t report_id,
         return;
     }
 
-    /* Dongle config reports 0xF6-0xF9 */
-    if (is_dongle_cmd(report_id)) {
-        feature_resp_buf[0] = report_id;
-
-        if (report_id == 0xF7) {
-            struct config_body snapshot;
-            config_snapshot(&snapshot);
-            const struct config_body *cfg = &snapshot;
-            uint16_t cfg_len = sizeof(struct config_body);
-            if (cfg_len > FEATURE_DATA_MAX)
-                cfg_len = FEATURE_DATA_MAX;
-            memcpy(feature_resp_buf + 1, cfg, cfg_len);
-            *data = feature_resp_buf;
-            *len  = 1 + cfg_len;
-            LOG_INF("[USB] GET_REPORT(0xF7) → config %u bytes\n", cfg_len);
-        } else if (report_id == 0xF8) {
-            uint16_t ver_len = strlen(FIRMWARE_VERSION);
-            if (ver_len > FEATURE_DATA_MAX)
-                ver_len = FEATURE_DATA_MAX;
-            memcpy(feature_resp_buf + 1, FIRMWARE_VERSION, ver_len);
-            *data = feature_resp_buf;
-            *len  = 1 + ver_len;
-            LOG_INF("[USB] GET_REPORT(0xF8) → firmware version\n");
-        } else if (report_id == 0xF9) {
-            extern int8_t bt_hid_host_get_cached_rssi(void);
-            extern uint8_t get_battery_level(void);
-            extern uint8_t get_battery_state(void);
-
-            feature_resp_buf[1] = (uint8_t)bt_hid_host_get_cached_rssi();
-            uint8_t aflags = 0x80;
-            if (state_mgr_is_spk_active() && !config_get()->disable_speaker &&
-                bt_hid_host_get_state() == BT_HID_STATE_CONNECTED) aflags |= 0x02;
-            if (audio_mic_active() && !config_get()->disable_mic &&
-                bt_hid_host_get_state() == BT_HID_STATE_CONNECTED) aflags |= 0x01;
-            feature_resp_buf[2] = aflags;
-            /* Layout kept identical to the private firmware so the companion
-             * web tool can parse RSSI / audio / battery. OTA fields are
-             * reserved and always zero — this build has no OTA. */
-            feature_resp_buf[3]  = 0;   /* OTA status (idle) */
-            feature_resp_buf[4]  = 0;   /* OTA bytes received */
-            feature_resp_buf[5]  = 0;
-            feature_resp_buf[6]  = 0;
-            feature_resp_buf[7]  = 0;
-            feature_resp_buf[8]  = 0;   /* OTA total size */
-            feature_resp_buf[9]  = 0;
-            feature_resp_buf[10] = 0;
-            feature_resp_buf[11] = 0;
-            feature_resp_buf[12] = get_battery_level();
-            feature_resp_buf[13] = get_battery_state();
-            *data = feature_resp_buf;
+    /* Keep CR's DAUD status ABI; legacy web telemetry bytes are reserved. */
+    if (report_id >= 0xF6) {
+        *len = 0;
+        if (report_id == 0xF9) {
+            memset(feature_resp_buf, 0, 22);
+            feature_resp_buf[0] = 0xF9;
             usb_audio_control_status(&audio_control, feature_resp_buf + 14);
-            *len  = 22;
-        } else if (report_id == 0xFB) {
-            feature_resp_buf[0] = 0xFB;
-            feature_resp_buf[1] = remap_get_active_profile();
-            feature_resp_buf[2] = remap_read_profile;
-            memcpy(feature_resp_buf + 3,
-                   remap_get_profile_table(remap_read_profile),
-                   REMAP_BTN_COUNT * sizeof(remap_entry_t));
             *data = feature_resp_buf;
-            *len  = 3 + REMAP_BTN_COUNT * (int)sizeof(remap_entry_t);
-            LOG_INF("[USB] GET_REPORT(0xFB) → profile %d (%d bytes)\n",
-                    remap_read_profile, *len);
-        } else {
-            *len = 0;
+            *len = 22;
         }
-        return;
+        return; /* Never forward removed private reports to the controller. */
     }
 
     /* DSE profile reports (0x70-0x7B): the class wrapper stalls absent
@@ -1282,72 +1194,11 @@ void usbd_hid_set_report(uint8_t busid, uint8_t intf, uint8_t report_id,
         payload_len--;
     }
 
-    /* Dongle config command (0xF6 SET) */
-    if (report_type == 0x03 && report_id == 0xF6 && payload_len > 0) {
-        uint8_t cmd = payload[0];
-        if (cmd == 0x01 && payload_len > 1) {
-            config_set(payload + 1, payload_len - 1);
-            /* DS5Dongle updates the live state as well as saved preferences. */
-            struct config_body *cfg = config_get();
-            state_mgr_apply_config(cfg->speaker_volume, cfg->headset_volume,
-                                   cfg->speaker_gain, cfg->trigger_reduce);
-            uint8_t mode = cfg->controller_mode;
-            bool edge = mode == 1 || (mode == 2 &&
-                (bt_hid_host_get_state() == BT_HID_STATE_CONNECTED ?
-                 bt_hid_host_is_dse() : cfg->dse_detected));
-            usb_gamepad_set_dse_mode(edge);
-            request_usb_profile();
-            if (config_get()->lock_volume)
-                state_mgr_restore_config_volume();
-            LOG_INF("[USB] CMD 0x01: config updated\n");
-        } else if (cmd == 0x02) {
-            config_request_save();
-        } else if (cmd == 0x04) {
-            usb_audio_control_command(&audio_control, payload, payload_len,
-                                      bflb_mtimer_get_time_us());
-        } else if (cmd == 0x03) {
-            if (!usb_reset_pending) usb_profile_request_us = bflb_mtimer_get_time_us();
-            usb_reset_pending = true;
-        }
-        return;
-    }
-
-    /* Button remap command (0xFB SET) */
-    if (report_type == 0x03 && report_id == 0xFB && payload_len > 0) {
-        uint8_t cmd = payload[0];
-        if (cmd == 0x01) {
-            /* 0x01 [profile] [data...] — set remap for profile */
-            if (payload_len >= 2 + REMAP_OLD_BTN_COUNT * (int)sizeof(remap_entry_t)) {
-                uint8_t prof = payload[1];
-                if (prof >= REMAP_PROFILE_COUNT) prof = 0;
-                remap_set_profile(prof, payload + 2, (uint8_t)(payload_len - 2));
-                remap_request_save(prof);
-                LOG_INF("[USB] CMD 0xFB/0x01: profile %d updated (%d bytes)\n", prof, payload_len - 2);
-            } else if (payload_len >= 1 + REMAP_OLD_BTN_COUNT * (int)sizeof(remap_entry_t)) {
-                /* backward compat: no profile byte → profile 0 */
-                remap_set_profile(0, payload + 1, (uint8_t)(payload_len - 1));
-                remap_request_save(0);
-                LOG_INF("[USB] CMD 0xFB/0x01: profile 0 updated (compat)\n");
-            }
-        } else if (cmd == 0x02) {
-            /* 0x02 [profile] — reset profile (optional byte) */
-            uint8_t prof = (payload_len >= 2) ? payload[1] : remap_get_active_profile();
-            if (prof >= REMAP_PROFILE_COUNT) prof = 0;
-            remap_reset_profile(prof);
-            remap_request_save(prof);
-            LOG_INF("[USB] CMD 0xFB/0x02: profile %d reset\n", prof);
-        } else if (cmd == 0x03 && payload_len >= 2) {
-            /* 0x03 [profile] — select profile to read on next GET_REPORT */
-            remap_read_profile = payload[1] < REMAP_PROFILE_COUNT ? payload[1] : 0;
-            LOG_INF("[USB] CMD 0xFB/0x03: read_profile → %d\n", remap_read_profile);
-        } else if (cmd == 0x05 && payload_len >= 2) {
-            /* 0x05 [profile] — switch active profile */
-            uint8_t prof = payload[1];
-            if (prof < REMAP_PROFILE_COUNT) {
-                remap_switch_profile(prof);
-                LOG_INF("[USB] CMD 0xFB/0x05: active profile → %d\n", prof);
-            }
-        }
+    /* Only the DAUD audio command remains in the private HID range. */
+    if (report_id >= 0xF6) {
+        feature_set_rejected = report_type != 0x03 || report_id != 0xF6 ||
+            !usb_audio_control_command(&audio_control, payload, payload_len,
+                                       bflb_mtimer_get_time_us());
         return;
     }
 

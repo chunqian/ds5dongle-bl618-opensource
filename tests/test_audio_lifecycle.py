@@ -6,7 +6,6 @@ import tempfile
 root=Path(__file__).resolve().parents[1]
 audio=(root/'src/audio.c').read_text()
 usb=(root/'src/ds5_usb_audio.c').read_text()
-gamepad=(root/'src/usb_gamepad.c').read_text()
 def extract(source,signature):
     start=source.index(signature); end=source.index('{',start)+1; depth=1
     while depth:
@@ -50,9 +49,6 @@ static unsigned bt_hid_host_get_state(void) { return state; }
 static uint32_t bt_hid_host_session(void) { return session; }
 static struct config_body cfg;
 struct config_body *config_get(void) { return &cfg; }
-static bool spk_active;
-static void state_mgr_set_spk_active(bool on) { spk_active=on; }
-static bool state_mgr_is_spk_active(void) { return spk_active; }
 static unsigned reads, writes, closed, queue_resets, status_sent, audio_sent;
 static bool fail_status, toggle_during_send, fail_read, fail_write;
 static uint64_t clock_us;
@@ -125,26 +121,21 @@ for sig in ('uint32_t usb_audio_session(', 'static void speaker_arm(', 'static v
             'void usb_audio_discard_pending(', 'bool usb_audio_read(', 'bool usb_audio_mic_is_active(',
             'void usb_audio_discard_mic(', 'void usb_audio_mic_stop(', 'void usb_audio_poll(', 'static void audio_mic_ep_in_handler(', 'static void audio_ep_out_handler('):
     harness+=extract(usb,sig)
-for sig in ('void audio_set_mic_active(', 'bool audio_mic_active(', 'void audio_reset_encoder(',
+for sig in ('void audio_set_mic_active(', 'void audio_reset_encoder(',
             'void audio_reset(', 'static void audio_owner_reset(', 'static int send_mic_status(',
             'static void audio_sync_mic(', 'static int send_audio_report('):
     harness+=extract(audio,sig)
-# Exercise the production F9 flag expressions, including config and connection state.
-a=gamepad.index('            uint8_t aflags = 0x80;')
-b=gamepad.index('            feature_resp_buf[2] = aflags;',a)
-harness+='static uint8_t status_flags(void) {\n'+gamepad[a:b]+'return aflags;\n}\n'
 harness+=r'''
 static void owner_reset(void) { owner_context=true; audio_owner_reset(); owner_context=false; }
 int main(void) {
     usb_audio_set_visible(true);
     usbd_audio_open(0,USB_AUDIO_INTF_STREAM); usbd_audio_open(0,USB_AUDIO_INTF_MIC);
     assert(reads==1 && writes==1 && stream_active && mic_active && mic_enabled);
-    assert(status_flags()==0x83); audio_sync_mic(); assert(last_mic_status && !mic_status_pending);
+    audio_sync_mic(); assert(last_mic_status && !mic_status_pending);
     owner_reset();
     unsigned before=reads;
     usb_audio_suspend(); usb_audio_suspend(); /* repeated notification is idempotent */
     assert(host_speaker_open && host_mic_open && !stream_active && !mic_active && !mic_enabled);
-    assert(status_flags()==0x80);
     usb_audio_resume(); assert(reads==before+1 && writes==2 && mic_enabled && stream_active);
     usb_audio_resume(); assert(reads==before+1 && writes==2);
     audio_sync_mic(); assert(last_mic_status); owner_reset();
@@ -156,7 +147,7 @@ int main(void) {
     assert(usb_audio_is_active() && usb_audio_mic_is_active() && host_mic_open);
     assert(!mic_enabled && !pcm_ready && !mic_ring_wr && queue_resets==1);
     assert(opus_slots[0][0]==0x55 && haptic_slots[0][0]==0x55 && packet_counter==20);
-    assert(status_flags()==0x80); audio_sync_mic();
+    audio_sync_mic();
     state=BT_HID_STATE_CONNECTED; session++;
     fail_status=true; audio_sync_mic(); assert(mic_enabled && mic_status_pending);
     unsigned sent=status_sent; audio_sync_mic(); assert(status_sent==sent+1 && mic_status_pending);
@@ -165,9 +156,9 @@ int main(void) {
 
     /* Configuration disable/reenable is reflected without another host-open request. */
     cfg.disable_mic=1; cfg.disable_speaker=1; audio_sync_mic();
-    assert(!mic_enabled && !last_mic_status && status_flags()==0x80);
+    assert(!mic_enabled && !last_mic_status);
     cfg.disable_mic=cfg.disable_speaker=0; audio_sync_mic();
-    assert(mic_enabled && last_mic_status && status_flags()==0x83);
+    assert(mic_enabled && last_mic_status);
     mic_status_pending=true; toggle_during_send=true; audio_sync_mic();
     assert(mic_status_pending); audio_sync_mic(); assert(!mic_status_pending && last_mic_status);
 

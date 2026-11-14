@@ -36,19 +36,6 @@ void state_mgr_apply_config(uint8_t spk_vol, uint8_t hp_vol, uint8_t spk_gain,
                             uint8_t trigger_reduce);
 
 /**
- * Set the speaker-active flag. BL618 sends state separately from its 0x39
- * audio packets, including while speaker streaming is active.
- * Called from USB Audio Class callbacks when the host opens/closes
- * the speaker streaming interface.
- */
-void state_mgr_set_spk_active(bool active);
-
-/**
- * Check if the speaker streaming interface is active.
- */
-bool state_mgr_is_spk_active(void);
-
-/**
  * Set speaker/headphone volume directly (from UAC SET_CUR).
  * Values are DualSense range [0, 127].
  */
@@ -58,13 +45,6 @@ void state_mgr_set_volume(uint8_t spk_vol, uint8_t hp_vol);
  * Set speaker+headphone mute (from UAC SET_CUR).
  */
 void state_mgr_set_mute(bool mute);
-
-/**
- * Force the state volume/mute back to config values and mark dirty.
- * Called when lock_volume is enabled to immediately override
- * any game-set volume with the user's configured preference.
- */
-void state_mgr_restore_config_volume(void);
 
 /**
  * Check if a UAC volume/mute change is pending.

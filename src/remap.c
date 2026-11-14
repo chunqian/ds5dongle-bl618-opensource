@@ -184,8 +184,6 @@ static inline uint8_t get_src_bit(const uint8_t *p, int id)
     return 0u;
 }
 
-#define REMAP_MIN_SET_SIZE (REMAP_OLD_BTN_COUNT * sizeof(remap_entry_t))
-
 static void load_single_profile(uint8_t idx)
 {
     size_t len = 0;
@@ -235,77 +233,6 @@ void remap_load(void)
             active_profile, (int)g_remap_is_identity);
 }
 
-bool remap_save(void)
-{
-    return remap_save_profile(active_profile);
-}
-
-bool remap_save_profile(uint8_t profile)
-{
-    if (profile >= REMAP_PROFILE_COUNT) return false;
-    remap_entry_t snapshot[REMAP_BTN_COUNT];
-    uintptr_t irq = bflb_irq_save();
-    memcpy(snapshot, g_profiles[profile], sizeof(snapshot));
-    bflb_irq_restore(irq);
-    int r = ef_set_env_blob(profile_keys[profile], snapshot, sizeof(snapshot));
-    return r == 0;
-}
-
-void remap_request_save(uint8_t profile)
-{
-    if (profile >= REMAP_PROFILE_COUNT) return;
-    _Static_assert(sizeof(g_profiles[0]) <= 128, "remap snapshot too large");
-    uintptr_t irq = bflb_irq_save();
-    deferred_store_request(profile == 0 ? STORE_REMAP_0 : STORE_REMAP_1,
-                           g_profiles[profile], sizeof(g_profiles[profile]));
-    bflb_irq_restore(irq);
-}
-void remap_set(const uint8_t *data, uint8_t len)
-{
-    remap_set_profile(active_profile, data, len);
-}
-
-void remap_set_profile(uint8_t profile, const uint8_t *data, uint8_t len)
-{
-    if (profile >= REMAP_PROFILE_COUNT) return;
-    size_t n_entries = len / sizeof(remap_entry_t);
-    if (n_entries < REMAP_OLD_BTN_COUNT) return; /* need at least old-format count */
-
-    uintptr_t irq = bflb_irq_save();
-    if (n_entries >= REMAP_BTN_COUNT) {
-        memcpy(g_profiles[profile], data, REMAP_BTN_COUNT * sizeof(remap_entry_t));
-    } else {
-        /* Partial (old web config sends 23 entries): copy what we have, identity-fill rest */
-        memcpy(g_profiles[profile], data, n_entries * sizeof(remap_entry_t));
-        for (size_t i = n_entries; i < REMAP_BTN_COUNT; i++)
-            g_profiles[profile][i] = (remap_entry_t){ REMAP_TYPE_BTN, (uint8_t)i, 0, 0 };
-    }
-    for (int i = 0; i < REMAP_BTN_COUNT; i++)
-        sanitize_entry(&g_profiles[profile][i], (uint8_t)i);
-
-    if (profile == active_profile)
-        update_identity_cache();
-    bflb_irq_restore(irq);
-    LOG_INF("[REMAP] Profile %d updated, identity=%d\n",
-            profile, (int)is_table_identity(g_profiles[profile]));
-}
-
-void remap_reset(void)
-{
-    remap_reset_profile(active_profile);
-}
-
-void remap_reset_profile(uint8_t profile)
-{
-    if (profile >= REMAP_PROFILE_COUNT) return;
-    uintptr_t irq = bflb_irq_save();
-    reset_table(g_profiles[profile]);
-    if (profile == active_profile) {
-        g_remap_is_identity = true;
-    }
-    bflb_irq_restore(irq);
-}
-
 void remap_switch_profile(uint8_t profile)
 {
     if (profile >= REMAP_PROFILE_COUNT) return;
@@ -321,17 +248,6 @@ void remap_switch_profile(uint8_t profile)
 uint8_t remap_get_active_profile(void)
 {
     return active_profile;
-}
-
-const remap_entry_t *remap_get_table(void)
-{
-    return g_profiles[active_profile];
-}
-
-const remap_entry_t *remap_get_profile_table(uint8_t profile)
-{
-    if (profile >= REMAP_PROFILE_COUNT) profile = 0;
-    return g_profiles[profile];
 }
 
 void remap_apply(uint8_t *p)

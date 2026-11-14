@@ -1285,7 +1285,6 @@ static void conn_connected(struct bt_conn *conn, uint8_t err)
     LOG_DBG("[BT-CB] conn_connected EXIT\n");
 }
 
-static volatile int8_t cached_rssi = 1; /* 1 = unknown (positive → web shows "Unknown") */
 static volatile bool switch_pending = false;
 
 static bool clear_bonds_pending;
@@ -1355,7 +1354,6 @@ bool bt_hid_host_poll_disconnect(void)
 
     feature_cache_clear();
     dse_reset();
-    cached_rssi = 1;
     if (clear_bonds_pending)
         clear_bond_storage();
 
@@ -2105,26 +2103,6 @@ void bt_hid_host_poll_control(void)
     bt_conn_unref(conn);
 }
 
-int bt_hid_host_read_rssi(int8_t *rssi)
-{
-    if (!hid_ctx.conn || hid_ctx.state != BT_HID_STATE_CONNECTED)
-        return -1;
-    int8_t val = 0;
-    int ret = bt_le_read_rssi(hid_ctx.conn->handle, &val);
-    if (ret == 0) {
-        cached_rssi = val;
-        if (rssi) *rssi = val;
-    } else {
-        LOG_WRN("[BT] Read RSSI failed: %d\n", ret);
-    }
-    return ret;
-}
-
-int8_t bt_hid_host_get_cached_rssi(void)
-{
-    return cached_rssi;
-}
-
 static int send_output_session(const uint8_t *data, uint16_t len, uint32_t generation, bool reliable)
 {
     if (generation != app_tx_generation)
@@ -2454,7 +2432,6 @@ int bt_hid_host_switch_next(void)
         app_tx_fifo_reset();
         feature_cache_clear();
         dse_reset();
-        cached_rssi = 1;
 
         request_scan_mode(true);
 

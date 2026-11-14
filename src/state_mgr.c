@@ -42,7 +42,6 @@
  */
 
 static uint8_t state[SET_STATE_SIZE];
-static volatile bool spk_active;
 static volatile bool vol_dirty;
 static uint32_t vol_version;
 static uint8_t initial_state[SET_STATE_SIZE];
@@ -63,7 +62,6 @@ void state_mgr_init(const uint8_t *init_data, uint8_t len)
     initialized = true;
     output_dirty = false;
     ++output_version;
-    spk_active = false;
     vol_dirty = false;
     ++vol_version;
     bflb_irq_restore(irq);
@@ -138,16 +136,6 @@ void state_mgr_apply_config(uint8_t spk_vol, uint8_t hp_vol, uint8_t spk_gain,
     bflb_irq_restore(irq);
 }
 
-void state_mgr_set_spk_active(bool active)
-{
-    spk_active = active;
-}
-
-bool state_mgr_is_spk_active(void)
-{
-    return spk_active;
-}
-
 void state_mgr_set_volume(uint8_t spk_vol, uint8_t hp_vol)
 {
     uintptr_t irq = bflb_irq_save();
@@ -178,21 +166,6 @@ void state_mgr_set_mute(bool mute)
         state[9] |= 0x60;
     else
         state[9] &= ~0x60;
-    vol_dirty = true;
-    ++vol_version;
-    output_changed();
-    bflb_irq_restore(irq);
-}
-
-void state_mgr_restore_config_volume(void)
-{
-    uintptr_t irq = bflb_irq_save();
-    struct config_body *cfg = config_get();
-    state[0] |= 0x30;
-    state[1] |= 0x02;
-    state[4] = cfg->headset_volume;
-    state[5] = cfg->speaker_volume;
-    state[9] &= ~0x60;
     vol_dirty = true;
     ++vol_version;
     output_changed();
@@ -289,7 +262,6 @@ void state_mgr_usb_reset(void)
         state_mgr_apply_config(cfg->speaker_volume, cfg->headset_volume,
                                cfg->speaker_gain, cfg->trigger_reduce);
         state_mgr_set_led_color(cfg->led_r, cfg->led_g, cfg->led_b);
-        spk_active = false;
         vol_dirty = false;
         ++vol_version;
         output_changed();

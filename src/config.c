@@ -5,8 +5,6 @@
 #include "debug_log.h"
 #include <math.h>
 
-extern int bt_settings_set_bin(const char *key, const uint8_t *value,
-                               size_t length);
 extern int bt_settings_get_bin(const char *key, uint8_t *value,
                                size_t exp_len, size_t *real_len);
 
@@ -14,7 +12,6 @@ extern int bt_settings_get_bin(const char *key, uint8_t *value,
 
 static struct config_body cfg;
 static bool detected_type_stored;
-_Static_assert(sizeof(struct config_body) <= 128, "configuration snapshot too large");
 
 void config_validate(void)
 {
@@ -130,32 +127,6 @@ void config_load(void)
            (unsigned)rlen);
 }
 
-bool config_save(void)
-{
-    struct config_body snapshot;
-    config_snapshot(&snapshot);
-    int rc = bt_settings_set_bin(CONFIG_EF_KEY, (const uint8_t *)&snapshot,
-                                 sizeof(snapshot));
-    if (rc == 0) {
-        LOG_INF("[CFG] Saved to flash\n");
-        return true;
-    }
-    LOG_ERR("[CFG] Save failed: %d\n", rc);
-    return false;
-}
-
-void config_snapshot(struct config_body *out)
-{
-    uintptr_t irq = bflb_irq_save();
-    memcpy(out, &cfg, sizeof(cfg));
-    bflb_irq_restore(irq);
-}
-void config_request_save(void)
-{
-    uintptr_t irq = bflb_irq_save();
-    deferred_store_request(STORE_CONFIG, &cfg, sizeof(cfg));
-    bflb_irq_restore(irq);
-}
 void config_note_controller(bool edge)
 {
     uintptr_t irq = bflb_irq_save();
@@ -169,16 +140,4 @@ void config_note_controller(bool edge)
 struct config_body *config_get(void)
 {
     return &cfg;
-}
-
-void config_set(const uint8_t *data, uint16_t len)
-{
-    uintptr_t irq = bflb_irq_save();
-    uint8_t detected = cfg.dse_detected;
-    uint16_t copy_len = len < sizeof(cfg) ? len : sizeof(cfg);
-    memcpy(&cfg, data, copy_len);
-    config_validate();
-    cfg.dse_detected = detected; /* runtime detection is not a host preference */
-    bflb_irq_restore(irq);
-    LOG_INF("[CFG] Updated from host (%d bytes)\n", copy_len);
 }

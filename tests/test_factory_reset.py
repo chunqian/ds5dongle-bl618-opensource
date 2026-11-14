@@ -89,7 +89,8 @@ int main(void) {
     assert(config_get()->tp_mode==0 && config_get()->tp_mode_enabled_mask==3);
     assert(config_get()->dse_detected==0 && config_get()->trigger_reduce==0);
     for(unsigned mode=0;mode<3;mode++) {
-        config_get()->polling_rate_mode=mode;assert(config_save());
+        config_get()->polling_rate_mode=mode;
+        assert(!bt_settings_set_bin("dongle_cfg",(const uint8_t *)config_get(),sizeof(struct config_body)));
         config_load();assert(config_polling_mode()==mode); /* keep existing choices */
     }
     assert(factory_reset_request());assert(factory_reset_apply_pending());

@@ -60,9 +60,6 @@ static volatile bool battery_low = false;
 static volatile bool bt_init_done = false;
 static volatile bool bt_init_failed;
 
-static volatile uint8_t cached_battery_level = 0xFF;
-static volatile uint8_t cached_battery_state = 0;
-
 /* LED auto-off timers */
 #define LED_DISABLE_OFF_US   (60ULL * 1000000ULL)  /* 1 minute */
 static volatile uint64_t conn_led_start_us = 0;
@@ -153,8 +150,6 @@ static int send_led_primer(uint32_t session)
 static int on_hid_primer(uint32_t session)
 {
     int ret = send_led_primer(session);
-    if (usb_audio_is_active())
-        state_mgr_set_spk_active(true);
     if (!ret) LOG_INF("[MAIN] Initial 0x32 queued after Feature GETs\n");
     return ret;
 }
@@ -195,8 +190,6 @@ static void on_hid_state(enum bt_hid_host_state state)
         if (ds5_connected) {
             ds5_connected = false;
             battery_low = false;
-            cached_battery_level = 0xFF;
-            cached_battery_state = 0;
             uint8_t neutral[DS5_USB_INPUT_PAYLOAD_LEN];
             memset(neutral, 0, sizeof(neutral));
             neutral[0] = 0x7F; /* LX center */
@@ -546,21 +539,11 @@ static void bt_task(void *arg)
         }
 
         if (bt_init_failed) {
-            /* Keep USB configuration and BOOT recovery available. */
+            /* Keep USB and BOOT recovery available. */
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
         bt_hid_host_persist_if_dirty();
-
-        /* Periodic RSSI read (~every 5 s) */
-        {
-            static uint64_t last_rssi_us;
-            uint64_t now = bflb_mtimer_get_time_us();
-            if (ds5_connected && now - last_rssi_us >= 5000000ULL) {
-                last_rssi_us = now;
-                bt_hid_host_read_rssi(NULL);
-            }
-        }
 
         bt_hid_host_poll_disconnect();
         bt_hid_host_poll_control();
@@ -810,8 +793,6 @@ static void usb_task(void *arg)
                 uint8_t batt = raw_report[2 + DS5_BATT_BYTE_OFFSET];
                 uint8_t pct  = batt & DS5_BATT_LEVEL_MASK;
                 uint8_t st   = (batt >> DS5_BATT_STATE_SHIFT) & 0x0F;
-                cached_battery_level = (pct > 10) ? 100 : pct * 10;
-                cached_battery_state = st;
                 bool discharging = (st == DS5_BATT_STATE_DISCHARGE);
                 bool is_low  = discharging && (pct <= DS5_BATT_LOW_THRESHOLD);
 
@@ -842,9 +823,6 @@ static void led_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
-
-uint8_t get_battery_level(void)  { return cached_battery_level; }
-uint8_t get_battery_state(void)  { return cached_battery_state; }
 
 int main(void)
 {

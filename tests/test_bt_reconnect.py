@@ -71,7 +71,7 @@ end = SOURCE.index("} hid_ctx;", start) + len("} hid_ctx;")
 harness += SOURCE[start:end]
 harness += r'''
 static TickType_t tick;
-static int ctrl_ops, intr_ops, cached_rssi;
+static int ctrl_ops, intr_ops;
 static bool first_intr_logged, first_output_logged, switch_pending;
 static bool bonded_refresh_pending, pairing_addr_pending;
 static unsigned pages, channel_count, channels[8], disconnects, scan_calls, delays;

@@ -17,7 +17,6 @@
 #include "debug_log.h"
 #include <math.h>
 
-
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -725,11 +724,6 @@ void audio_set_mic_active(bool active)
         usb_audio_discard_mic();
     }
     bflb_irq_restore(irq);
-}
-
-bool audio_mic_active(void)
-{
-    return mic_enabled;
 }
 
 /* ---- Mic decode task: runs independently at lower priority than audio_task ----

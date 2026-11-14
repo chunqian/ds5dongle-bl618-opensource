@@ -335,7 +335,6 @@ void usbd_audio_open(uint8_t busid, uint8_t intf)
             stream_active = true;
             pcm_write_pos = pcm_write_idx = 0;
             pcm_ready = false;
-            state_mgr_set_spk_active(true);
             audio_reset_encoder();
             speaker_retry_us = 0;
             speaker_arm(busid);
@@ -502,7 +501,6 @@ void usb_audio_stop(void)
     audio_suspended = false;
     pcm_write_pos = pcm_write_idx = 0;
     pcm_ready = false;
-    state_mgr_set_spk_active(false);
     bflb_irq_restore(irq);
 }
 

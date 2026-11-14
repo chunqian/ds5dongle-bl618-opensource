@@ -10,9 +10,8 @@
 #define CONFIG_DEFAULT_LED_B 0x40
 
 /*
- * Configuration body — layout-compatible with DS5Dongle's Config_body
- * for potential companion-app interoperability.  Audio-related fields
- * are preserved but currently ignored on BL618.
+ * Configuration body — preserve the legacy Flash layout when loading
+ * settings saved by earlier firmware. No host configuration write API.
  */
 struct __attribute__((packed)) config_body {
     uint8_t config_version;
@@ -46,16 +45,11 @@ struct __attribute__((packed)) config_body {
 #define CONFIG_VERSION  2
 
 void config_load(void);
-/* Synchronous helper for startup/task-only callers. Runtime HID uses request_save. */
-bool config_save(void);
-void config_request_save(void);
 /* Independent persisted detection hint; never saves other unsaved preferences. */
 void config_note_controller(bool edge);
-void config_snapshot(struct config_body *out);
 void config_validate(void);
 
 struct config_body *config_get(void);
-void config_set(const uint8_t *data, uint16_t len);
 
 /* Convenience accessors for hot-path fields */
 static inline bool config_wake_enabled(void)       { return config_get()->enable_wake; }

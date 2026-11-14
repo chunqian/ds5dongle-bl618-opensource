@@ -162,14 +162,14 @@ LCTech BL616 has a single blue LED (GPIO27); states are distinguished by blink c
 - Full output passthrough: rumble, RGB light bar, player indicators, adaptive triggers
 - Audio passthrough (bidirectional): UAC1 4ch 48kHz OUT → Opus encode → BT 0x39 dual-frame report (547B, speaker/headset); BT mic Opus → decode → UAC1 2ch 48kHz IN (microphone)
 - HD haptics: USB Audio Ch2/Ch3 → 16:1 decimation → BT 0x92 haptic tag
-- DualSense Edge full support: auto-detect → unlock handshake → profile prefetch → 437B descriptor, PID auto-switch (0DF2)
+- DualSense Edge full support: auto-detect → unlock handshake → profile prefetch → 421B descriptor, PID auto-switch (0DF2)
 - Multi-controller memory: remembers up to 8 paired controllers, single click to switch
 - Controller-initiated reconnect via L2CAP server registration (passive model)
 - Robust reconnection: periodic scan retry (~30s), connection watchdog (3s no-input detection), Link Supervision Timeout (5s), system reset fallback for stale ACL cleanup
 - Idle timeout: configurable 0–60 min auto-disconnect (default 30 min)
 - Gamepad HID only: no auxiliary keyboard, mouse, volume keys, PS keyboard shortcut or synthetic F15 wake
 - Configurable polling rate: 250Hz / 500Hz / real-time (~750Hz, follows the BT report rate)
-- Button remap: remap any controller button to another controller button (Feature Report 0xFB)
+- Button remap: remap any controller button to another controller button (loads existing Flash mappings)
 - MuteLight: mic button LED control (toggle on/off via the controller mute button)
 - USB remote wakeup signal only; request controller power-off after 3s suspend
 - USB stealth mode: hide the USB device until a controller connects (configurable)
@@ -191,7 +191,7 @@ LCTech BL616 has a single blue LED (GPIO27); states are distinguished by blink c
 
 ### Controller Feature Compatibility
 
-The USB side presents DualSense-compatible HID descriptors (auto-switching between DS and Edge; standard wired layout plus dongle-config Feature Reports 0xF6–0xF9 / 0xFB), so hosts treat the dongle like a wired controller.
+The USB side presents DualSense-compatible HID descriptors (auto-switching between DS and Edge; standard wired layout plus DAUD audio-control Feature Reports 0xF6 / 0xF9), so hosts treat the dongle like a wired controller.
 
 | Feature | Data Path | Supported |
 |---------|-----------|-----------|
@@ -210,7 +210,7 @@ The USB side presents DualSense-compatible HID descriptors (auto-switching betwe
 
 ## Configuration
 
-Settings persist via `bt_settings` and are read/written over USB Feature Reports 0xF6–0xF9. They can be changed from a web page without rebuilding (see Web Configuration). Highlights (defaults):
+Web configuration and its HID settings APIs have been removed. Firmware uses source defaults and can load existing Flash settings. Hold BOOT for 3 seconds to clear all settings. Changing defaults requires rebuilding. Highlights (defaults):
 
 | Option | Default |
 |--------|---------|
@@ -240,7 +240,7 @@ src/
 ├── audio.c/h           Audio pipeline (sinc resample + Opus encode/decode + haptics + mic)
 ├── usb_wake.c/h        USB remote wakeup FSM
 ├── state_mgr.c/h       SetStateData conditional merge manager
-├── config.c/h          Configuration system (bt_settings + 0xF6-0xF9)
+├── config.c/h          Defaults and legacy Flash loading (bt_settings)
 ├── dse.c/h             DualSense Edge profile management
 ├── remap.c/h           Button remap
 ├── led_status.c/h      LED status indicator (LCTech single blue LED)
@@ -272,9 +272,26 @@ firmware/               Board flash configs + local build output (binaries git-i
 - **Audio IN (Controller → Host):** BT 0x31 mic Opus frame → queue → Opus decode (48kHz mono) → mono-to-stereo → ring buffer → USB Audio ISO IN (2ch 48kHz)
 - **Feature (bidirectional):** GET_REPORT from BT-side cache (DSE profiles support NAK gating) | SET_REPORT adds CRC32 and forwards via L2CAP control channel
 
-## Web Configuration
+## USB Audio Control
 
-The companion web configuration tool is intentionally not open-sourced, in order to protect the interests of early users. The web configuration page is currently available at [ps5.ds5678.top](https://ps5.ds5678.top). The open-source firmware can still be configured from a web page (USB Feature Reports 0xF6–0xF9 / 0xFB), but **online OTA is not supported in this open-source build**. If you are comfortable with WebHID, implementing your own configuration page is straightforward — with AI assistance it can be done very quickly.
+USB audio is hidden by default. CR on macOS enables it using the DAUD HID
+protocol; iOS/iPadOS leaves it hidden. Changing visibility causes USB re-enumeration.
+Authorization is held in RAM and is revoked on a new host session. Hiding audio
+also disables audio-driven HD haptics and microphone streaming.
+
+Offsets below include the Report ID:
+
+- `GET_FEATURE 0xF9`: byte 0 is `F9`; bytes 1–13 are reserved and zero.
+  Bytes 14–17 contain `DAUD`, byte 18 is protocol version `1`, and bytes 19–21
+  report current visibility, requested visibility, and pending transition.
+- `SET_FEATURE 0xF6`: send `F6 04 44 41 55 44 01 XX`, padded to 64 bytes;
+  `XX=01` enables audio and `XX=00` hides it. Check the DAUD marker before sending
+  commands; Sony VID/PID alone does not identify a compatible adapter.
+
+Legacy web settings, save, re-enumeration, version/telemetry queries and remap
+editing commands are removed. Native controller HID reports remain supported.
+Controller-type memory and physical remap-profile selection persist independently
+through the deferred store; they never save the entire preferences structure.
 
 ## Acknowledgements
 
@@ -298,6 +315,6 @@ This project is licensed under the [GNU General Public License v3.0](LICENSE) (G
 
 Auxiliary HID has been removed. Legacy keyboard/mouse mappings revert to their
 original gamepad buttons; touchpad mouse modes are disabled. Gamepad button and
-touchpad direction remapping remain available. Legacy web options cannot enable
-auxiliary HID. Configuration offsets and lengths remain compatible. Hosts that
+touchpad direction remapping remain available. Configuration offsets and lengths
+remain compatible with existing Flash settings. Hosts that
 relied on synthetic F15 wake input need wake compatibility testing.

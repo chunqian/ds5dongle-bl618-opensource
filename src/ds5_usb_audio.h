@@ -58,7 +58,7 @@ bool usb_audio_is_active(void);
 bool usb_audio_read(int16_t *out);
 
 /**
- * Reset audio streaming state (stream_active, PCM buffers, spk_active).
+ * Reset audio streaming state (stream_active, PCM buffers).
  * Called on USB RESET to avoid stale flags suppressing 0x31 output.
  */
 void usb_audio_stop(void);
