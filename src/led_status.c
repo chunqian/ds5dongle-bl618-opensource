@@ -7,7 +7,6 @@
 
 #define BLINK_SLOW_PERIOD   10   /* 500ms per toggle → 1Hz */
 #define BLINK_FAST_PERIOD   3    /* 150ms per toggle → ~3Hz */
-#define BLINK_BATT_PERIOD   6    /* 300ms */
 
 /* After disconnect blink, auto-transition to slow blink
  * after ~3 seconds (60 ticks at 50ms/tick). */
@@ -42,8 +41,7 @@ static inline void led_pin_off(uint32_t pin)
  *   Disconnect (red blink)        → medium blink → auto slow blink
  *   Event ack (blink once)        → single flash
  *   Bonds cleared (triple)        → triple flash
- *   Battery critical              → rapid blink
- *   Battery warning               → medium blink
+ *   Settings/storage failure      → rapid blink
  * ══════════════════════════════════════════════════════════════ */
 
 static bool led_on = false;
@@ -82,8 +80,7 @@ void led_status_set(enum led_pattern pattern)
     case LED_PURPLE_BLINK_SLOW:
     case LED_PURPLE_BLINK_FAST:
     case LED_RED_BLINK:
-    case LED_BLINK_BATTERY:
-    case LED_BLINK_BATTERY_WARN:
+    case LED_BLINK_ERROR:
         set_led(true);
         break;
     case LED_GREEN_SOLID:
@@ -161,15 +158,8 @@ void led_status_tick(void)
         }
         break;
 
-    case LED_BLINK_BATTERY:
+    case LED_BLINK_ERROR:
         if (tick_count >= BLINK_FAST_PERIOD) {
-            tick_count = 0;
-            set_led(!led_on);
-        }
-        break;
-
-    case LED_BLINK_BATTERY_WARN:
-        if (tick_count >= BLINK_BATT_PERIOD) {
             tick_count = 0;
             set_led(!led_on);
         }

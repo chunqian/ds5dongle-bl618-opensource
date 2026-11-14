@@ -137,9 +137,7 @@ LCTech BL616 has a single blue LED (GPIO27); states are distinguished by blink c
 | Scanning | Fast blink (~3Hz) |
 | Connected | Solid |
 | Just disconnected | Blink (~1Hz) for ~3s, then back to idle slow blink |
-| Battery ≤20% (discharging) | Medium blink (~1.7Hz) |
-| Battery ≤10% (discharging) | Fast blink (~3Hz) |
-| Auto-off | Off after 1 min (on by default; battery warnings unaffected) |
+| Auto-off | Off after 1 min when enabled (disabled by default) |
 | Event acknowledge | Single flash |
 | Bonds cleared | Triple flash |
 
@@ -177,8 +175,8 @@ LCTech BL616 has a single blue LED (GPIO27); states are distinguished by blink c
 - USB serial number: unique chip ID from eFuse (configurable, on by default)
 - Trigger motor power reduction: configurable 0–10 levels
 - Volume lock: prevent the host from changing controller speaker/headset volume
-- LED auto-off: steady LEDs turn off after 1 min (on by default; battery warnings unaffected)
-- Battery alerts: ≤20% green-yellow blink warning, ≤10% red blink critical
+- LED auto-off: steady LEDs turn off after 1 min when enabled (disabled by default)
+- On-board low-battery alerts disabled; battery data still reaches the host through HID
 - LCTech BL616: native Type-C USB, single blue LED on GPIO27
 - Build-time log level control (`LOG_LEVEL` 0–3)
 - FreeRTOS multi-task architecture (BT / USB / Audio / Mic)
@@ -198,7 +196,7 @@ The USB side presents DualSense-compatible HID descriptors (auto-switching betwe
 | Sticks / Buttons / Triggers | HID Input passthrough | Yes |
 | Gyro / Accelerometer | HID Input passthrough | Yes |
 | Touchpad | HID Input passthrough | Yes |
-| Battery level | HID Input passthrough | Yes (+ on-board LED low-battery alert) |
+| Battery level | HID Input passthrough | Yes (no on-board low-battery LED alert) |
 | **Adaptive triggers** | HID Output SetStateData | Yes |
 | **Rumble** | HID Output SetStateData | Yes |
 | RGB light bar / Player LEDs | HID Output SetStateData | Yes |

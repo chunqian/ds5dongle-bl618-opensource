@@ -31,7 +31,7 @@ static void xQueueReset(int queue) { (void)queue; }
 static uint64_t handshake_start_us, connecting_start_tick;
 static uint64_t conn_led_start_us;
 static unsigned usb_fwd_count;
-static bool ds5_connected, battery_low, first_input_logged;
+static bool ds5_connected, first_input_logged;
 static bool bt_disconnect_pending_usb, conn_led_off, scan_after_disconnect;
 static bool wake_enabled, suspended, visible;
 static unsigned visibility_calls, wake_connects, wake_disconnects, neutral_reports;

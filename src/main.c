@@ -56,7 +56,6 @@ static uint8_t input_queue_storage[INPUT_QUEUE_ITEM_SZ];
 static uint8_t output_queue_storage[1]; /* Coalesced wake signal, not report storage. */
 static volatile bool ds5_connected = false;
 static volatile bool bt_disconnect_pending_usb = false;
-static volatile bool battery_low = false;
 static volatile bool bt_init_done = false;
 static volatile bool bt_init_failed;
 
@@ -189,7 +188,6 @@ static void on_hid_state(enum bt_hid_host_state state)
         if (output_queue) xQueueReset(output_queue);
         if (ds5_connected) {
             ds5_connected = false;
-            battery_low = false;
             uint8_t neutral[DS5_USB_INPUT_PAYLOAD_LEN];
             memset(neutral, 0, sizeof(neutral));
             neutral[0] = 0x7F; /* LX center */
@@ -272,7 +270,6 @@ static void on_hid_state(enum bt_hid_host_state state)
         bt_disconnect_pending_usb = false;
 
         ds5_connected = true;
-        battery_low = false;
         usb_wake_on_bt_connect();
         conn_led_start_us = bflb_mtimer_get_time_us();
         conn_led_off = false;
@@ -581,10 +578,7 @@ static void bt_task(void *arg)
             } else {
                 conn_led_off = false;
                 if (ds5_connected) {
-                    if (battery_low)
-                        led_status_set(LED_BLINK_BATTERY);
-                    else
-                        led_status_set(LED_GREEN_SOLID);
+                    led_status_set(LED_GREEN_SOLID);
                     LOG_DBG("[LED-DBG] toggle OFF: restored green, conn=1\n");
                 } else {
                     enum bt_hid_host_state s = bt_hid_host_get_state();
@@ -787,28 +781,6 @@ static void usb_task(void *arg)
                 }
                 prev_mic_bit = cur_mic_bit;
             }
-
-            if (ds5_connected) {
-                /* Battery monitoring: <=10% red blink */
-                uint8_t batt = raw_report[2 + DS5_BATT_BYTE_OFFSET];
-                uint8_t pct  = batt & DS5_BATT_LEVEL_MASK;
-                uint8_t st   = (batt >> DS5_BATT_STATE_SHIFT) & 0x0F;
-                bool discharging = (st == DS5_BATT_STATE_DISCHARGE);
-                bool is_low  = discharging && (pct <= DS5_BATT_LOW_THRESHOLD);
-
-                if (is_low && !battery_low) {
-                    battery_low = true;
-                    led_status_set(LED_BLINK_BATTERY);
-                    LOG_WRN("[MAIN] Battery critical (%d%%)\n", pct * 10);
-                } else if (!is_low && battery_low) {
-                    battery_low = false;
-                    if (config_led_disabled() && conn_led_off)
-                        led_status_set(LED_OFF);
-                    else
-                        led_status_set(LED_GREEN_SOLID);
-                }
-
-            }
         }
 
         usb_wake_task();
@@ -869,7 +841,7 @@ int main(void)
         LOG_ERR("[B] Settings reset/storage failed; reconnect power to retry\n");
         /* Never start Bluetooth/USB with partially reset settings. */
         led_status_init();
-        led_status_set(LED_BLINK_BATTERY);
+        led_status_set(LED_BLINK_ERROR);
         while (1) {
             led_status_tick();
             bflb_mtimer_delay_ms(10);

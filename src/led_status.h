@@ -13,8 +13,7 @@ enum led_pattern {
     LED_BLINK_ONCE,        /* Single flash — event acknowledge */
     LED_BLINK_DOUBLE,      /* Double flash — remap profile 2 */
     LED_BLINK_TRIPLE,      /* Triple flash — bonds cleared */
-    LED_BLINK_BATTERY,     /* Red blink — critical battery (<=10%) */
-    LED_BLINK_BATTERY_WARN,/* Yellow blink — low battery (<=20%) */
+    LED_BLINK_ERROR,       /* Persistent blink — settings/storage failure */
 };
 
 void led_status_init(void);
