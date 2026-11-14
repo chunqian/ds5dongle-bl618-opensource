@@ -2,12 +2,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* ------------------------------------------------------------------ */
-/* Button remap table — maps 15 DualSense buttons to BTN or KBD       */
-/* BTN: remap to another gamepad button                                */
-/* KBD: emit HID keyboard keycode (+ optional modifier or 2nd key)    */
-/* ------------------------------------------------------------------ */
-
+/* Gamepad button remapping; legacy entry size stays unchanged. */
 #define REMAP_BTN_COUNT  31
 
 /* Source button IDs (index into g_remap[]) */
@@ -50,19 +45,12 @@
 
 /* Target types */
 #define REMAP_TYPE_BTN   0   /* value = target button ID 0-30 */
-#define REMAP_TYPE_KBD   1   /* value = USB HID keycode       */
-#define REMAP_TYPE_MOUSE 2   /* value = mouse button: 0=left, 1=right, 2=middle */
-
-/* flags bit 0 */
-#define REMAP_FLAG_SUPPRESS  0x01  /* suppress original gamepad bit output */
-/* flags bit 1 */
-#define REMAP_FLAG_EXTRA_KEY 0x02  /* modifier byte carries a 2nd keycode instead of modifier bitmask */
 
 typedef struct {
-    uint8_t type;      /* REMAP_TYPE_BTN or REMAP_TYPE_KBD */
-    uint8_t value;     /* BTN: target btn ID; KBD: HID keycode (key1) */
-    uint8_t modifier;  /* KBD: modifier bitmask — OR key2 when REMAP_FLAG_EXTRA_KEY is set */
-    uint8_t flags;     /* bit0: REMAP_FLAG_SUPPRESS; bit1: REMAP_FLAG_EXTRA_KEY */
+    uint8_t type;      /* REMAP_TYPE_BTN only */
+    uint8_t value;     /* Target gamepad button ID */
+    uint8_t modifier;  /* Reserved legacy byte; retained for wire/storage compatibility */
+    uint8_t flags;     /* Reserved legacy flags */
 } remap_entry_t;
 
 #define REMAP_PROFILE_COUNT 2
@@ -79,11 +67,6 @@ void remap_set_profile(uint8_t profile, const uint8_t *data, uint8_t len);
 void remap_reset(void);
 void remap_reset_profile(uint8_t profile);
 void remap_apply(uint8_t *payload);
-void remap_kbd_tick(const uint8_t *payload, uint32_t session);
-void remap_on_disconnect(void);
-bool remap_has_kbd_targets(void);
-bool remap_has_mouse_targets(void);
-void remap_mouse_tick(const uint8_t *payload, uint32_t session);
 const remap_entry_t *remap_get_table(void);
 const remap_entry_t *remap_get_profile_table(uint8_t profile);
 uint8_t remap_get_active_profile(void);

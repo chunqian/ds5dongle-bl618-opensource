@@ -4,40 +4,23 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# ── 板型选择 ──
-#   lctech616  — LCTech BL616, 默认
-#   aim61      — Ai-M61-32S-Kit (BL618)
-#   m0sdock    — Sipeed M0S Dock (BL616)
-BOARD_TYPE="${BOARD_TYPE:-lctech616}"
+# Only LCTech BL616 is supported. Reject old build invocations explicitly.
+if [[ "${BOARD_TYPE:-lctech616}" != "lctech616" || -n "${BOARD_M0S_DOCK+x}" ]]; then
+    echo "[build] ERROR: Only LCTech BL616 (lctech616) is supported." >&2
+    exit 1
+fi
+BOARD_TYPE=lctech616
 
 # ── USB 速度 ──
 #   fs  — Full-Speed 12Mbps（默认，线材兼容性好）
 #   hs  — High-Speed 480Mbps（高轮询率，线材兼容性较差）
 USB_SPEED="${USB_SPEED:-fs}"
 
-# Clear all board env vars first
-unset BOARD_M0S_DOCK 2>/dev/null || true
-unset BOARD_LCTECH_616 2>/dev/null || true
 unset FORCE_FS 2>/dev/null || true
-
 if [[ "$USB_SPEED" == "fs" ]]; then
     export FORCE_FS=1
 fi
-
-case "$BOARD_TYPE" in
-    aim61)
-        echo "[build] Target: Ai-M61-32S-Kit (BL618)"
-        ;;
-    m0sdock)
-        export BOARD_M0S_DOCK=1
-        echo "[build] Target: Sipeed M0S Dock (BL616)"
-        ;;
-    lctech616|*)
-        BOARD_TYPE="lctech616"
-        export BOARD_LCTECH_616=1
-        echo "[build] Target: LCTech BL616"
-        ;;
-esac
+echo "[build] Target: LCTech BL616"
 
 echo "[build] USB:  ${USB_SPEED}"
 
@@ -229,7 +212,7 @@ case "$ACTION" in
         strip_intermediates
         ;;
     *)
-        echo "Usage: [BOARD_TYPE=...] [USB_SPEED=hs|fs] ./build_macos.sh [build|clean|flash|rebuild|strip]"
+        echo "Usage: [USB_SPEED=hs|fs] ./build_macos.sh [build|clean|flash|rebuild|strip]"
         echo ""
         echo "  build   - 编译项目（默认）"
         echo "  clean   - 清除构建产物"
@@ -237,7 +220,7 @@ case "$ACTION" in
         echo "  rebuild - 清除后重新编译"
         echo "  strip   - 仅清理中间文件（保留固件）"
         echo ""
-        echo "Board types:  lctech616 (默认) | aim61 | m0sdock"
+        echo "Board: LCTech BL616 only"
         echo ""
         echo "USB speed:"
         echo "  fs  — Full-Speed 12Mbps（默认，线材兼容性好）"

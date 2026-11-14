@@ -1,5 +1,13 @@
 cmake_minimum_required(VERSION 3.15)
 
+# Reject obsolete board selectors instead of silently building another board.
+if((DEFINED ENV{BOARD_TYPE} AND NOT "$ENV{BOARD_TYPE}" STREQUAL "" AND
+    NOT "$ENV{BOARD_TYPE}" STREQUAL "lctech616") OR
+   (DEFINED BOARD_TYPE AND NOT "${BOARD_TYPE}" STREQUAL "lctech616") OR
+   DEFINED ENV{BOARD_M0S_DOCK} OR DEFINED BOARD_M0S_DOCK)
+    message(FATAL_ERROR "Only LCTech BL616 (lctech616) is supported; remove obsolete board selectors.")
+endif()
+
 include(proj.conf)
 
 # FORCE_FS=1 env var → remove CONFIG_USB_HS so SDK sets FORCE_FS bit
@@ -23,7 +31,6 @@ target_sources(app PRIVATE
     src/bt_hid_host.c
     src/ds5_protocol.c
     src/usb_audio_control.c
-    src/hid_aux.c
     src/usb_gamepad.c
     src/ds5_usb_audio.c
     src/audio.c
@@ -99,16 +106,7 @@ set(OPUS_RAM_LINKER_SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/generated/opus_all_ram.l
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(WRITE "${OPUS_RAM_LINKER_SCRIPT}" "${OPUS_LINKER_CONTENT}")
 sdk_set_linker_script_macro("${OPUS_RAM_LINKER_SCRIPT}")
-# Board selection via env vars (mutually exclusive)
-if(DEFINED ENV{BOARD_LCTECH_616})
-    target_compile_definitions(app PRIVATE BOARD_LCTECH_616=1)
-    message(STATUS "Target board: LCTech BL616")
-elseif(DEFINED ENV{BOARD_M0S_DOCK})
-    target_compile_definitions(app PRIVATE BOARD_M0S_DOCK=1)
-    message(STATUS "Target board: Sipeed M0S Dock (BL616)")
-else()
-    message(STATUS "Target board: Ai-M61-32S-Kit (BL618)")
-endif()
+message(STATUS "Target board: LCTech BL616 (only supported board)")
 
 target_compile_definitions(app PRIVATE HAVE_CONFIG_H)
 if(DEFINED ENV{FORCE_FS})

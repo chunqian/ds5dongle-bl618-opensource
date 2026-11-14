@@ -53,7 +53,6 @@ static bool usb_gamepad_set_bt_visible(bool requested) {
 }
 static void dse_reset(void) {}
 static void audio_reset(void) {}
-static void remap_on_disconnect(void) {}
 static void led_status_set(unsigned value) { (void)value; }
 static void bt_hid_host_scan_start(unsigned value) { (void)value; }
 static void usb_gamepad_set_dse_mode(bool value) { (void)value; }

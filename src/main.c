@@ -219,7 +219,6 @@ static void on_hid_state(enum bt_hid_host_state state)
         bt_disconnect_pending_usb = false;
         dse_reset();
         audio_reset();
-        remap_on_disconnect();
         if (was_connected) {
             conn_led_start_us = bflb_mtimer_get_time_us();
             conn_led_off = false;
@@ -687,30 +686,11 @@ static void usb_task(void *arg)
     uint32_t usb_session = bt_hid_host_session();
     uint8_t prev_mic_bit = 0xFF;
 
-    /* PS shortcut state (short press → Win+G, with debounce) */
-    bool     ps_debounced    = false;
-    bool     ps_was_pressed  = false;
-    bool     ps_key_pending  = false;
-    bool     ps_key_scheduled = false;
-    uint64_t ps_last_high_us = 0;
-    uint64_t ps_press_us     = 0;
-    uint64_t ps_key_rel_us   = 0;
-    uint64_t ps_key_sched_us = 0;
-
     /* Remap profile switch: Create + D-pad Left/Right */
     bool     remap_combo_fired = false;
 
     /* Touchpad mode cycle: Create + Touchpad Press */
     bool     tp_mode_combo_fired = false;
-
-    /* Volume combo: Options + D-pad Up/Down → Consumer Control Volume */
-    bool     vol_key_active = false, vol_releasing = false, vol_repeat_again = false;
-    uint16_t vol_sent_usage = 0;
-    uint64_t vol_repeat_us  = 0;
-    #define VOL_REPEAT_FIRST_MS  400
-    #define VOL_REPEAT_NEXT_MS   120
-    #define CC_VOL_UP    0x01   /* bitmap bit0 = Volume Increment */
-    #define CC_VOL_DOWN  0x02   /* bitmap bit1 = Volume Decrement */
 
     for (;;) {
         /* Periodic USB status check (every ~10 seconds) */
@@ -731,14 +711,7 @@ static void usb_task(void *arg)
         if (session != usb_session) {
             usb_session = session;
             prev_mic_bit = 0xFF;
-            ps_debounced = ps_was_pressed = ps_key_scheduled = ps_key_pending = false;
-            remap_on_disconnect(); /* reset local remap state after any stale work */
-            vol_releasing = vol_repeat_again = false;
             remap_combo_fired = tp_mode_combo_fired = false;
-            if (vol_key_active) {
-                usb_gamepad_send_consumer_report(0);
-                vol_key_active = false;
-            }
         }
 
         TickType_t wait = pdMS_TO_TICKS(10);
@@ -754,45 +727,6 @@ static void usb_task(void *arg)
             else if ((usb_fwd_count % 500) == 0)
                 LOG_DBG("[USB-FWD] %lu reports forwarded\n",
                        (unsigned long)usb_fwd_count);
-
-            /* Volume combo: Options(≡) + D-pad Up/Down → Consumer Control Vol.
-             * Detect BEFORE remap so we can suppress both buttons from gamepad. */
-            {
-                bool opt_held = (raw_report[2 + DS5_BTN_BYTE] & DS5_BTN_OPTIONS_BIT) != 0;
-                uint8_t dv = raw_report[2 + DS5_DPAD_BYTE] & DS5_DPAD_MASK;
-                uint16_t vu = 0;
-                if (opt_held) {
-                    if (dv == DS5_DPAD_N) vu = CC_VOL_UP;
-                    else if (dv == DS5_DPAD_S) vu = CC_VOL_DOWN;
-                }
-
-                uint64_t vt = bflb_mtimer_get_time_us();
-                if (!vu) vol_repeat_again = false;
-                if (vol_key_active && (vu != vol_sent_usage || vt >= vol_repeat_us)) {
-                    vol_releasing = true;
-                    if (vu == vol_sent_usage) vol_repeat_again = true;
-                }
-                if (vol_releasing) {
-                    if (usb_gamepad_send_consumer_session(0, input.session) == 0) {
-                        vol_key_active = vol_releasing = false;
-                    }
-                } else if (vu && !vol_key_active) {
-                    if (usb_gamepad_send_consumer_session(vu, input.session) == 0) {
-                        vol_key_active = true;
-                        vol_sent_usage = vu;
-                        vol_repeat_us = vt + (vol_repeat_again ? VOL_REPEAT_NEXT_MS :
-                                              VOL_REPEAT_FIRST_MS) * 1000ULL;
-                    }
-                } else if (!vu) {
-                    /* Release a press that has not yet reached the host, too. */
-                    usb_gamepad_send_consumer_session(0, input.session);
-                }
-
-                if (vol_key_active) {
-                    raw_report[2 + DS5_BTN_BYTE] &= ~DS5_BTN_OPTIONS_BIT;
-                    raw_report[2 + DS5_DPAD_BYTE] = (raw_report[2 + DS5_DPAD_BYTE] & ~DS5_DPAD_MASK) | DS5_DPAD_NONE;
-                }
-            }
 
             /* Remap profile switch: Create + D-pad Left → profile 0, Right → profile 1 */
             {
@@ -851,8 +785,6 @@ static void usb_task(void *arg)
                 }
             }
 
-            remap_kbd_tick(raw_report + 2, input.session);
-            remap_mouse_tick(raw_report + 2, input.session);
             remap_apply(raw_report + 2);
             if (usb_gamepad_send_input_session(raw_report + 2, input.session) != 0)
                 continue;
@@ -896,65 +828,6 @@ static void usb_task(void *arg)
                         led_status_set(LED_GREEN_SOLID);
                 }
 
-                /* PS key scheduled send + release (runs unconditionally) */
-                {
-                    uint64_t now_us = bflb_mtimer_get_time_us();
-
-                    /*
-                     * PS shortcut: short press → Win+G (Game Bar)
-                     * Long press removed — conflicts with controller disconnect.
-                     * 50ms debounce, 30ms key hold before release.
-                     */
-                    if (config_ps_shortcut()) {
-                        bool raw_ps = (raw_report[2 + DS5_BTN_PS_BYTE] &
-                                       DS5_BTN_PS_BIT) != 0;
-
-                        if (raw_ps) {
-                            ps_debounced = true;
-                            ps_last_high_us = now_us;
-                        } else if (now_us - ps_last_high_us > 50000ULL) {
-                            ps_debounced = false;
-                        }
-
-                        if (ps_debounced && !ps_was_pressed) {
-                            ps_press_us = now_us;
-                            ps_was_pressed = true;
-                        } else if (!ps_debounced && ps_was_pressed) {
-                            if (now_us - ps_press_us < 500000ULL) {
-                                /* Delay Win+G 150ms after release so host
-                                 * processes Guide button release first. */
-                                ps_key_sched_us = now_us + 150000ULL;
-                                ps_key_scheduled = true;
-                            }
-                            ps_was_pressed = false;
-                        }
-                    } else if (ps_was_pressed) {
-                        ps_was_pressed = false;
-                        ps_debounced = false;
-                    }
-                }
-            }
-        }
-
-        uint64_t ps_now = bflb_mtimer_get_time_us();
-        if (!ds5_connected || !config_ps_shortcut()) {
-            ps_debounced = ps_key_scheduled = ps_was_pressed = false;
-            uint8_t up[8] = {0};
-            if (usb_gamepad_send_keys(HID_AUX_PS, up, 8, usb_session) == 0)
-                ps_key_pending = false;
-        } else {
-            if (ps_key_scheduled && ps_now >= ps_key_sched_us && !ps_key_pending) {
-                uint8_t kbd[8] = {0x08, 0, 0x0A, 0, 0, 0, 0, 0};
-                if (usb_gamepad_send_keys(HID_AUX_PS, kbd, 8, usb_session) == 0) {
-                    ps_key_pending = true;
-                    ps_key_rel_us = ps_now + 30000ULL;
-                    ps_key_scheduled = false;
-                }
-            }
-            if (ps_key_pending && ps_now >= ps_key_rel_us) {
-                uint8_t up[8] = {0};
-                if (usb_gamepad_send_keys(HID_AUX_PS, up, 8, usb_session) == 0)
-                    ps_key_pending = false;
             }
         }
 

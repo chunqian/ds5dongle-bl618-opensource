@@ -1,5 +1,4 @@
 #include "usb_wake.h"
-#include "usb_gamepad.h"
 #include "bt_hid_host.h"
 #include "config.h"
 #include "usbd_core.h"
@@ -8,28 +7,23 @@
 #include <string.h>
 #include "debug_log.h"
 
-#define WAKE_KEYCODE_F15 0x68
-#define WAKE_SETTLE_US 150000ULL
-#define WAKE_KEY_HOLD_US 80000ULL
-#define WAKE_KEY_UP_SETTLE_US 200000ULL
 #define WAKE_REQUEST_TIMEOUT_US 5000000ULL
-#define WAKE_KEY_ATTEMPTS 2
 #define WAKE_POWEROFF_DEBOUNCE_US 3000000ULL
 #define WAKE_RECONNECT_GRACE_US 5000000ULL
 
 typedef enum {
     WAKE_IDLE, WAKE_PENDING_PRESS, WAKE_REQUESTED,
-    WAKE_KEY_DOWN, WAKE_KEY_UP_SENT, WAKE_DONE,
+    WAKE_DONE,
 } wake_state_t;
 
 /* USB callbacks run in interrupt context. Snapshot/update together, preserving
  * the caller's interrupt mask; never hold it across USB or Bluetooth calls. */
-static bool host_suspended, host_resumed, poweroff_pending, key_down_on_host;
+static bool host_suspended, host_resumed, poweroff_pending;
 static wake_state_t state;
 static uint64_t state_entered_us, suspend_at_us, reconnect_until_us;
 static uint32_t wake_generation, poweroff_session;
 static uint64_t poweroff_retry_us;
-static uint8_t key_attempts, prev_b7 = 8, prev_b8, prev_b9;
+static uint8_t prev_b7 = 8, prev_b8, prev_b9;
 
 static uint64_t now_us(void) { return bflb_mtimer_get_time_us(); }
 static void enter_state(wake_state_t next)
@@ -59,9 +53,9 @@ void usb_wake_init(void)
 {
     uintptr_t irq = bflb_irq_save();
     state = WAKE_IDLE;
-    host_suspended = host_resumed = poweroff_pending = key_down_on_host = false;
+    host_suspended = host_resumed = poweroff_pending = false;
     suspend_at_us = reconnect_until_us = state_entered_us = 0;
-    key_attempts = prev_b8 = prev_b9 = 0;
+    prev_b8 = prev_b9 = 0;
     prev_b7 = 8;
     ++wake_generation;
     bflb_irq_restore(irq);
@@ -89,7 +83,7 @@ void usb_wake_on_suspend(void)
     suspend_at_us = now;
     poweroff_session = bt_hid_host_session();
     poweroff_retry_us = now;
-    key_attempts = prev_b8 = prev_b9 = 0;
+    prev_b8 = prev_b9 = 0;
     prev_b7 = 8;
     enter_state(config_wake_enabled() ? WAKE_PENDING_PRESS : WAKE_IDLE);
     bflb_irq_restore(irq);
@@ -126,8 +120,7 @@ void usb_wake_on_bt_disconnect(void)
     ++wake_generation;
     poweroff_pending = false;
     enter_state(WAKE_IDLE);
-    prev_b7 = 8; prev_b8 = prev_b9 = key_attempts = 0;
-    /* If a keydown already reached the host, the task still owes a release. */
+    prev_b7 = 8; prev_b8 = prev_b9 = 0;
     bflb_irq_restore(irq);
 }
 
@@ -148,7 +141,7 @@ void usb_wake_on_bt_input(const uint8_t *payload, uint16_t len)
     prev_b7 = payload[7]; prev_b8 = payload[8]; prev_b9 = payload[9];
     bflb_irq_restore(irq);
     /* Like DS5Dongle, let the USB stack check suspend even if a hub hid the
-     * suspend notification. A rejected request does not send an F15. */
+     * suspend notification. No keyboard reports are generated. */
     if (changed && armable) request_host_wake();
 }
 
@@ -173,7 +166,6 @@ void usb_wake_task(void)
     uint64_t entered = state_entered_us;
     uint32_t generation = wake_generation;
     bool resumed = host_resumed || !host_suspended;
-    uint8_t attempts = key_attempts;
     bflb_irq_restore(irq);
 
     if (power_off) {
@@ -194,40 +186,10 @@ void usb_wake_task(void)
         }
         /* Keep page scan available: a PS press can reconnect and wake USB. */
     }
-    if (!config_wake_enabled() || current == WAKE_IDLE || current == WAKE_DONE) {
-        /* Publish release even after a failed keydown; retry it while busy. */
-        uint8_t up[8] = {0};
-        if (usb_gamepad_send_kbd_report(up, sizeof(up)) == 0) {
-            irq = bflb_irq_save(); key_down_on_host = false; bflb_irq_restore(irq);
-        }
-        return;
-    }
-    bool down = false, send = false;
-    wake_state_t next = current;
-    if (current == WAKE_REQUESTED) {
-        if (resumed && now - entered >= WAKE_SETTLE_US) {
-            down = send = true; next = WAKE_KEY_DOWN;
-        } else if (!resumed && now - entered > WAKE_REQUEST_TIMEOUT_US) {
-            next = WAKE_DONE;
-        }
-    } else if (current == WAKE_KEY_DOWN && now - entered >= WAKE_KEY_HOLD_US) {
-        send = true; next = WAKE_KEY_UP_SENT;
-    } else if (current == WAKE_KEY_UP_SENT && now - entered >= WAKE_KEY_UP_SETTLE_US) {
-        if (attempts < WAKE_KEY_ATTEMPTS) {
-            down = send = true; next = WAKE_KEY_DOWN;
-        } else next = WAKE_DONE;
-    }
-    if (send) {
-        if (!usb_gamepad_kbd_ready()) return;
-        uint8_t report[8] = {0};
-        if (down) report[2] = WAKE_KEYCODE_F15;
-        if (usb_gamepad_send_kbd_report(report, sizeof(report)) != 0) return;
-    }
+    /* Remote wake only: no synthetic keyboard press after resume. */
     irq = bflb_irq_save();
-    if (send) key_down_on_host = down;
-    if (generation == wake_generation && state == current && next != current) {
-        if (send && down) ++key_attempts;
-        enter_state(next);
-    }
+    if (generation == wake_generation && state == current && current == WAKE_REQUESTED &&
+        (!config_wake_enabled() || resumed || now - entered > WAKE_REQUEST_TIMEOUT_US))
+        enter_state(WAKE_DONE);
     bflb_irq_restore(irq);
 }

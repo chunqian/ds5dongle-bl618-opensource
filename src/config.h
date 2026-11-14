@@ -26,7 +26,7 @@ struct __attribute__((packed)) config_body {
     uint8_t audio_buffer_length;  /* [16,127]   — controller audio buffer depth */
     uint8_t controller_mode;      /* 0: DS5, 1: DSE, 2: Auto */
     uint8_t enable_usb_sn;        /* bool */
-    uint8_t ps_shortcut_enabled;  /* bool */
+    uint8_t ps_shortcut_enabled;  /* reserved legacy byte, always 0 */
     uint8_t disable_mic;          /* bool       — disable mic passthrough */
     uint8_t disable_speaker;      /* bool       — disable Opus speaker encoding */
     uint8_t enable_wake;          /* bool */
@@ -37,9 +37,9 @@ struct __attribute__((packed)) config_body {
     uint8_t led_r;                /* [0-255] custom LED red   (default 0x00) */
     uint8_t led_g;                /* [0-255] custom LED green (default 0x00) */
     uint8_t led_b;                /* [0-255] custom LED blue  (default 0x40) */
-    uint8_t tp_mode;              /* 0=off, 1=dpad, 2=Lmouse+Rdpad, 3=Ldpad+Rmouse, 4=split */
-    uint8_t tp_mode_enabled_mask; /* bitmask of enabled modes (bit0-bit4) */
-    uint8_t tp_mouse_sensitivity; /* [1-32], default 8 */
+    uint8_t tp_mode;              /* 0=off, 1=dpad, 4=split; legacy mouse modes disabled */
+    uint8_t tp_mode_enabled_mask; /* enabled modes: bits 0, 1, 4 */
+    uint8_t tp_mouse_sensitivity; /* reserved legacy byte, always 0 */
     uint8_t audio_haptic;         /* 0=off, 1=auto(game priority), 2=force */
 };
 
@@ -62,7 +62,6 @@ static inline bool config_wake_enabled(void)       { return config_get()->enable
 static inline bool config_led_disabled(void)        { return config_get()->disable_led; }
 static inline uint8_t config_inactive_minutes(void) { return config_get()->inactive_time; }
 static inline uint8_t config_polling_mode(void)     { return config_get()->polling_rate_mode; }
-static inline bool config_ps_shortcut(void)         { return config_get()->ps_shortcut_enabled; }
 static inline uint8_t config_controller_mode(void)  { return config_get()->controller_mode; }
 static inline bool config_dse_detected(void)        { return config_get()->dse_detected; }
 static inline bool config_speaker_disabled(void)    { return config_get()->disable_speaker; }

@@ -13,13 +13,12 @@ static struct config_body cfg;
 struct config_body *config_get(void) { return &cfg; }
 static uint64_t clock_us;
 static uintptr_t masked;
-static unsigned requests, forced, poweroffs, reports;
+static unsigned requests, forced, poweroffs;
 static uint32_t session=1;
 static bool poweroff_fail, resume_before_submit;
 uint32_t bt_hid_host_session(void) { return session; }
-static bool ready, send_fail, suspend_during_request, resume_during_request;
+static bool suspend_during_request, resume_during_request;
 static int wake_result;
-static uint8_t keys[16], last_key;
 uint64_t bflb_mtimer_get_time_us(void) { return clock_us; }
 uintptr_t bflb_irq_save(void) { uintptr_t old=masked; masked=1; return old; }
 void bflb_irq_restore(uintptr_t old) { masked=old; }
@@ -32,14 +31,6 @@ int usbd_send_remote_wakeup(uint8_t bus) {
     return wake_result;
 }
 void usbd_set_remote_wakeup(uint8_t bus) { assert(!masked && bus==0); forced++; }
-bool usb_gamepad_kbd_ready(void) { assert(!masked); return ready; }
-int usb_gamepad_send_kbd_report(const uint8_t *data,uint8_t len) {
-    assert(!masked && len==8);
-    if(data[2]==last_key) return 0;
-    if(send_fail || !ready) return -1;
-    last_key=data[2];
-    assert(reports<16); keys[reports++]=data[2]; return 0;
-}
 int bt_hid_host_set_feature_crc_guarded(uint8_t id,const uint8_t *data,uint16_t len,uint32_t generation,bool (*allow)(uint32_t),uint32_t token) {
     assert(!masked && id==8 && len==47 && data[0]==2); if(resume_before_submit) usb_wake_on_resume();
     if(!allow(token)) return -1;
@@ -50,15 +41,15 @@ harness += '#include "'+str(ROOT/'src/usb_wake.c')+'"\n'
 harness+=r'''
 static void setup(void) {
     clock_us=0; masked=0; poweroff_fail=resume_before_submit=false; session=1; cfg.enable_wake=1;
-    requests=forced=poweroffs=reports=0; last_key=0;
-    ready=true; send_fail=suspend_during_request=resume_during_request=false;
-    wake_result=0; memset(keys,0,sizeof(keys)); usb_wake_init();
+    requests=forced=poweroffs=0;
+    suspend_during_request=resume_during_request=false;
+    wake_result=0; usb_wake_init();
 }
 static void step(uint64_t time) { clock_us=time; usb_wake_task(); assert(!masked); }
 int main(void) {
     setup(); cfg.enable_wake=0; usb_wake_on_suspend();
     step(2999999); assert(!poweroffs); step(3000000); assert(poweroffs==1);
-    step(9000000); assert(poweroffs==1 && !reports && !requests);
+    step(9000000); assert(poweroffs==1 && !requests);
     setup(); usb_wake_on_suspend(); step(2000000); usb_wake_on_resume();
     step(4000000); assert(!poweroffs);
     setup(); usb_wake_note_usb_reconnect(); usb_wake_on_suspend();
@@ -70,34 +61,26 @@ int main(void) {
 
     setup(); usb_wake_on_suspend(); clock_us=100; usb_wake_on_bt_connect();
     assert(state==WAKE_REQUESTED && requests==1);
-    usb_wake_on_resume(); step(150099); assert(!reports);
-    ready=false; step(150100); assert(!reports && !key_attempts);
-    ready=true; send_fail=true; step(150101); assert(!reports && !key_attempts);
-    send_fail=false; step(150102); assert(reports==1 && keys[0]==0x68);
-    step(230101); assert(reports==1); step(230102); assert(reports==2 && !keys[1]);
-    ready=false; step(430102); step(450000); assert(key_attempts==1 && reports==2);
-    ready=true; step(460000); assert(reports==3 && keys[2]==0x68 && key_attempts==2);
-    step(540000); assert(reports==4 && !keys[3]); step(740000);
-    assert(state==WAKE_DONE && reports==4 && !key_down_on_host && !poweroffs);
+    usb_wake_on_resume(); step(101);
+    assert(state==WAKE_DONE && !poweroffs);
 
     setup(); wake_result=-1; usb_wake_on_suspend(); usb_wake_on_bt_connect();
     assert(forced==1 && state==WAKE_REQUESTED);
-    step(5000001); assert(state==WAKE_DONE && !reports);
+    step(5000001); assert(state==WAKE_DONE);
     /* Changed buttons request wake even if a hub masked our suspend hook. */
     setup(); uint8_t input[10]={0}; input[7]=8; input[8]=1;
     wake_result=-1; usb_wake_on_bt_input(input,10);
     assert(requests==1 && !forced && state==WAKE_IDLE);
     input[8]=0; wake_result=0; usb_wake_on_bt_input(input,10);
-    step(150000); assert(reports==1 && keys[0]==0x68);
-    usb_wake_on_bt_disconnect(); step(150001);
-    assert(reports==2 && !keys[1]); /* release owed even after disconnect */
+    step(150000); assert(state==WAKE_DONE);
+    usb_wake_on_bt_disconnect(); assert(state==WAKE_IDLE);
     setup(); usb_wake_on_suspend(); suspend_during_request=true;
     usb_wake_on_bt_connect(); assert(state==WAKE_PENDING_PRESS); /* old completion ignored */
     setup(); usb_wake_on_suspend(); resume_during_request=true;
-    usb_wake_on_bt_connect(); step(150000); assert(reports==1);
+    usb_wake_on_bt_connect(); step(150000); assert(state==WAKE_DONE);
     /* Re-suspend re-arms a new attempt; callbacks preserve ISR entry mask. */
     masked=1; usb_wake_on_suspend(); assert(masked==1 && state==WAKE_PENDING_PRESS);
-    masked=0; ready=false; step(160000); assert(reports==1);
+    masked=0; step(160000); assert(state==WAKE_PENDING_PRESS);
     setup(); usb_wake_on_suspend(); poweroff_fail=true;
     step(3000000); assert(poweroffs==1 && poweroff_pending);
     step(3099999); assert(poweroffs==1);
@@ -110,7 +93,7 @@ int main(void) {
     usb_wake_on_resume(); step(4000000); assert(poweroffs==1);
     setup(); usb_wake_on_suspend(); resume_before_submit=true;
     step(4000000); assert(!poweroffs && !poweroff_pending);
-    puts("PASS: 3s power-off, reconnect grace, remote wake, two F15 pairs, busy/failure retry, disconnect release, ISR/session races");
+    puts("PASS: 3s power-off, reconnect grace, remote wake, no synthetic input, power-off retry, ISR/session races");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='ds5-wake-') as d:

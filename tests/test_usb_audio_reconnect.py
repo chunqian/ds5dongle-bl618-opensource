@@ -43,7 +43,7 @@ harness = r"""
 #define pdMS_TO_TICKS(x) (x)
 #define LOG_INF(...) ((void)0)
 static struct usb_audio_control audio_control;
-static bool usb_configured, ep_in_busy, kbd_ep_busy, pending_valid, pending_active;
+static bool usb_configured, ep_in_busy, pending_valid, pending_active;
 static bool first_usb_send_logged, usb_bt_hidden, usb_reenumerating;
 static bool usb_profile_pending, usb_reset_pending, host_asleep, profile_restored;
 static uint64_t usb_profile_request_us;
@@ -78,7 +78,6 @@ static uint64_t bflb_mtimer_get_time_us(void) {
 
 static void usb_host_session_end(void) {} /* Exercised with real state in test_output_lifecycle.py. */
 static void usb_wake_note_usb_reconnect(void) {}
-static void aux_reset(void) {}
 static void usb_audio_stop(void) {}
 static void usb_audio_suspend(void) {}
 static void usb_audio_mic_stop(void) {}
@@ -120,7 +119,7 @@ static void vTaskDelay(unsigned ms) {
 static void setup(void) {
     memset(&audio_control, 0, sizeof(audio_control));
     usb_configured = true;
-    ep_in_busy = kbd_ep_busy = pending_valid = pending_active = first_usb_send_logged = false;
+    ep_in_busy = pending_valid = pending_active = first_usb_send_logged = false;
     memset(usb_regs,0,sizeof(usb_regs));
     usb_bt_hidden=usb_reenumerating=false; suspends=0;
     usb_profile_pending=usb_reset_pending=host_asleep=profile_restored=false; usb_profile_request_us=0;

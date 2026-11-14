@@ -25,29 +25,21 @@
 #include "task.h"
 #include "queue.h"
 
-#if defined(BOARD_LCTECH_616)
-  #ifdef FORCE_FS_MODE
-    #define FIRMWARE_VERSION "LCT616-DS5 3.18-HidAudio-R5"
-  #else
-    #define FIRMWARE_VERSION "LCT616-DS5 3.18H-HidAudio-R5"
-  #endif
-#elif defined(BOARD_M0S_DOCK)
-#define FIRMWARE_VERSION "M0S-DS5 3.5-HidAudio-R5"
+#ifdef FORCE_FS_MODE
+#define FIRMWARE_VERSION "LCT616-DS5 3.18-HidAudio-R5"
 #else
-#define FIRMWARE_VERSION "BL618-DS5 3.5-HidAudio-R5"
+#define FIRMWARE_VERSION "LCT616-DS5 3.18H-HidAudio-R5"
 #endif
 
 #define USBD_MAX_POWER      250
 #define USBD_LANGID         0x0409
 
-/* Config(9) + Audio(186) + Gamepad(9+9+7) + Keyboard(9+9+7) = 245 */
-#define USB_KBD_DESC_SIZE  25   /* intf(9) + HID(9) + EP_IN(7) */
-#define USB_HID_ONLY_SIZE (9 + 9 + 7 + USB_KBD_DESC_SIZE)
+/* Config(9) + Audio(186) + Gamepad(9+9+7) = 220 */
+#define USB_HID_ONLY_SIZE (9 + 9 + 7)
 #define USB_AUDIO_DESC_SIZE 186
 #define USB_HID_CONFIG_SIZE (9 + USB_AUDIO_DESC_SIZE + USB_HID_ONLY_SIZE)
 #define HID_REPORT_DESC_SIZE_DS  329
 #define HID_REPORT_DESC_SIZE_DSE 445
-#define KBD_REPORT_DESC_SIZE 138  /* Keyboard + Consumer + Mouse */
 
 static bool current_dse_mode = false;
 static bool requested_dse_mode, usb_initialized;
@@ -342,85 +334,6 @@ static const uint8_t hid_report_desc_dse[HID_REPORT_DESC_SIZE_DSE] = {
     0xC0,
 };
 
-/* Multi-TLC HID report descriptor: Keyboard (Report ID 1) + Consumer Control (Report ID 2) + Mouse (Report ID 3) */
-static const uint8_t kbd_report_desc[KBD_REPORT_DESC_SIZE] = {
-    /* ── Collection 1: Keyboard (Report ID 1, 9 bytes total) ── */
-    0x05, 0x01,       /* Usage Page (Generic Desktop) */
-    0x09, 0x06,       /* Usage (Keyboard) */
-    0xA1, 0x01,       /* Collection (Application) */
-    0x85, 0x01,       /*   Report ID (1) */
-    0x05, 0x07,       /*   Usage Page (Keyboard/Keypad) */
-    0x19, 0xE0,       /*   Usage Minimum (Left Control) */
-    0x29, 0xE7,       /*   Usage Maximum (Right GUI) */
-    0x15, 0x00,       /*   Logical Minimum (0) */
-    0x25, 0x01,       /*   Logical Maximum (1) */
-    0x75, 0x01,       /*   Report Size (1) */
-    0x95, 0x08,       /*   Report Count (8) */
-    0x81, 0x02,       /*   Input (Data,Var,Abs) — modifier byte */
-    0x95, 0x01,       /*   Report Count (1) */
-    0x75, 0x08,       /*   Report Size (8) */
-    0x81, 0x01,       /*   Input (Const) — reserved byte */
-    0x95, 0x06,       /*   Report Count (6) */
-    0x75, 0x08,       /*   Report Size (8) */
-    0x15, 0x00,       /*   Logical Minimum (0) */
-    0x26, 0xFF, 0x00, /*   Logical Maximum (255) */
-    0x05, 0x07,       /*   Usage Page (Keyboard/Keypad) */
-    0x19, 0x00,       /*   Usage Minimum (0) */
-    0x2A, 0xFF, 0x00, /*   Usage Maximum (255) */
-    0x81, 0x00,       /*   Input (Data,Array) — 6 keycodes */
-    0xC0,             /* End Collection */
-
-    /* ── Collection 2: Consumer Control (Report ID 2, 1 byte bitmap) ── */
-    0x05, 0x0C,       /* Usage Page (Consumer) */
-    0x09, 0x01,       /* Usage (Consumer Control) */
-    0xA1, 0x01,       /* Collection (Application) */
-    0x85, 0x02,       /*   Report ID (2) */
-    0x15, 0x00,       /*   Logical Minimum (0) */
-    0x25, 0x01,       /*   Logical Maximum (1) */
-    0x75, 0x01,       /*   Report Size (1) */
-    0x95, 0x03,       /*   Report Count (3) — 3 bits: VolUp, VolDn, Mute */
-    0x09, 0xE9,       /*   Usage (Volume Increment) — bit 0 */
-    0x09, 0xEA,       /*   Usage (Volume Decrement) — bit 1 */
-    0x09, 0xE2,       /*   Usage (Mute)             — bit 2 */
-    0x81, 0x02,       /*   Input (Data,Var,Abs) */
-    0x95, 0x01,       /*   Report Count (1) */
-    0x75, 0x05,       /*   Report Size (5) — padding */
-    0x81, 0x01,       /*   Input (Const) */
-    0xC0,             /* End Collection */
-
-    /* ── Collection 3: Mouse (Report ID 3, 4 bytes: btns + X + Y + wheel) ── */
-    0x05, 0x01,       /* Usage Page (Generic Desktop) */
-    0x09, 0x02,       /* Usage (Mouse) */
-    0xA1, 0x01,       /* Collection (Application) */
-    0x85, 0x03,       /*   Report ID (3) */
-    0x09, 0x01,       /*   Usage (Pointer) */
-    0xA1, 0x00,       /*   Collection (Physical) */
-    0x05, 0x09,       /*   Usage Page (Button) */
-    0x19, 0x01,       /*   Usage Minimum (1) */
-    0x29, 0x03,       /*   Usage Maximum (3) */
-    0x15, 0x00,       /*   Logical Minimum (0) */
-    0x25, 0x01,       /*   Logical Maximum (1) */
-    0x95, 0x03,       /*   Report Count (3) */
-    0x75, 0x01,       /*   Report Size (1) */
-    0x81, 0x02,       /*   Input (Data,Var,Abs) — 3 buttons */
-    0x95, 0x01,       /*   Report Count (1) */
-    0x75, 0x05,       /*   Report Size (5) */
-    0x81, 0x01,       /*   Input (Const) — padding */
-    0x05, 0x01,       /*   Usage Page (Generic Desktop) */
-    0x09, 0x30,       /*   Usage (X) */
-    0x09, 0x31,       /*   Usage (Y) */
-    0x15, 0x81,       /*   Logical Minimum (-127) */
-    0x25, 0x7F,       /*   Logical Maximum (127) */
-    0x75, 0x08,       /*   Report Size (8) */
-    0x95, 0x02,       /*   Report Count (2) */
-    0x81, 0x06,       /*   Input (Data,Var,Rel) — X, Y */
-    0x09, 0x38,       /*   Usage (Wheel) */
-    0x95, 0x01,       /*   Report Count (1) */
-    0x81, 0x06,       /*   Input (Data,Var,Rel) — Wheel */
-    0xC0,             /*   End Collection (Physical) */
-    0xC0,             /* End Collection (Application) */
-};
-
 static uint8_t device_desc[] = {
     0x12,                    /* bLength */
     0x01,                    /* bDescriptorType: Device */
@@ -447,15 +360,12 @@ static uint8_t device_desc[] = {
 #define HID_SECTION_OFFSET          (AUDIO_DESC_OFFSET + USB_AUDIO_DESC_SIZE)  /* 195 */
 #define CONFIG_DESC_WDLEN_OFF       (HID_SECTION_OFFSET + 9 + 7)  /* 211: gamepad HID wDescriptorLength */
 #define BINTERVAL_GAMEPAD_EP_IN_OFF (HID_SECTION_OFFSET + 9 + 9 + 6) /* 219 */
-#define KBD_INTF_OFF  (HID_SECTION_OFFSET + 9 + 9 + 7) /* 220 */
-#define KBD_SUBCLASS_OFF (KBD_INTF_OFF + 6)  /* bInterfaceSubClass in kbd intf */
-#define KBD_PROTOCOL_OFF (KBD_INTF_OFF + 7)  /* bInterfaceProtocol in kbd intf */
 
 static uint8_t config_desc[USB_HID_CONFIG_SIZE] = {
     /* Configuration Descriptor (9 bytes) */
     0x09, 0x02,
     USB_HID_CONFIG_SIZE & 0xFF, (USB_HID_CONFIG_SIZE >> 8) & 0xFF,
-    0x05,                    /* bNumInterfaces: AC + AS_SPK + AS_MIC + Gamepad + Kbd */
+    0x04,                    /* bNumInterfaces: AC + AS_SPK + AS_MIC + Gamepad */
     0x01,                    /* bConfigurationValue */
     0x00,                    /* iConfiguration */
     0xE0,                    /* bmAttributes: self-powered + remote wakeup */
@@ -490,31 +400,6 @@ static uint8_t config_desc[USB_HID_CONFIG_SIZE] = {
     0x03,                    /* bmAttributes: Interrupt */
     USB_GAMEPAD_EP_MPS, 0x00,
     USB_GAMEPAD_INTERVAL_MS,
-
-    /* ---- Interface 4: Keyboard (PS shortcut / remap / wake key) ---- */
-    0x09, 0x04,
-    USB_INTF_KBD,            /* bInterfaceNumber: 4 */
-    0x00,                    /* bAlternateSetting */
-    0x01,                    /* bNumEndpoints: IN only */
-    0x03,                    /* bInterfaceClass: HID */
-    0x01,                    /* bInterfaceSubClass: Boot Interface Subclass */
-    0x01,                    /* bInterfaceProtocol: Keyboard — forces kbdhid.sys on Windows */
-    0x00,                    /* iInterface */
-
-    /* HID Descriptor (Keyboard) */
-    0x09, 0x21,
-    0x11, 0x01,              /* bcdHID: 1.11 */
-    0x00,                    /* bCountryCode */
-    0x01,                    /* bNumDescriptors */
-    0x22,                    /* bDescriptorType: Report */
-    KBD_REPORT_DESC_SIZE & 0xFF, (KBD_REPORT_DESC_SIZE >> 8) & 0xFF,
-
-    /* EP IN (Keyboard) */
-    0x07, 0x05,
-    USB_KBD_EP_IN,           /* bEndpointAddress */
-    0x03,                    /* bmAttributes: Interrupt */
-    USB_KBD_EP_MPS, 0x00,
-    USB_KBD_INTERVAL_MS,
 };
 
 /* ---- Advance-mode descriptor callbacks ---- */
@@ -573,13 +458,10 @@ static const uint8_t *desc_other_speed_cb(uint8_t speed)
             if ((bmAttr & 0x03) == 0x01)
                 other_speed_desc[i + 6] = 1;   /* ISO: FS bInterval=1 (1ms) */
             else if ((bmAttr & 0x03) == 0x03) {
-                bool keyboard = other_speed_desc[i + 2] == USB_KBD_EP_IN;
 #ifdef FORCE_FS_MODE
-                other_speed_desc[i + 6] = keyboard ? 7 :
-                    (applied_polling_mode == 0 ? 6 : applied_polling_mode == 1 ? 5 : 3);
+                other_speed_desc[i + 6] = (applied_polling_mode == 0 ? 6 : applied_polling_mode == 1 ? 5 : 3);
 #else
-                other_speed_desc[i + 6] = keyboard ? 10 :
-                    (applied_polling_mode == 0 ? 4 : applied_polling_mode == 1 ? 2 : 1);
+                other_speed_desc[i + 6] = (applied_polling_mode == 0 ? 4 : applied_polling_mode == 1 ? 2 : 1);
 #endif
             }
         }
@@ -652,23 +534,13 @@ static const struct usb_descriptor usb_desc = {
 /* Gamepad interface / endpoints */
 static struct usbd_interface hid_intf;
 static struct usbd_endpoint  hid_ep_in;
-/* EP OUT removed: output reports arrive via EP0 SET_REPORT to avoid
- * FIFO F2 sharing conflict with keyboard EP3 IN. */
-
-/* Keyboard interface / endpoint */
-static struct usbd_interface kbd_intf;
-static struct usbd_endpoint  kbd_ep_in;
-
-static bool kbd_registered = false;
+/* Output reports arrive via EP0 SET_REPORT; no interrupt OUT endpoint. */
 
 /* Only called before enumeration, during reset, or while detached. */
+
 static void apply_audio_profile(void)
 {
     hid_intf.intf_num = audio_control.visible ? USB_INTF_GAMEPAD : 0;
-    usbd_hid_init_intf(0, &kbd_intf, kbd_report_desc, sizeof(kbd_report_desc));
-    kbd_intf.intf_num = kbd_registered ? (audio_control.visible ? USB_INTF_KBD : 1) : 0xff;
-    if (!kbd_registered)
-        kbd_intf.class_interface_handler = NULL;
     usb_audio_set_visible(audio_control.visible);
 }
 
@@ -713,11 +585,6 @@ bool usb_gamepad_host_active(void)
 static volatile bool usb_bt_hidden = false;
 static volatile bool usb_reenumerating = false;
 static volatile bool ep_in_busy = false;
-static volatile bool kbd_ep_busy = false;
-static struct hid_aux aux;
-static uint32_t aux_session;
-static void aux_flush(void);
-static void aux_reset(void);
 static usb_gamepad_output_cb_t output_callback = NULL;
 
 /* Suspend/resume hooks for wake module */
@@ -726,7 +593,6 @@ static void (*hook_resume)(void)     = NULL;
 static void (*hook_configured)(void) = NULL;
 
 static USB_NOCACHE_RAM_SECTION uint8_t usb_in_buf[64];
-static USB_NOCACHE_RAM_SECTION uint8_t kbd_buf[USB_KBD_EP_MPS];
 
 static volatile uint8_t pending_payload[DS5_USB_INPUT_PAYLOAD_LEN];
 /* Valid cache and unsent update are distinct: periodic modes may replay a
@@ -790,13 +656,6 @@ static void hid_ep_in_handler(uint8_t busid, uint8_t ep, uint32_t nbytes)
     try_send_pending();
 }
 
-static void kbd_ep_in_handler(uint8_t busid, uint8_t ep, uint32_t nbytes)
-{
-    (void)busid; (void)ep; (void)nbytes;
-    kbd_ep_busy = false;
-    aux_flush();
-}
-
 static void usbd_event_handler(uint8_t busid, uint8_t event)
 {
     switch (event) {
@@ -806,7 +665,6 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
         usb_audio_control_configured(&audio_control);
         usb_configured = true;
         ep_in_busy = false;
-        kbd_ep_busy = false;
         LOG_INF("[USB-EVT] CONFIGURED — host enumeration complete!\n");
         if (hook_configured)
             hook_configured();
@@ -824,9 +682,7 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
         ep_in_busy = false;
         pending_valid = false;
         pending_active = false;
-        kbd_ep_busy = false;
         first_usb_send_logged = false;
-        aux_reset();
         usb_audio_stop();
         usb_audio_mic_stop();
         audio_set_mic_active(false);
@@ -836,7 +692,6 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
     case USBD_EVENT_SUSPEND:
         usb_configured = false;
         ep_in_busy = false;
-        kbd_ep_busy = false;
         usb_audio_suspend();
         LOG_INF("[USB-EVT] SUSPEND\n");
         /* Our own detach must not masquerade as a sleeping host, otherwise
@@ -849,7 +704,6 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
         usb_configured = true;
         usb_audio_resume();
         ep_in_busy = false;
-        kbd_ep_busy = false;
         LOG_INF("[USB-EVT] RESUME\n");
         if (hook_resume)
             hook_resume();
@@ -860,7 +714,6 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
         break;
     case USBD_EVENT_DISCONNECTED:
         usb_host_session_end();
-        aux_reset();
         usb_audio_control_disconnect(&audio_control);
         apply_audio_profile();
         usb_configured = false;
@@ -902,18 +755,10 @@ static void apply_dse_mode(bool dse)
            dse ? "Edge" : "Standard", pid, rdl);
 }
 
-static bool profile_needs_keyboard(void)
-{
-    const struct config_body *cfg = config_get();
-    return cfg->enable_wake || cfg->ps_shortcut_enabled || remap_has_kbd_targets() || remap_has_mouse_targets() ||
-           cfg->tp_mode == 2 || cfg->tp_mode == 3;
-}
-
 static bool usb_profile_matches_config(void)
 {
     const struct config_body *cfg = config_get();
     return current_dse_mode == requested_dse_mode &&
-           kbd_registered == profile_needs_keyboard() &&
            !!(config_desc[7] & 0x20) == !!cfg->enable_wake &&
            device_desc[16] == (cfg->enable_usb_sn ? 3 : 0) &&
            applied_polling_mode == cfg->polling_rate_mode;
@@ -930,14 +775,11 @@ static void apply_usb_profile(void)
 {
     const struct config_body *cfg = config_get();
     apply_dse_mode(requested_dse_mode);
-    kbd_registered = profile_needs_keyboard();
-    uint16_t total = USB_HID_CONFIG_SIZE - (kbd_registered ? 0 : USB_KBD_DESC_SIZE);
+    uint16_t total = USB_HID_CONFIG_SIZE;
     config_desc[2] = total & 0xff;
     config_desc[3] = total >> 8;
-    config_desc[4] = kbd_registered ? 5 : 4;
+    config_desc[4] = 4;
     config_desc[7] = cfg->enable_wake ? 0xe0 : 0xc0;
-    config_desc[KBD_SUBCLASS_OFF] = 0;
-    config_desc[KBD_PROTOCOL_OFF] = 0;
     device_desc[16] = cfg->enable_usb_sn ? 3 : 0;
     apply_polling_rate(cfg->polling_rate_mode);
     applied_polling_mode = cfg->polling_rate_mode;
@@ -1028,10 +870,8 @@ void usb_gamepad_process_deferred(void)
         usb_audio_control_apply(&audio_control, enabled, generation,
                                 bflb_mtimer_get_time_us());
         apply_usb_profile();
-        aux_reset();
         usb_profile_pending = false;
         ep_in_busy = false;
-        kbd_ep_busy = false;
         pending_valid = false;
         pending_active = false;
         enabled = audio_control.visible;
@@ -1045,7 +885,6 @@ void usb_gamepad_process_deferred(void)
     deferred_store_process();
 
 
-    aux_flush();
     usb_audio_poll();
 
     /* Recover a failed queue attempt even when the controller stops sending. */
@@ -1054,10 +893,8 @@ void usb_gamepad_process_deferred(void)
 
 int usb_gamepad_init(usb_gamepad_output_cb_t output_cb)
 {
-    aux_reset();
     output_callback = output_cb;
     memset(usb_in_buf, 0, sizeof(usb_in_buf));
-    memset(kbd_buf, 0, sizeof(kbd_buf));
 
     if (!set_report_queue)
         set_report_queue = xQueueCreate(SET_REPORT_QUEUE_DEPTH,
@@ -1094,17 +931,10 @@ int usb_gamepad_init(usb_gamepad_output_cb_t output_cb)
     LOG_INF("[USB-INIT] Gamepad HID intf added (report_desc=%uB, DSE=%d)\n",
            rd_len, current_dse_mode);
 
-    usbd_add_interface(0, usbd_hid_init_intf(
-        0, &kbd_intf, kbd_report_desc, sizeof(kbd_report_desc)));
-
     hid_ep_in.ep_addr = USB_GAMEPAD_EP_IN;
     hid_ep_in.ep_cb = hid_ep_in_handler;
     usbd_add_endpoint(0, &hid_ep_in);
 
-
-    kbd_ep_in.ep_addr = USB_KBD_EP_IN;
-    kbd_ep_in.ep_cb = kbd_ep_in_handler;
-    usbd_add_endpoint(0, &kbd_ep_in);
 
     /* Read registers BEFORE usbd_initialize */
     {
@@ -1163,14 +993,7 @@ int usb_gamepad_init(usb_gamepad_output_cb_t output_cb)
     }
 
     LOG_INF("[USB-INIT] === USB Ready. Waiting for host to send RESET ===\n");
-#if USB_NATIVE_TYPEC
     LOG_INF("[USB-INIT] USB Type-C native — no wiring needed\n");
-#else
-    LOG_INF("[USB-INIT] If no [USB-EVT] RESET appears, check wiring:\n");
-    LOG_INF("[USB-INIT]   Kit Pin 37 (USB_DM) -> cable D- (white)\n");
-    LOG_INF("[USB-INIT]   Kit Pin 38 (USB_DP) -> cable D+ (green)\n");
-    LOG_INF("[USB-INIT]   Kit Pin 21/22 (GND) -> cable GND (black)\n");
-#endif
     return 0;
 }
 
@@ -1251,118 +1074,10 @@ bool usb_gamepad_is_ready(void)
 }
 
 
-/* All auxiliary producers share one immutable in-flight DMA buffer. The
- * arbiter retains desired states/motion on busy or driver failure. */
-static int aux_write(const uint8_t *report, uint8_t len)
-{
-    if (!usb_configured || !kbd_registered || kbd_ep_busy) return -1;
-    memcpy(kbd_buf, report, len);
-    kbd_ep_busy = true;
-    int ret = usbd_ep_start_write(0, USB_KBD_EP_IN, kbd_buf, len);
-    if (ret < 0) kbd_ep_busy = false; /* no transfer was accepted */
-    return ret;
-}
-static void aux_sync_session(void)
-{
-    uint32_t session = bt_hid_host_session();
-    if (session != aux_session || bt_hid_host_get_state() == BT_HID_STATE_DISCONNECTING) {
-        hid_aux_release(&aux);
-        aux_session = session;
-    }
-}
-static void aux_flush(void)
-{
-    uintptr_t irq = bflb_irq_save();
-    aux_sync_session();
-    hid_aux_flush(&aux, aux_write);
-    bflb_irq_restore(irq);
-}
-static void aux_reset(void)
-{
-    uintptr_t irq = bflb_irq_save();
-    hid_aux_reset(&aux);
-    aux_session = bt_hid_host_session();
-    kbd_ep_busy = false; /* bus reset/detach has cancelled endpoint ownership */
-    bflb_irq_restore(irq);
-}
-void usb_gamepad_release_aux(void)
-{
-    uintptr_t irq = bflb_irq_save();
-    hid_aux_release(&aux);
-    aux_session = bt_hid_host_session();
-    hid_aux_flush(&aux, aux_write);
-    bflb_irq_restore(irq);
-}
-int usb_gamepad_send_keys(enum hid_aux_source source, const uint8_t *report,
-                          uint8_t len, uint32_t session)
-{
-    if ((unsigned)source >= HID_AUX_SOURCES || !report) return -1;
-    uintptr_t irq = bflb_irq_save();
-    aux_sync_session();
-    if (session != aux_session || bt_hid_host_get_state() == BT_HID_STATE_DISCONNECTING) {
-        bflb_irq_restore(irq); return -1;
-    }
-    uint8_t keys[8] = {0};
-    memcpy(keys, report, len > 8 ? 8 : len);
-    hid_aux_keyboard(&aux, source, keys);
-    hid_aux_flush(&aux, aux_write);
-    int ret = usb_configured && kbd_registered && hid_aux_keyboard_sent(&aux) ? 0 : -1;
-    bflb_irq_restore(irq);
-    return ret;
-}
-int usb_gamepad_send_kbd_report(const uint8_t *report, uint8_t len)
-{
-    return usb_gamepad_send_keys(HID_AUX_WAKE, report, len, bt_hid_host_session());
-}
-int usb_gamepad_send_consumer_session(uint16_t bits, uint32_t session)
-{
-    uintptr_t irq = bflb_irq_save();
-    aux_sync_session();
-    if (session != aux_session || bt_hid_host_get_state() == BT_HID_STATE_DISCONNECTING) {
-        bflb_irq_restore(irq); return -1;
-    }
-    hid_aux_consumer(&aux, bits & 0xff);
-    hid_aux_flush(&aux, aux_write);
-    int ret = usb_configured && kbd_registered && aux.consumer == aux.sent_consumer ? 0 : -1;
-    bflb_irq_restore(irq);
-    return ret;
-}
-int usb_gamepad_send_consumer_report(uint16_t bits)
-{
-    return usb_gamepad_send_consumer_session(bits, bt_hid_host_session());
-}
-/* Motion is accumulated once per input, then drained by the arbiter. A zero
- * return here means ownership transferred, not that the host has polled it. */
-int usb_gamepad_send_mouse_session(uint8_t buttons, int8_t dx, int8_t dy, int8_t wheel,
-                                   uint32_t session)
-{
-    uintptr_t irq = bflb_irq_save();
-    aux_sync_session();
-    if (session != aux_session || bt_hid_host_get_state() == BT_HID_STATE_DISCONNECTING) {
-        bflb_irq_restore(irq); return -1;
-    }
-    hid_aux_mouse(&aux, buttons, dx, dy, wheel);
-    hid_aux_flush(&aux, aux_write);
-    bflb_irq_restore(irq);
-    return 0;
-}
-int usb_gamepad_send_mouse_report(uint8_t buttons, int8_t dx, int8_t dy, int8_t wheel)
-{
-    return usb_gamepad_send_mouse_session(buttons, dx, dy, wheel, bt_hid_host_session());
-}
-bool usb_gamepad_kbd_ready(void)
-{
-    uintptr_t irq = bflb_irq_save();
-    bool ready = usb_configured && kbd_registered && !kbd_ep_busy;
-    bflb_irq_restore(irq);
-    return ready;
-}
-
 /* ---------- HID class request callbacks (Feature Report forwarding) ---------- */
 
 /* +1 for Report ID prefix required by CherryUSB */
 static uint8_t feature_resp_buf[FEATURE_DATA_MAX + 1];
-static uint8_t kbd_idle_report[USB_KBD_EP_MPS];
 
 static bool is_dongle_cmd(uint8_t report_id)
 {
@@ -1455,13 +1170,7 @@ void usbd_hid_get_report(uint8_t busid, uint8_t intf, uint8_t report_id,
                          uint8_t report_type, uint8_t **data, uint32_t *len)
 {
     (void)busid;
-
-    if (kbd_registered && intf == kbd_intf.intf_num) {
-        memset(kbd_idle_report, 0, sizeof(kbd_idle_report));
-        *data = kbd_idle_report;
-        *len  = (report_id == 0x02) ? 1 : 8; /* CC=1B bitmap, Kbd=8B (no Report ID prefix) */
-        return;
-    }
+    (void)intf;
 
     if (report_type != 0x03) {
         *len = 0;
@@ -1580,10 +1289,7 @@ void usbd_hid_set_report(uint8_t busid, uint8_t intf, uint8_t report_id,
                          uint32_t report_len)
 {
     (void)busid;
-
-    if (kbd_registered && intf == kbd_intf.intf_num) {
-        return;
-    }
+    (void)intf;
 
     const uint8_t *payload = report;
     uint32_t payload_len = report_len;
@@ -1727,7 +1433,6 @@ bool usb_gamepad_set_bt_visible(bool visible)
         usb_soft_disconnect();
         usb_configured = false;
         ep_in_busy = false;
-        kbd_ep_busy = false;
         pending_valid = false;
         pending_active = false;
     }

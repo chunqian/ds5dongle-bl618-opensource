@@ -50,8 +50,7 @@ void config_validate(void)
         b->controller_mode = 2;
     if (b->enable_usb_sn > 1)
         b->enable_usb_sn = 0;
-    if (b->ps_shortcut_enabled > 1)
-        b->ps_shortcut_enabled = 0;
+    b->ps_shortcut_enabled = 0; /* Reserved: auxiliary keyboard removed. */
     if (b->disable_mic > 1)
         b->disable_mic = 0;
     if (b->disable_speaker > 1)
@@ -73,12 +72,12 @@ void config_validate(void)
         b->led_g = CONFIG_DEFAULT_LED_G;
         b->led_b = CONFIG_DEFAULT_LED_B;
     }
-    if (b->tp_mode > 4)
+    if (b->tp_mode > 4 || b->tp_mode == 2 || b->tp_mode == 3)
         b->tp_mode = 0;
-    if (b->tp_mode_enabled_mask == 0 || b->tp_mode_enabled_mask > 0x1F)
+    b->tp_mode_enabled_mask &= 0x13; /* Only off, gamepad d-pad and split zones. */
+    if (b->tp_mode_enabled_mask == 0)
         b->tp_mode_enabled_mask = 0x01; /* at least mode 0 enabled */
-    if (b->tp_mouse_sensitivity == 0 || b->tp_mouse_sensitivity > 32)
-        b->tp_mouse_sensitivity = 8;
+    b->tp_mouse_sensitivity = 0; /* Reserved legacy byte. */
     if (b->audio_haptic > 2)
         b->audio_haptic = 0;
 }

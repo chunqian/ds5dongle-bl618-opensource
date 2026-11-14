@@ -39,21 +39,14 @@ struct usbd_interface {
     uint8_t intf_num;
     void *class_interface_handler;
 };
-static struct usbd_interface hid_intf, kbd_intf;
+static struct usbd_interface hid_intf;
 static struct config_body cfg;
 struct config_body *config_get(void) { return &cfg; }
-static bool remap_keys, remap_mouse, audio_visible;
-static bool remap_has_mouse_targets(void) { return remap_mouse; }
-static bool remap_has_kbd_targets(void) { return remap_keys; }
+static bool audio_visible;
 void usb_audio_set_visible(bool value) { audio_visible = value; }
-static void usbd_hid_init_intf(int bus, struct usbd_interface *p, const uint8_t *rd, size_t len) {
-    (void)bus; p->hid_report_descriptor=rd; p->hid_report_descriptor_len=len;
-    p->class_interface_handler=(void *)1;
-}
 static uint64_t now_us;
 static uint64_t bflb_mtimer_get_time_us(void) { return now_us; }
 static bool current_dse_mode, requested_dse_mode, usb_initialized, usb_profile_pending;
-static bool kbd_registered;
 static uint64_t usb_profile_request_us;
 static uint8_t applied_polling_mode;
 static struct usb_audio_control audio_control;
@@ -66,7 +59,6 @@ for signature in (
     'static void apply_polling_rate(uint8_t mode)',
     'static void apply_audio_profile(void)',
     'static void apply_dse_mode(bool dse)',
-    'static bool profile_needs_keyboard(void)',
     'static bool usb_profile_matches_config(void)',
     'static void request_usb_profile(void)',
     'static void apply_usb_profile(void)',
@@ -78,11 +70,11 @@ for signature in (
     harness += function(signature)
 harness += r'''
 static unsigned u16(const uint8_t *p) { return p[0] | (p[1]<<8); }
-static void check_descriptors(bool edge, bool with_audio, bool keyboard, bool wake, unsigned poll) {
+static void check_descriptors(bool edge, bool with_audio, bool wake, unsigned poll) {
     const uint8_t *dev=desc_device_cb(0), *desc=desc_config_cb(0);
     assert(u16(dev+10)==(edge?0x0df2:0x0ce6));
-    assert(desc && u16(desc+2)==9+(with_audio?186:0)+25+(keyboard?25:0));
-    unsigned expected=(with_audio?3:0)+1+keyboard;
+    assert(desc && u16(desc+2)==9+(with_audio?186:0)+25);
+    unsigned expected=(with_audio?3:0)+1;
     assert(desc[4]==expected && !!(desc[7]&0x20)==wake);
     unsigned seen=0, hid_count=0, last_intf=255;
     for (unsigned i=9; i<u16(desc+2); i+=desc[i]) {
@@ -99,22 +91,17 @@ static void check_descriptors(bool edge, bool with_audio, bool keyboard, bool wa
                 assert(u16(desc+i+7)==hid_intf.hid_report_descriptor_len);
                 assert(hid_intf.hid_report_descriptor==(edge?hid_report_desc_dse:hid_report_desc_ds));
                 assert(desc[i+9+6]==poll);
-            } else {
-                assert(last_intf==kbd_intf.intf_num);
-                assert(kbd_intf.class_interface_handler);
-                assert(u16(desc+i+7)==sizeof(kbd_report_desc));
-                assert(desc[i+9+6]==USB_KBD_INTERVAL_MS);
+
             }
         }
     }
-    assert(seen==expected && hid_count==1+keyboard);
+    assert(seen==expected && hid_count==1);
     assert(audio_visible==with_audio);
-    if (!keyboard) assert(kbd_intf.intf_num==255 && !kbd_intf.class_interface_handler);
 }
 int main(void) {
     memcpy(config_desc+AUDIO_DESC_OFFSET, audio_desc, sizeof(audio_desc));
     usb_initialized=true;
-    /* Real descriptor matrix: both PIDs, audio profiles, keyboard and polling modes. */
+    /* Real descriptor matrix: both PIDs, audio profiles, legacy auxiliary settings and polling modes. */
     for (unsigned edge=0;edge<2;edge++)
     for (unsigned aud=0;aud<2;aud++)
     for (unsigned keys=0;keys<7;keys++)
@@ -123,7 +110,6 @@ int main(void) {
         cfg.polling_rate_mode=mode;
         cfg.enable_wake=keys==1;
         cfg.ps_shortcut_enabled=keys==2;
-        remap_keys=keys==3; remap_mouse=keys==6;
         cfg.tp_mode=keys==4?2:keys==5?3:0;
         requested_dse_mode=edge;
         audio_control.visible=aud;
@@ -133,22 +119,22 @@ int main(void) {
 #else
         unsigned poll=mode==0?6:mode==1?5:3;
 #endif
-        check_descriptors(edge,aud,keys!=0,keys==1,poll);
+        check_descriptors(edge,aud,keys==1,poll);
         assert(usb_profile_matches_config());
         const uint8_t *other=desc_other_speed_cb(0);
         assert(other && other[1]==7);
         for(unsigned i=9;i<u16(other+2);i+=other[i]) {
             if(other[i+1]!=5 || (other[i+3]&3)!=3) continue;
-            bool kbd=other[i+2]==USB_KBD_EP_IN;
+            assert(other[i+2]==USB_GAMEPAD_EP_IN);
 #ifdef FORCE_FS_MODE
-            assert(other[i+6]==(kbd?7:mode==0?6:mode==1?5:3));
+            assert(other[i+6]==(mode==0?6:mode==1?5:3));
 #else
-            assert(other[i+6]==(kbd?10:mode==0?4:mode==1?2:1));
+            assert(other[i+6]==(mode==0?4:mode==1?2:1));
 #endif
         }
     }
     /* A pending host setting must not mutate an attached descriptor set. */
-    memset(&cfg,0,sizeof(cfg)); remap_keys=remap_mouse=false; requested_dse_mode=false;
+    memset(&cfg,0,sizeof(cfg)); requested_dse_mode=false;
     audio_control.visible=false; apply_usb_profile();
     uint8_t old_device[sizeof(device_desc)], old_config[sizeof(config_desc)];
     memcpy(old_device,device_desc,sizeof(old_device));

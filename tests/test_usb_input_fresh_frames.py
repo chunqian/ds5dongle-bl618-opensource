@@ -46,7 +46,7 @@ static uint32_t bt_hid_host_session(void) { return generation; }
 static unsigned bt_hid_host_get_state(void) { return bt_state; }
 static struct config_body test_config;
 struct config_body *config_get(void) { return &test_config; }
-static bool first_usb_send_logged, kbd_ep_busy;
+static bool first_usb_send_logged;
 static bool usb_bt_hidden, usb_reenumerating;
 static struct usb_audio_control audio_control;
 static void (*hook_configured)(void), (*hook_resume)(void), (*hook_suspend)(void);
@@ -94,7 +94,6 @@ static bool host_session_open;
 static void usb_host_session_end(void) { host_session_open=false; }
 static void usb_soft_disconnect(void) {}
 static void apply_audio_profile(void) {}
-static void aux_reset(void) {}
 static void usb_audio_stop(void) {}
 static void usb_audio_suspend(void) {}
 static void usb_audio_resume(void) {}
@@ -117,7 +116,7 @@ static void setup(void) {
     memset(&audio_control, 0, sizeof(audio_control));
     memset((void *)pending_payload, 0, sizeof(pending_payload));
     memset(usb_in_buf, 0, sizeof(usb_in_buf));
-    pending_valid = pending_active = ep_in_busy = first_usb_send_logged = kbd_ep_busy = false;
+    pending_valid = pending_active = ep_in_busy = first_usb_send_logged = false;
     memset(&test_config, 0, sizeof(test_config));
     test_config.polling_rate_mode = 2;
     usb_configured = true;

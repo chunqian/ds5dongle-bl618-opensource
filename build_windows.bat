@@ -15,13 +15,20 @@ rem
 rem  Environment overrides:
 rem    BL_SDK_BASE     path to the DS5Dongle BL618 SDK fork
 rem    TOOLCHAIN_PATH  path to the T-Head Windows toolchain
-rem    BOARD_TYPE      lctech616 (default) | aim61 | m0sdock
 rem    USB_SPEED       fs (default) | hs
 rem ============================================================
 
 if "%BL_SDK_BASE%"=="" set "BL_SDK_BASE=%~dp0..\bouffalo_sdk"
 if "%TOOLCHAIN_PATH%"=="" set "TOOLCHAIN_PATH=%USERPROFILE%\Desktop\toolchain_gcc_t-head_windows"
-if "%BOARD_TYPE%"=="" set "BOARD_TYPE=lctech616"
+if defined BOARD_TYPE if /i not "%BOARD_TYPE%"=="lctech616" (
+    echo [ERROR] Only LCTech BL616 ^(lctech616^) is supported.
+    exit /b 1
+)
+if defined BOARD_M0S_DOCK (
+    echo [ERROR] Remove obsolete board selectors; only LCTech BL616 is supported.
+    exit /b 1
+)
+set "BOARD_TYPE=lctech616"
 if "%USB_SPEED%"=="" set "USB_SPEED=fs"
 if "%NUMBER_OF_PROCESSORS%"=="" set "NUMBER_OF_PROCESSORS=8"
 
@@ -63,17 +70,6 @@ call :build_one
 goto :done
 
 :build_one
-    rem ---- board mapping ----
-    set "BOARD_LCTECH_616="
-    set "BOARD_M0S_DOCK="
-    if /i "%BOARD_TYPE%"=="m0sdock" (
-        set "BOARD_M0S_DOCK=1"
-    ) else if /i "%BOARD_TYPE%"=="aim61" (
-        set "BOARD_LCTECH_616="
-    ) else (
-        set "BOARD_TYPE=lctech616"
-        set "BOARD_LCTECH_616=1"
-    )
     rem ---- usb speed mapping ----
     set "FORCE_FS="
     set "SPEED_SUFFIX="

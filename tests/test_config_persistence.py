@@ -120,6 +120,18 @@ int main(void) {
     calls=records[STORE_CONFIG].calls;
     config_get()->speaker_volume=88; config_note_controller(true); deferred_store_process();
     assert(records[STORE_CONTROLLER_TYPE].data[0]==1 && records[STORE_CONFIG].calls==calls);
+    /* Old host settings and saved layouts cannot re-enable removed auxiliaries. */
+    _Static_assert(sizeof(struct config_body)==29,"preserve configuration wire/storage layout");
+    for (unsigned mode=0;mode<5;mode++) {
+        host=*config_get();host.ps_shortcut_enabled=1;host.tp_mode=mode;
+        host.tp_mode_enabled_mask=0x1f;host.tp_mouse_sensitivity=32;
+        config_set((uint8_t *)&host,sizeof(host));
+        assert(!config_get()->ps_shortcut_enabled && !config_get()->tp_mouse_sensitivity);
+        assert(config_get()->tp_mode==(mode==2 || mode==3 ? 0 : mode));
+        assert(config_get()->tp_mode_enabled_mask==0x13);
+        config_request_save();deferred_store_process();config_load();
+        assert(!config_get()->ps_shortcut_enabled && config_get()->tp_mode_enabled_mask==0x13);
+    }
     assert(!irq_depth);
     puts("PASS: save-time snapshots, isolated type memory/migration, failed-write retry, concurrent SAVE, two remap profiles and deferred selection");
 }
