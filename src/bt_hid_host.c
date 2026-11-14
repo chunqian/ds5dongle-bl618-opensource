@@ -48,6 +48,8 @@ static void feature_cache_clear(void)
 static void feature_cache_store(uint8_t report_id,
                                 const uint8_t *data, uint16_t len)
 {
+    if (report_id >= 0x70 && report_id <= 0x7B && len != 63)
+        return;
     if (len > FEATURE_DATA_MAX)
         len = FEATURE_DATA_MAX;
 
@@ -366,6 +368,12 @@ static bool first_output_logged = false;
 
 static uint8_t  app_tx_buf[APP_TX_SLOTS][APP_TX_DATA_SZ];
 static uint16_t app_tx_len[APP_TX_SLOTS];
+static bool app_tx_reliable[APP_TX_SLOTS];
+/* One failed critical submission remains ahead of the FIFO. Ordinary streaming
+ * reports keep the reference project's drop-on-error policy. */
+static uint8_t app_tx_retry_data[APP_TX_DATA_SZ];
+static uint16_t app_tx_retry_len;
+static bool app_tx_retry_pending;
 static volatile uint8_t  app_tx_head = 0;   /* next slot to consume */
 static volatile uint8_t  app_tx_tail = 0;   /* next slot to fill */
 static volatile bool     app_tx_busy = false; /* true: one packet is in HCI */
@@ -441,9 +449,10 @@ static void hid_tx_drain_one(void)
     for (unsigned attempt = 0; attempt < APP_TX_DEPTH; ++attempt) {
         uint8_t data[APP_TX_DATA_SZ];
         uint16_t len;
+        bool reliable;
         uint32_t generation;
         taskENTER_CRITICAL();
-        if (app_tx_busy || app_tx_head == app_tx_tail ||
+        if (app_tx_busy || (!app_tx_retry_pending && app_tx_head == app_tx_tail) ||
             !hid_ctx.intr_connected || !hid_ctx.conn ||
             hid_ctx.state == BT_HID_STATE_DISCONNECTING) {
             taskEXIT_CRITICAL();
@@ -451,10 +460,18 @@ static void hid_tx_drain_one(void)
         }
         app_tx_busy = true;
         generation = app_tx_generation;
-        uint8_t idx = app_tx_head;
-        len = app_tx_len[idx];
-        memcpy(data, app_tx_buf[idx], len);
-        app_tx_head = (idx + 1) % APP_TX_SLOTS;
+        if (app_tx_retry_pending) {
+            len = app_tx_retry_len;
+            memcpy(data, app_tx_retry_data, len);
+            reliable = true;
+            app_tx_retry_pending = false;
+        } else {
+            uint8_t idx = app_tx_head;
+            len = app_tx_len[idx];
+            reliable = app_tx_reliable[idx];
+            memcpy(data, app_tx_buf[idx], len);
+            app_tx_head = (idx + 1) % APP_TX_SLOTS;
+        }
         taskEXIT_CRITICAL();
 
         int err = -ENOBUFS;
@@ -470,11 +487,18 @@ static void hid_tx_drain_one(void)
         LOG_ERR("[HID] drain: send err=%d\n", err);
         taskENTER_CRITICAL();
         bool current = generation == app_tx_generation;
-        if (current)
+        if (current) {
             app_tx_busy = false;
+            if (reliable && err != -EMSGSIZE && err != -EINVAL &&
+                hid_ctx.state != BT_HID_STATE_DISCONNECTING) {
+                memcpy(app_tx_retry_data, data, len);
+                app_tx_retry_len = len;
+                app_tx_retry_pending = true;
+            }
+        }
         taskEXIT_CRITICAL();
-        if (!current)
-            return;
+        if (!current || reliable)
+            return; /* bounded: retry on the next task poll, before successors */
     }
 }
 
@@ -486,6 +510,7 @@ static void app_tx_fifo_reset(void)
     app_tx_head = 0;
     app_tx_tail = 0;
     app_tx_busy = false;
+    app_tx_retry_pending = false;
     memset(feature_refresh_pending, 0, sizeof(feature_refresh_pending));
     taskEXIT_CRITICAL();
 }
@@ -635,27 +660,23 @@ static void handshake_send_pending(void)
                     handshake_ids[i], err, hid_ctx.handshake.attempts[i]);
         }
     }
-    /* Start the first Edge probe in the same pass, even if an earlier GET
-     * failed to submit or has not replied. Only repeated probes are paced. */
-    if (hid_ctx.handshake.probe_attempts &&
-        (TickType_t)(now - hid_ctx.handshake.probe_tick) < HANDSHAKE_PROBE_TICKS)
-        return;
-    if (hid_ctx.handshake.probe_attempts >= 6)
-        return; /* Keep waiting for a real reply or stack error; never guess the type. */
-
-    hid_ctx.handshake.probe_tick = now;
-    ++hid_ctx.handshake.probe_attempts;
-    hid_ctx.check_dse = true;
-    int err = bt_hid_host_get_feature(0x70);
-    if (generation != app_tx_generation || hid_ctx.state != BT_HID_STATE_HANDSHAKE)
-        return;
-    if (err) {
-        LOG_WRN("[HID] Edge probe send failed (%d), attempt %u\n",
-                err, hid_ctx.handshake.probe_attempts);
+    /* First probe still follows the GET batch immediately. Primer retries
+     * must remain possible after a reply or after all probe attempts. */
+    if (!hid_ctx.handshake.detection_ready && hid_ctx.handshake.probe_attempts < 6 &&
+        (!hid_ctx.handshake.probe_attempts ||
+         (TickType_t)(now - hid_ctx.handshake.probe_tick) >= HANDSHAKE_PROBE_TICKS)) {
+        hid_ctx.handshake.probe_tick = now;
+        ++hid_ctx.handshake.probe_attempts;
+        hid_ctx.check_dse = true;
+        int err = bt_hid_host_get_feature(0x70);
+        if (generation != app_tx_generation || hid_ctx.state != BT_HID_STATE_HANDSHAKE)
+            return;
+        if (err) LOG_WRN("[HID] Edge probe send failed (%d)\n", err);
     }
+
     if (!hid_ctx.handshake.primer_done) {
-        if (hid_ctx.primer_cb)
-            hid_ctx.primer_cb();
+        if (hid_ctx.primer_cb && hid_ctx.primer_cb(generation) != 0)
+            return;
         taskENTER_CRITICAL();
         if (generation != app_tx_generation || hid_ctx.state != BT_HID_STATE_HANDSHAKE) {
             taskEXIT_CRITICAL();
@@ -1982,7 +2003,7 @@ int8_t bt_hid_host_get_cached_rssi(void)
     return cached_rssi;
 }
 
-int bt_hid_host_send_output_session(const uint8_t *data, uint16_t len, uint32_t generation)
+static int send_output_session(const uint8_t *data, uint16_t len, uint32_t generation, bool reliable)
 {
     if (generation != app_tx_generation)
         return -ENOTCONN;
@@ -1992,7 +2013,7 @@ int bt_hid_host_send_output_session(const uint8_t *data, uint16_t len, uint32_t 
 
     if (!data || !len)
         return -EINVAL;
-    if (len > L2CAP_BR_MTU - 1)
+    if (len > L2CAP_BR_MTU - 1 || (reliable && len >= APP_TX_DATA_SZ))
         return -EMSGSIZE;
 
     /* Both 0x31 state and 0x32 initialization use the same ordered FIFO,
@@ -2022,6 +2043,10 @@ int bt_hid_host_send_output_session(const uint8_t *data, uint16_t len, uint32_t 
         taskEXIT_CRITICAL();
         return -ENOTCONN;
     }
+    if (reliable && len + 1 > hid_ctx.intr_chan.tx.mtu) {
+        taskEXIT_CRITICAL();
+        return -EMSGSIZE;
+    }
     uint8_t next_tail = (app_tx_tail + 1) % APP_TX_SLOTS;
 
     /* DS5Dongle rejects the new packet when full, preserving queued order. */
@@ -2034,6 +2059,7 @@ int bt_hid_host_send_output_session(const uint8_t *data, uint16_t len, uint32_t 
     app_tx_buf[slot][0] = HID_HEADER(HID_TRANS_DATA, HID_REPORT_OUTPUT);
     memcpy(app_tx_buf[slot] + 1, data, len);
     app_tx_len[slot] = len + 1;
+    app_tx_reliable[slot] = reliable;
     app_tx_tail = next_tail;
     taskEXIT_CRITICAL();
 
@@ -2048,6 +2074,16 @@ int bt_hid_host_send_output_session(const uint8_t *data, uint16_t len, uint32_t 
     return 0;
 }
 
+/* Success transfers retry ownership to the queue, not a controller ACK. */
+int bt_hid_host_send_output_reliable_session(const uint8_t *data, uint16_t len, uint32_t session)
+{
+    return send_output_session(data, len, session, true);
+}
+int bt_hid_host_send_output_session(const uint8_t *data, uint16_t len, uint32_t session)
+{
+    return send_output_session(data, len, session, false);
+}
+
 uint32_t bt_hid_host_session(void)
 {
     return app_tx_generation;
@@ -2058,10 +2094,9 @@ int bt_hid_host_send_output(const uint8_t *data, uint16_t len)
     return bt_hid_host_send_output_session(data, len, app_tx_generation);
 }
 
-int bt_hid_host_set_feature(uint8_t report_id, const uint8_t *data,
-                             uint16_t len)
+int bt_hid_host_set_feature_session(uint8_t report_id, const uint8_t *data,
+                                     uint16_t len, uint32_t generation)
 {
-    uint32_t generation = app_tx_generation;
     if (!hid_ctx.ctrl_connected || !hid_ctx.conn)
         return -1;
 
@@ -2083,7 +2118,12 @@ int bt_hid_host_set_feature(uint8_t report_id, const uint8_t *data,
     return 0;
 }
 
-static int get_feature_for_session(uint8_t report_id, uint32_t generation)
+int bt_hid_host_set_feature(uint8_t report_id, const uint8_t *data, uint16_t len)
+{
+    return bt_hid_host_set_feature_session(report_id, data, len, app_tx_generation);
+}
+
+int bt_hid_host_get_feature_session(uint8_t report_id, uint32_t generation)
 {
     if (!hid_ctx.ctrl_connected || !hid_ctx.conn)
         return -1;
@@ -2107,7 +2147,7 @@ static int get_feature_for_session(uint8_t report_id, uint32_t generation)
 
 int bt_hid_host_get_feature(uint8_t report_id)
 {
-    return get_feature_for_session(report_id, app_tx_generation);
+    return bt_hid_host_get_feature_session(report_id, app_tx_generation);
 }
 
 void bt_hid_host_refresh_feature(uint8_t report_id)
@@ -2139,7 +2179,7 @@ static void feature_refresh_poll(void)
         return;
     /* A failed submission has no response: keep it for a later task poll.
      * Requests for other IDs, or a repeated ISR request, remain independent. */
-    if (get_feature_for_session((uint8_t)report_id, generation)) {
+    if (bt_hid_host_get_feature_session((uint8_t)report_id, generation)) {
         taskENTER_CRITICAL();
         if (generation == app_tx_generation && hid_ctx.state == BT_HID_STATE_CONNECTED)
             feature_refresh_pending[report_id >> 3] |= 1u << (report_id & 7);
@@ -2336,8 +2376,8 @@ bool bt_hid_host_is_dse(void)
     return hid_ctx.is_dse;
 }
 
-int bt_hid_host_set_feature_crc_session(uint8_t report_id, const uint8_t *data,
-                                        uint16_t len, uint32_t generation)
+int bt_hid_host_set_feature_crc_guarded(uint8_t report_id, const uint8_t *data,
+        uint16_t len, uint32_t generation, bool (*allow)(uint32_t), uint32_t token)
 {
     if (generation != app_tx_generation)
         return -ENOTCONN;
@@ -2370,6 +2410,13 @@ int bt_hid_host_set_feature_crc_session(uint8_t report_id, const uint8_t *data,
         ds5_write_le32(crc_region + crc_data_len, crc);
     }
 
+    /* Recheck revocable work AFTER allocation/formatting. No IRQ lock is held
+     * across SDK calls. Once transport accepts a command it cannot be recalled. */
+    if (allow && !allow(token)) {
+        net_buf_unref(buf);
+        return -ECANCELED;
+    }
+
     int err = hid_send_buf(&hid_ctx.ctrl_chan, buf, NULL, generation);
     if (err < 0) {
         LOG_ERR("[HID] SET_FEATURE_CRC(0x%02x): l2cap send failed err=%d\n",
@@ -2380,6 +2427,12 @@ int bt_hid_host_set_feature_crc_session(uint8_t report_id, const uint8_t *data,
     LOG_INF("[HID] SET_REPORT(Feature, 0x%02x) sent with CRC, len=%d\n",
            report_id, (int)(len + 2));
     return 0;
+}
+
+int bt_hid_host_set_feature_crc_session(uint8_t report_id, const uint8_t *data,
+                                        uint16_t len, uint32_t generation)
+{
+    return bt_hid_host_set_feature_crc_guarded(report_id, data, len, generation, NULL, 0);
 }
 
 int bt_hid_host_set_feature_crc(uint8_t report_id, const uint8_t *data, uint16_t len)

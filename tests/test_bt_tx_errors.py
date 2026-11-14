@@ -43,7 +43,8 @@ static struct {
 } hid_ctx;
 static unsigned critical_depth, allocated, allocation_failures;
 static unsigned sends, result_count, result_index, completion_count, completion_index;
-static bool reset_during_send, refill_on_error;
+static bool reset_during_send, refill_on_error, command_allowed;
+static bool allow_command(uint32_t token) { assert(token==42); return command_allowed; }
 static int results[32];
 static unsigned sent_ids[128];
 static struct { struct bt_conn *conn; bt_conn_tx_cb_t cb; void *arg; } completions[128];
@@ -93,9 +94,9 @@ static void ds5_write_le32(uint8_t *out, uint32_t value) {
 }
 '''
 harness += "int bt_hid_host_get_feature(uint8_t report_id);\n"
-harness += fifo + "\n" + function("bt_hid_host_send_output_session") + "\n" + function("bt_hid_host_send_output")
+harness += fifo + "\n" + function("send_output_session") + "\n" + function("bt_hid_host_send_output_reliable_session") + "\n" + function("bt_hid_host_send_output_session") + "\n" + function("bt_hid_host_send_output")
 harness += "\n" + "\n".join(function(name) for name in (
-    "get_feature_for_session", "bt_hid_host_get_feature", "bt_hid_host_set_feature", "bt_hid_host_set_feature_crc_session", "bt_hid_host_set_feature_crc"))
+    "bt_hid_host_get_feature_session", "bt_hid_host_get_feature", "bt_hid_host_set_feature_session", "bt_hid_host_set_feature", "bt_hid_host_set_feature_crc_guarded", "bt_hid_host_set_feature_crc_session", "bt_hid_host_set_feature_crc"))
 for name in ("bt_hid_host_refresh_feature", "feature_refresh_poll"):
     start=source.index(("static void " if name=="feature_refresh_poll" else "void ")+name+"(", source.index("int bt_hid_host_get_feature("))
     end=source.index("\n}",start)+2
@@ -238,6 +239,35 @@ int main(void) {
     assert(bt_hid_host_send_output(NULL,1)==-EINVAL);
     assert(bt_hid_host_send_output(next,0)==-EINVAL);
     assert(bt_hid_host_send_output(next,672)==-EMSGSIZE);
+
+    /* Reliable state packets retain ownership across allocation and SDK
+     * failures, ahead of subsequently enqueued ordinary frames. */
+    setup(); allocation_failures=1;
+    assert(bt_hid_host_send_output_reliable_session(init,sizeof(init),app_tx_generation)==0);
+    assert(app_tx_retry_pending && !sends && !app_tx_busy);
+    results[0]=-ENOBUFS; result_count=1; enqueue(91);
+    assert(sends==1 && sent_ids[0]==90 && app_tx_retry_pending);
+    bt_hid_host_poll_tx(); assert(sends==2 && sent_ids[1]==90 && !app_tx_retry_pending);
+    complete(); assert(sends==3 && sent_ids[2]==91); complete();
+    setup(); allocation_failures=1;
+    assert(bt_hid_host_send_output_reliable_session(init,sizeof(init),app_tx_generation)==0);
+    app_tx_fifo_reset(); bt_hid_host_poll_tx(); assert(!sends && !app_tx_retry_pending);
+    setup(); enqueue(1);
+    for(unsigned i=0;i<APP_TX_DEPTH;i++) enqueue(i+2);
+    assert(bt_hid_host_send_output_reliable_session(init,sizeof(init),app_tx_generation)==-ENOBUFS);
+    complete();
+    assert(bt_hid_host_send_output_reliable_session(init,sizeof(init),app_tx_generation)==0);
+    while(app_tx_busy) complete();
+    assert(sent_ids[sends-1]==90);
+    setup(); hid_ctx.intr_chan.tx.mtu=2;
+    assert(bt_hid_host_send_output_reliable_session(init,sizeof(init),app_tx_generation)==-EMSGSIZE);
+    assert(!app_tx_retry_pending && !sends && app_tx_head==app_tx_tail);
+
+    setup(); command_allowed=false;
+    assert(bt_hid_host_set_feature_crc_guarded(8,next,47,app_tx_generation,allow_command,42)==-ECANCELED);
+    assert(!sends && allocated==1 && buffers[0].frees==1);
+    command_allowed=true;
+    assert(bt_hid_host_set_feature_crc_guarded(8,next,47,app_tx_generation,allow_command,42)==0 && sends==1);
 
     /* Coalesced GETs survive different IDs and transient send failure,
      * but are dropped across session reset. */

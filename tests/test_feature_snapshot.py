@@ -34,7 +34,7 @@ h+=r'''
 static uint8_t observed[256];
 static void interrupt_read(void){
     uint16_t n=0;masked=1;
-    assert(bt_hid_host_copy_feature(0x70,observed,sizeof(observed),&n));
+    assert(bt_hid_host_copy_feature(0x20,observed,sizeof(observed),&n));
     assert(n==256 && masked==1);
     for(unsigned i=0;i<n;i++)assert(observed[i]==0x22);
     masked=0;
@@ -42,12 +42,18 @@ static void interrupt_read(void){
 int main(void){
     uint8_t old[256],newer[256],snapshot[256];uint16_t n;
     memset(old,0x11,256);memset(newer,0x22,256);
-    feature_cache_clear();feature_cache_store(0x70,old,256);
-    inject=true;feature_cache_store(0x70,newer,256);
+    feature_cache_clear();feature_cache_store(0x20,old,256);
+    inject=true;feature_cache_store(0x20,newer,256);
     assert(!masked && !interrupt_pending && observed[0]==0x22);
-    assert(bt_hid_host_copy_feature(0x70,snapshot,61,&n) && n==61);
-    feature_cache_store(0x70,old,256);assert(snapshot[0]==0x22); /* owned snapshot */
-    feature_cache_clear();assert(!bt_hid_host_copy_feature(0x70,snapshot,256,&n) && !n);
+    assert(bt_hid_host_copy_feature(0x20,snapshot,61,&n) && n==61);
+    feature_cache_store(0x20,old,256);assert(snapshot[0]==0x22); /* owned snapshot */
+    feature_cache_clear();assert(!bt_hid_host_copy_feature(0x20,snapshot,256,&n) && !n);
+    feature_cache_clear(); feature_cache_store(0x70,old,62);
+    assert(!bt_hid_host_copy_feature(0x70,snapshot,256,&n));
+    feature_cache_store(0x70,old,63);
+    assert(bt_hid_host_copy_feature(0x70,snapshot,256,&n) && n==63);
+    feature_cache_store(0x70,newer,64);
+    assert(bt_hid_host_copy_feature(0x70,snapshot,256,&n) && n==63 && snapshot[0]==0x11);
     assert(!masked);puts("PASS: coherent Feature snapshot, ISR mask preservation, bounded copy, owned lifetime and clear");
 }
 '''

@@ -27,7 +27,8 @@ typedef enum {
 static bool host_suspended, host_resumed, poweroff_pending, key_down_on_host;
 static wake_state_t state;
 static uint64_t state_entered_us, suspend_at_us, reconnect_until_us;
-static uint32_t wake_generation;
+static uint32_t wake_generation, poweroff_session;
+static uint64_t poweroff_retry_us;
 static uint8_t key_attempts, prev_b7 = 8, prev_b8, prev_b9;
 
 static uint64_t now_us(void) { return bflb_mtimer_get_time_us(); }
@@ -86,6 +87,8 @@ void usb_wake_on_suspend(void)
     host_suspended = poweroff_pending = true;
     host_resumed = false;
     suspend_at_us = now;
+    poweroff_session = bt_hid_host_session();
+    poweroff_retry_us = now;
     key_attempts = prev_b8 = prev_b9 = 0;
     prev_b7 = 8;
     enter_state(config_wake_enabled() ? WAKE_PENDING_PRESS : WAKE_IDLE);
@@ -121,6 +124,7 @@ void usb_wake_on_bt_disconnect(void)
 {
     uintptr_t irq = bflb_irq_save();
     ++wake_generation;
+    poweroff_pending = false;
     enter_state(WAKE_IDLE);
     prev_b7 = 8; prev_b8 = prev_b9 = key_attempts = 0;
     /* If a keydown already reached the host, the task still owes a release. */
@@ -148,13 +152,23 @@ void usb_wake_on_bt_input(const uint8_t *payload, uint16_t len)
     if (changed && armable) request_host_wake();
 }
 
+static bool poweroff_allowed(uint32_t generation)
+{
+    uintptr_t irq = bflb_irq_save();
+    bool allowed = poweroff_pending && host_suspended &&
+                   generation == wake_generation && poweroff_session == bt_hid_host_session();
+    bflb_irq_restore(irq);
+    return allowed;
+}
+
 void usb_wake_task(void)
 {
     uintptr_t irq = bflb_irq_save();
     uint64_t now = now_us();
     bool power_off = poweroff_pending && host_suspended &&
-                     now - suspend_at_us >= WAKE_POWEROFF_DEBOUNCE_US;
-    if (power_off) poweroff_pending = false;
+                     now - suspend_at_us >= WAKE_POWEROFF_DEBOUNCE_US &&
+                     now >= poweroff_retry_us;
+    uint32_t session = poweroff_session;
     wake_state_t current = state;
     uint64_t entered = state_entered_us;
     uint32_t generation = wake_generation;
@@ -164,7 +178,20 @@ void usb_wake_task(void)
 
     if (power_off) {
         uint8_t payload[47] = {2};
-        bt_hid_host_set_feature_crc(0x08, payload, sizeof(payload));
+        irq = bflb_irq_save();
+        bool valid = poweroff_pending && host_suspended &&
+                     generation == wake_generation && session == bt_hid_host_session();
+        bflb_irq_restore(irq);
+        if (valid) {
+            int result = bt_hid_host_set_feature_crc_guarded(0x08, payload, sizeof(payload),
+                                                         session, poweroff_allowed, generation);
+            irq = bflb_irq_save();
+            if (generation == wake_generation && session == poweroff_session) {
+                if (result == 0) poweroff_pending = false;
+                else poweroff_retry_us = now_us() + 100000;
+            }
+            bflb_irq_restore(irq);
+        }
         /* Keep page scan available: a PS press can reconnect and wake USB. */
     }
     if (!config_wake_enabled() || current == WAKE_IDLE || current == WAKE_DONE) {

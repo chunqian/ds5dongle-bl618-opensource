@@ -48,7 +48,7 @@ int main(void) {
     assert(len==2 && data[1]==0x55 && requests==1 && requested==0x05);
     ready=false; cached=true; requests=0;
     get(0x70,&data,&len);
-    assert(len==0 && requests==1 && requested==0x70);
+    assert(len==0 && requests==0);
     puts("PASS: mutable Feature refresh, immutable cache, cache-miss fallback fetch and Edge prefetch gate");
 }
 '''

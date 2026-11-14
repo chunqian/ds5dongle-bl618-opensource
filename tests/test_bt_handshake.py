@@ -82,14 +82,14 @@ static struct {
     bool ctrl_connected, intr_connected, check_dse, is_dse;
     bool security_done, outgoing, sdp_pending;
     TickType_t acl_connect_tick, security_done_tick;
-    void (*primer_cb)(void);
+    int (*primer_cb)(uint32_t);
 '''
 support += handshake_fields + "\n} hid_ctx;\n"
 support += r'''
 static TickType_t tick;
 static uint32_t app_tx_generation=1;
 static unsigned sent[256], sent_count, fail_count[256], cached[256];
-static unsigned events[256], event_count, primers;
+static unsigned events[256], event_count, primers, primer_failures;
 static unsigned deleted_keys, disconnected, edge_unlocks, notifications, encryptions;
 static bool immediate_response, optional_response, reset_on_send, disconnect_on_unlock;
 static bool reject_initialization, reject_probe;
@@ -137,9 +137,11 @@ static void reject(void) {
     uint8_t data[]={2}; struct net_buf b={data,sizeof(data)};
     l2cap_ctrl_recv(&control,&b);
 }
-static void primer(void) {
+static int primer(uint32_t session) {
+    assert(session==app_tx_generation);
     assert(!critical_depth && hid_ctx.state==BT_HID_STATE_HANDSHAKE);
     assert(sent_count>=5 && sent[sent_count-1]==0x70);
+    if(primer_failures) { --primer_failures; return -1; }
     ++primers; event(0x32);
     if (reply_during_primer) {
         reply(0x70);
@@ -149,6 +151,7 @@ static void primer(void) {
         ++app_tx_generation; hid_ctx.conn=NULL; hid_ctx.state=BT_HID_STATE_IDLE;
         memset(&hid_ctx.handshake,0,sizeof(hid_ctx.handshake));
     }
+    return 0;
 }
 int bt_hid_host_get_feature(uint8_t id) {
     assert(!critical_depth); event(id);
@@ -204,7 +207,7 @@ static void setup(void) {
     hid_ctx.conn=&current; control.conn=&current;
     hid_ctx.ctrl_connected=hid_ctx.intr_connected=true;
     hid_ctx.primer_cb=primer;
-    event_count=primers=0; assert(!critical_depth);
+    event_count=primers=primer_failures=0; assert(!critical_depth);
     tick=0; sent_count=deleted_keys=disconnected=edge_unlocks=notifications=encryptions=0;
     immediate_response=optional_response=reset_on_send=disconnect_on_unlock=false; ++app_tx_generation;
     reject_initialization=reject_probe=false;
@@ -323,6 +326,17 @@ int main(void) {
     setup(); auth_pairing_failed(&current,BT_SECURITY_ERR_UNSPECIFIED);
     assert(!deleted_keys && disconnected==1);
     setup(); security_changed(&current,BT_SECURITY_L1,0); assert(!hid_ctx.security_done);
+    setup(); immediate_response=true; primer_failures=1;
+    bt_hid_host_handshake_tick();
+    assert(!primers && !hid_ctx.handshake.primer_done && hid_ctx.handshake.detection_ready);
+    tick=100; bt_hid_host_handshake_tick();
+    assert(primers==1 && hid_ctx.state==BT_HID_STATE_CONNECTED && sent_count==5);
+    setup(); primer_failures=10;
+    for(unsigned i=0;i<6;i++) { tick=i*1000; bt_hid_host_handshake_tick(); }
+    assert(!primers && hid_ctx.handshake.probe_attempts==6);
+    primer_failures=0; tick=6000; bt_hid_host_handshake_tick();
+    assert(primers==1 && hid_ctx.handshake.primer_done);
+    reply(0x70); assert(hid_ctx.state==BT_HID_STATE_CONNECTED);
     puts("PASS: GET batch -> 0x32 -> detection/unlock, synchronous replies, reconnects, retries, SDK auth errors and timeout bond preservation");
 }
 '''

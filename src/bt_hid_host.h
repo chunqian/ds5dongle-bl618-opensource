@@ -50,7 +50,7 @@ typedef void (*bt_hid_state_cb_t)(enum bt_hid_host_state state);
 /* Called once in the BT task after the initial GET 09/20/22/05/70 batch.
  * Initialize state and send 0x32 here, before type detection is finalized,
  * matching DS5Dongle's init_feature() -> state_init() -> bt_write(0x32). */
-typedef void (*bt_hid_primer_cb_t)(void);
+typedef int (*bt_hid_primer_cb_t)(uint32_t session);
 
 struct bt_hid_host_config {
     bt_hid_input_cb_t  input_cb;
@@ -111,6 +111,15 @@ uint32_t bt_hid_host_session(void);
 int bt_hid_host_send_output_session(const uint8_t *data, uint16_t len, uint32_t session);
 int bt_hid_host_set_feature_crc_session(uint8_t report_id, const uint8_t *data,
                                         uint16_t len, uint32_t session);
+
+/* Optional revocation check immediately before transport submission. */
+int bt_hid_host_set_feature_crc_guarded(uint8_t report_id, const uint8_t *data,
+        uint16_t len, uint32_t session, bool (*allow)(uint32_t), uint32_t token);
+
+/* Accepted critical output is retained on transient transport failure. */
+int bt_hid_host_send_output_reliable_session(const uint8_t *data, uint16_t len, uint32_t session);
+int bt_hid_host_set_feature_session(uint8_t report_id, const uint8_t *data, uint16_t len, uint32_t session);
+int bt_hid_host_get_feature_session(uint8_t report_id, uint32_t session);
 
 /* Continue queued output after failed submissions; call from the BT task. */
 void bt_hid_host_poll_tx(void);

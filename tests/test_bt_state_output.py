@@ -34,19 +34,19 @@ static struct config_body cfg;
 struct config_body *config_get(void) { return &cfg; }
 static unsigned output_count;
 static uint8_t last_output[142];
-static int bt_hid_host_send_output(const uint8_t *data, uint16_t len) {
-    assert(len==142); memcpy(last_output,data,len); ++output_count; return 0;
+static int bt_hid_host_send_output_reliable_session(const uint8_t *data, uint16_t len, uint32_t session) {
+    assert(session==7 && len==142); memcpy(last_output,data,len); ++output_count; return 0;
 }
 static bool usb_audio_is_active(void) { return false; }
 '''
 production += extract(main, 'static const uint8_t init_set_state[') + ';\n'
 for name in ('build_bt_output_ext', 'send_led_primer', 'on_hid_primer'):
-    production += extract(main, 'static void '+name+'(') + '\n'
+    production += extract(main, ('static void ' if name=='build_bt_output_ext' else 'static int ')+name+'(') + '\n'
 production += r'''
 void initialize(struct config_body config) {
     cfg=config;
     unsigned before=output_count;
-    on_hid_primer();
+    on_hid_primer(7);
     assert(output_count==before+1);
     assert(last_output[0]==0x32 && last_output[1]==0x10);
     assert(last_output[2]==0x90 && last_output[3]==63);
@@ -162,7 +162,7 @@ int main(void) {
 }
 '''
 # The only initial-state caller is the connection primer callback.
-assert main.count('send_led_primer();') == 1
+assert main.count('send_led_primer(session);') == 1
 assert 'primer_resend_us' not in main and 'stealth_primer_countdown' not in main
 with tempfile.TemporaryDirectory(prefix='ds5-state-') as directory:
     path=Path(directory)

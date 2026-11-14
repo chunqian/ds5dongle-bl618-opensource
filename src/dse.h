@@ -19,7 +19,7 @@ void dse_on_edge_detected(void);
 
 void dse_on_control_packet(const uint8_t *pkt, uint16_t size);
 
-void dse_on_profile_write(uint8_t report_id);
+void dse_on_profile_write(uint8_t report_id, uint32_t session);
 
 bool dse_profiles_ready(void);
 

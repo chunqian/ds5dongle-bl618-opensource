@@ -44,6 +44,7 @@
 static uint8_t state[SET_STATE_SIZE];
 static volatile bool spk_active;
 static volatile bool vol_dirty;
+static uint32_t vol_version;
 
 void state_mgr_init(const uint8_t *init_data, uint8_t len)
 {
@@ -53,6 +54,7 @@ void state_mgr_init(const uint8_t *init_data, uint8_t len)
     memcpy(state, init_data, len);
     spk_active = false;
     vol_dirty = false;
+    ++vol_version;
 }
 
 void state_mgr_update(const uint8_t *data, uint8_t len)
@@ -142,23 +144,30 @@ void state_mgr_set_volume(uint8_t spk_vol, uint8_t hp_vol)
     config_get()->headset_volume = hp_vol;
     config_get()->speaker_volume = spk_vol;
     vol_dirty = true;
+    ++vol_version;
     bflb_irq_restore(irq);
 }
 
 void state_mgr_set_mute(bool mute)
 {
-    if (config_get()->lock_volume)
+    uintptr_t irq = bflb_irq_save();
+    if (config_get()->lock_volume) {
+        bflb_irq_restore(irq);
         return;
+    }
     state[1] |= 0x02;
     if (mute)
         state[9] |= 0x60;
     else
         state[9] &= ~0x60;
     vol_dirty = true;
+    ++vol_version;
+    bflb_irq_restore(irq);
 }
 
 void state_mgr_restore_config_volume(void)
 {
+    uintptr_t irq = bflb_irq_save();
     struct config_body *cfg = config_get();
     state[0] |= 0x30;
     state[1] |= 0x02;
@@ -166,10 +175,28 @@ void state_mgr_restore_config_volume(void)
     state[5] = cfg->speaker_volume;
     state[9] &= ~0x60;
     vol_dirty = true;
+    ++vol_version;
+    bflb_irq_restore(irq);
 }
 
 bool state_mgr_vol_dirty(void) { return vol_dirty; }
-void state_mgr_vol_ack(void)   { vol_dirty = false; }
+bool state_mgr_volume_snapshot(uint8_t *out, uint8_t size, uint32_t *version)
+{
+    uintptr_t irq = bflb_irq_save();
+    bool pending = vol_dirty;
+    if (pending) {
+        state_mgr_get(out, size);
+        *version = vol_version;
+    }
+    bflb_irq_restore(irq);
+    return pending;
+}
+void state_mgr_vol_ack(uint32_t version)
+{
+    uintptr_t irq = bflb_irq_save();
+    if (version == vol_version) vol_dirty = false;
+    bflb_irq_restore(irq);
+}
 
 void state_mgr_set_led_color(uint8_t r, uint8_t g, uint8_t b)
 {

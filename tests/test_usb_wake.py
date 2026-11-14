@@ -14,6 +14,9 @@ struct config_body *config_get(void) { return &cfg; }
 static uint64_t clock_us;
 static uintptr_t masked;
 static unsigned requests, forced, poweroffs, reports;
+static uint32_t session=1;
+static bool poweroff_fail, resume_before_submit;
+uint32_t bt_hid_host_session(void) { return session; }
 static bool ready, send_fail, suspend_during_request, resume_during_request;
 static int wake_result;
 static uint8_t keys[16], last_key;
@@ -37,14 +40,16 @@ int usb_gamepad_send_kbd_report(const uint8_t *data,uint8_t len) {
     last_key=data[2];
     assert(reports<16); keys[reports++]=data[2]; return 0;
 }
-int bt_hid_host_set_feature_crc(uint8_t id,const uint8_t *data,uint16_t len) {
-    assert(!masked && id==8 && len==47 && data[0]==2); poweroffs++; return 0;
+int bt_hid_host_set_feature_crc_guarded(uint8_t id,const uint8_t *data,uint16_t len,uint32_t generation,bool (*allow)(uint32_t),uint32_t token) {
+    assert(!masked && id==8 && len==47 && data[0]==2); if(resume_before_submit) usb_wake_on_resume();
+    if(!allow(token)) return -1;
+    assert(generation==session); poweroffs++; return poweroff_fail ? -1 : 0;
 }
 '''
 harness += '#include "'+str(ROOT/'src/usb_wake.c')+'"\n'
 harness+=r'''
 static void setup(void) {
-    clock_us=0; masked=0; cfg.enable_wake=1;
+    clock_us=0; masked=0; poweroff_fail=resume_before_submit=false; session=1; cfg.enable_wake=1;
     requests=forced=poweroffs=reports=0; last_key=0;
     ready=true; send_fail=suspend_during_request=resume_during_request=false;
     wake_result=0; memset(keys,0,sizeof(keys)); usb_wake_init();
@@ -93,6 +98,18 @@ int main(void) {
     /* Re-suspend re-arms a new attempt; callbacks preserve ISR entry mask. */
     masked=1; usb_wake_on_suspend(); assert(masked==1 && state==WAKE_PENDING_PRESS);
     masked=0; ready=false; step(160000); assert(reports==1);
+    setup(); usb_wake_on_suspend(); poweroff_fail=true;
+    step(3000000); assert(poweroffs==1 && poweroff_pending);
+    step(3099999); assert(poweroffs==1);
+    poweroff_fail=false; step(3100000); assert(poweroffs==2 && !poweroff_pending);
+    setup(); usb_wake_on_suspend(); ++session;
+    step(4000000); assert(!poweroffs);
+    setup(); usb_wake_on_suspend(); usb_wake_on_bt_disconnect();
+    step(4000000); assert(!poweroffs);
+    setup(); usb_wake_on_suspend(); poweroff_fail=true; step(3000000);
+    usb_wake_on_resume(); step(4000000); assert(poweroffs==1);
+    setup(); usb_wake_on_suspend(); resume_before_submit=true;
+    step(4000000); assert(!poweroffs && !poweroff_pending);
     puts("PASS: 3s power-off, reconnect grace, remote wake, two F15 pairs, busy/failure retry, disconnect release, ISR/session races");
 }
 '''

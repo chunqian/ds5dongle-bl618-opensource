@@ -41,6 +41,7 @@ static uint64_t bflb_mtimer_get_time_us(void) { return 10000000; }
 static unsigned xTaskGetTickCount(void) { return 100; }
 static void usb_gamepad_send_raw_input(const uint8_t *data) {
     assert(data[0]==0x7f && data[3]==0x7f && data[7]==DS5_DPAD_NONE);
+    assert(data[32]==0x80 && data[36]==0x80);
     ++neutral_reports;
 }
 static void usb_wake_on_bt_disconnect(void) { ++wake_disconnects; }

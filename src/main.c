@@ -131,7 +131,7 @@ static const uint8_t init_set_state[DS5_USB_OUTPUT_PAYLOAD_LEN] = {
 
 /* ---- BT HID callbacks ---- */
 
-static void send_led_primer(void)
+static int send_led_primer(uint32_t session)
 {
     state_mgr_init(init_set_state, DS5_USB_OUTPUT_PAYLOAD_LEN);
     struct config_body *cfg = config_get();
@@ -142,16 +142,17 @@ static void send_led_primer(void)
     state_mgr_get(merged, sizeof(merged));
     uint8_t buf[DS5_BT_OUTPUT_EXT_SIZE];
     build_bt_output_ext(merged, sizeof(merged), buf);
-    bt_hid_host_send_output(buf, sizeof(buf));
+    return bt_hid_host_send_output_reliable_session(buf, sizeof(buf), session);
 }
 
 /* Called after the initial Feature GET batch, before completing detection. */
-static void on_hid_primer(void)
+static int on_hid_primer(uint32_t session)
 {
-    send_led_primer();
+    int ret = send_led_primer(session);
     if (usb_audio_is_active())
         state_mgr_set_spk_active(true);
-    LOG_INF("[MAIN] Initial 0x32 sent after Feature GETs\n");
+    if (!ret) LOG_INF("[MAIN] Initial 0x32 queued after Feature GETs\n");
+    return ret;
 }
 
 static void on_hid_input(const uint8_t *data, uint16_t len)
@@ -199,6 +200,7 @@ static void on_hid_state(enum bt_hid_host_state state)
             neutral[2] = 0x7F; /* RX center */
             neutral[3] = 0x7F; /* RY center */
             neutral[7] = DS5_DPAD_NONE; /* D-pad neutral */
+            neutral[32] = neutral[36] = 0x80; /* both touch contacts released */
             usb_gamepad_send_raw_input(neutral);
         }
         ds5_connected = false;
@@ -605,15 +607,16 @@ static void bt_task(void *arg)
 
         if (ds5_connected) {
             /* Push UAC volume/mute changes to controller immediately */
-            if (state_mgr_vol_dirty()) {
-                state_mgr_vol_ack();
-                uint8_t merged[DS5_USB_OUTPUT_PAYLOAD_LEN];
-                state_mgr_get(merged, DS5_USB_OUTPUT_PAYLOAD_LEN);
+            uint8_t merged[DS5_USB_OUTPUT_PAYLOAD_LEN];
+            uint32_t volume_version;
+            uint32_t volume_session = bt_hid_host_session();
+            if (state_mgr_volume_snapshot(merged, sizeof(merged), &volume_version)) {
                 uint8_t bt_out[DS5_BT_OUTPUT_REPORT_SIZE];
                 build_bt_output(merged, DS5_USB_OUTPUT_PAYLOAD_LEN,
                                 output_seq, bt_out);
                 output_seq = (output_seq + 1) & 0x0F;
-                bt_hid_host_send_output(bt_out, DS5_BT_OUTPUT_REPORT_SIZE);
+                if (bt_hid_host_send_output_reliable_session(bt_out, sizeof(bt_out), volume_session) == 0)
+                    state_mgr_vol_ack(volume_version);
             }
 
             /* Merge flagged fields like DS5Dongle. BL618 retains 0x39 audio,

@@ -77,6 +77,23 @@ typedef struct {
 } set_report_entry_t;
 
 static QueueHandle_t set_report_queue = NULL;
+/* CherryUSB's SET callback is void. Propagate rejected critical writes through
+ * its class handler so EP0 stalls instead of acknowledging a dropped command. */
+static bool feature_set_rejected;
+static usbd_request_handler hid_class_handler;
+static int gamepad_class_request(uint8_t busid, struct usb_setup_packet *setup,
+                                 uint8_t **data, uint32_t *len)
+{
+    feature_set_rejected = false;
+    int result = hid_class_handler(busid, setup, data, len);
+    if (feature_set_rejected) return -1;
+    if (setup->bRequest == HID_REQUEST_GET_REPORT &&
+        (setup->wValue >> 8) == 3 &&
+        dse_is_profile_report(setup->wValue & 0xff) && *len == 0)
+        return -1; /* No fabricated empty profile when the snapshot is absent. */
+    return result;
+}
+
 
 /* DualSense USB HID Report Descriptor (321 bytes) */
 static const uint8_t hid_report_desc_ds[HID_REPORT_DESC_SIZE_DS] = {
@@ -900,6 +917,34 @@ void usb_gamepad_request_config_save(void)
     config_request_save();
 }
 
+/* One consumer. Peek keeps failed work ahead of later writes; the USB ISR
+ * may append but never removes/reorders it. Bound each task pass. */
+static void process_feature_sets(void)
+{
+    static uint64_t retry_at;
+    set_report_entry_t entry;
+    for (unsigned n = 0; n < SET_REPORT_QUEUE_DEPTH && set_report_queue &&
+         xQueuePeek(set_report_queue, &entry, 0) == pdTRUE; ++n) {
+        uint32_t session = bt_hid_host_session();
+        if (entry.session != session || bt_hid_host_get_state() != BT_HID_STATE_CONNECTED) {
+            xQueueReceive(set_report_queue, &entry, 0);
+            retry_at = 0;
+            continue;
+        }
+        uint64_t now = bflb_mtimer_get_time_us();
+        if (now < retry_at) break;
+        int ret = bt_hid_host_set_feature_crc_session(entry.report_id, entry.data,
+                                                      entry.len, entry.session);
+        if (ret) {
+            retry_at = now + 10000ULL;
+            break;
+        }
+        xQueueReceive(set_report_queue, &entry, 0);
+        retry_at = 0;
+        if (entry.is_dse) dse_on_profile_write(entry.report_id, entry.session);
+    }
+}
+
 ATTR_TCM_SECTION
 void usb_gamepad_process_deferred(void)
 {
@@ -956,15 +1001,7 @@ void usb_gamepad_process_deferred(void)
 
     deferred_store_process();
 
-    set_report_entry_t entry;
-    while (set_report_queue &&
-           xQueueReceive(set_report_queue, &entry, 0) == pdTRUE) {
-        LOG_INF("[USB] Deferred SET_REPORT(0x%02x) → BT, %u bytes%s\n",
-               entry.report_id, entry.len, entry.is_dse ? " (DSE)" : "");
-        if (bt_hid_host_set_feature_crc_session(entry.report_id, entry.data,
-                                                entry.len, entry.session) == 0 && entry.is_dse)
-            dse_on_profile_write(entry.report_id);
-    }
+    process_feature_sets();
 
     aux_flush();
 
@@ -1007,7 +1044,10 @@ int usb_gamepad_init(usb_gamepad_output_cb_t output_cb)
     /* Interface 3: Gamepad — select descriptor based on DSE mode */
     const uint8_t *rd  = current_dse_mode ? hid_report_desc_dse : hid_report_desc_ds;
     uint16_t rd_len    = current_dse_mode ? sizeof(hid_report_desc_dse) : sizeof(hid_report_desc_ds);
-    usbd_add_interface(0, usbd_hid_init_intf(0, &hid_intf, rd, rd_len));
+    usbd_hid_init_intf(0, &hid_intf, rd, rd_len);
+    hid_class_handler = hid_intf.class_interface_handler;
+    hid_intf.class_interface_handler = gamepad_class_request;
+    usbd_add_interface(0, &hid_intf);
     LOG_INF("[USB-INIT] Gamepad HID intf added (report_desc=%uB, DSE=%d)\n",
            rd_len, current_dse_mode);
 
@@ -1363,14 +1403,6 @@ static bool ds5_feature_fallback(uint8_t report_id, uint8_t *buf, uint32_t *len)
     }
 
     default:
-        if (report_id >= 0x70 && report_id <= 0x7B) {
-            /* DSE profile reports — return factory defaults (zeroed)
-             * while BT-side prefetch is still in progress. */
-            memset(buf, 0, 64);
-            buf[0] = report_id;
-            *len = 64;
-            return true;
-        }
         return false;
     }
 }
@@ -1462,10 +1494,10 @@ void usbd_hid_get_report(uint8_t busid, uint8_t intf, uint8_t report_id,
         return;
     }
 
-    /* DSE profile reports (0x70-0x7B): NAK while prefetch in progress
-     * so the PS Accessories app retries instead of caching empty data. */
+    /* DSE profile reports (0x70-0x7B): the class wrapper stalls absent
+     * snapshots rather than returning a fabricated all-zero profile. */
     if (dse_is_profile_report(report_id) && !dse_profiles_ready()) {
-        bt_hid_host_refresh_feature(report_id);
+        /* DSE owns paced requests until real responses complete the snapshot. */
         *len = 0;
         return;
     }
@@ -1587,19 +1619,22 @@ void usbd_hid_set_report(uint8_t busid, uint8_t intf, uint8_t report_id,
     }
 
     /* DSE profile writes (0x60-0x62) and unlock (0x80) — forward + notify */
-    if (report_type == 0x03 && payload_len > 0 &&
+    if (report_type == 0x03 &&
         (report_id == 0x60 || report_id == 0x61 ||
          report_id == 0x62 || report_id == 0x80)) {
-        if (bt_hid_host_get_state() != BT_HID_STATE_CONNECTED)
+        if (!set_report_queue || !payload_len || payload_len > SET_REPORT_MAX_DATA ||
+            bt_hid_host_get_state() != BT_HID_STATE_CONNECTED) {
+            feature_set_rejected = true;
             return;
+        }
         set_report_entry_t entry;
         entry.report_id = report_id;
         entry.session = bt_hid_host_session();
         entry.is_dse    = true;
-        entry.len = (payload_len <= SET_REPORT_MAX_DATA)
-                        ? payload_len : SET_REPORT_MAX_DATA;
+        entry.len = payload_len;
         memcpy(entry.data, payload, entry.len);
         BaseType_t ok = xQueueSendFromISR(set_report_queue, &entry, NULL);
+        feature_set_rejected = ok != pdTRUE;
         LOG_ISR("[USB-ISR] SET_REPORT(DSE 0x%02x) queued=%d len=%lu\n",
                report_id, (int)(ok == pdTRUE), (unsigned long)payload_len);
         return;

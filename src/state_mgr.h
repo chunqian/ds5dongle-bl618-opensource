@@ -69,14 +69,15 @@ void state_mgr_restore_config_volume(void);
 /**
  * Check if a UAC volume/mute change is pending.
  * If true, the caller should send a BT output report with state_mgr_get()
- * to push the update to the controller, then call state_mgr_vol_ack().
+ * to push the update to the controller, then acknowledge the matching snapshot version.
  */
 bool state_mgr_vol_dirty(void);
 
 /**
  * Clear the volume-dirty flag after the update has been sent.
  */
-void state_mgr_vol_ack(void);
+bool state_mgr_volume_snapshot(uint8_t *out, uint8_t size, uint32_t *version);
+void state_mgr_vol_ack(uint32_t version);
 
 /**
  * Persist custom LED color into internal state so subsequent
