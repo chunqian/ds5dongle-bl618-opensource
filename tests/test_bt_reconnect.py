@@ -29,6 +29,11 @@ harness = r'''
 typedef uint32_t TickType_t;
 typedef uint8_t bt_security_t;
 typedef struct { uint8_t val[6]; } bt_addr_t;
+struct bt_br_discovery_result { bt_addr_t addr; uint8_t cod[3]; };
+struct bt_br_discovery_param { uint8_t length; bool limited; };
+#define BT_MAX_DISCOVERED 8
+#define BT_INQUIRY_LEN 5
+static struct bt_br_discovery_result discovery_results[BT_MAX_DISCOVERED];
 struct bt_conn { unsigned refs; bt_addr_t addr; } current, other;
 #define BT_L2CAP_DISCONNECTED 0
 #define BFLB_BREDR_PATCH_CLEAR_L2CAP_BR_STALE_CID
@@ -74,16 +79,26 @@ static bool clear_bonds_pending;
 static void clear_bond_storage(void) { clear_bonds_pending=false; }
 static bool connectable, discoverable;
 static int reconnect_result;
+static bool fail_create;
 static TickType_t xTaskGetTickCount(void) { return tick; }
 static void set_state(enum bt_hid_host_state state) { hid_ctx.state=state; }
 static struct bt_conn *bt_conn_ref(struct bt_conn *conn) { ++conn->refs; return conn; }
 static void bt_conn_unref(struct bt_conn *conn) { assert(conn->refs>1); --conn->refs; }
 static const bt_addr_t *conn_get_br_addr(const struct bt_conn *conn) { return &conn->addr; }
 static void bt_addr_to_str(const bt_addr_t *addr, char *out, unsigned len) { out[0]=0; }
+static int bt_addr_cmp(const bt_addr_t *a, const bt_addr_t *b) { return memcmp(a,b,sizeof(*a)); }
+static void bt_addr_copy(bt_addr_t *a, const bt_addr_t *b) { *a=*b; }
+static int bt_br_discovery_start(const struct bt_br_discovery_param *param,
+    struct bt_br_discovery_result *results, size_t count,
+    void (*complete)(struct bt_br_discovery_result *, size_t)) {
+    assert(param->length==BT_INQUIRY_LEN && !param->limited);
+    assert(results==discovery_results && count==BT_MAX_DISCOVERED && complete);
+    ++scan_calls; return 0;
+}
 static int bt_br_discovery_stop(void) { return 0; }
 static void bt_br_set_connectable(bool enabled) { connectable=enabled; }
 static void bt_br_set_discoverable(bool enabled) { discoverable=enabled; }
-static struct bt_conn *bt_conn_create_br(const bt_addr_t *addr, void *params) { ++pages; return &current; }
+static struct bt_conn *bt_conn_create_br(const bt_addr_t *addr, void *params) { ++pages; return fail_create ? NULL : &current; }
 static int bt_conn_disconnect(struct bt_conn *conn, uint8_t reason) { ++disconnects; return disconnect_error; }
 static int bt_l2cap_chan_connect(struct bt_conn *conn, struct bt_l2cap_chan *chan, unsigned psm) {
     assert(conn==hid_ctx.conn && channel_count<8); channels[channel_count++]=psm; return 0;
@@ -95,11 +110,13 @@ static void feature_cache_clear(void) { ++cache_resets; }
 static void dse_reset(void) { ++dse_resets; }
 static int l2cap_server_reject_blacklisted(struct bt_conn *conn) { return 0; }
 static int bt_hid_host_try_reconnect(void) { return reconnect_result; }
-static int bt_hid_host_scan_start(uint8_t seconds) { ++scan_calls; return 0; }
 static void vTaskDelay(TickType_t delay) { ++delays; tick+=delay; }
 void bt_hid_host_disconnect(void);
 '''
 for signature in (
+    "static void discovery_complete(",
+    "int bt_hid_host_scan_start(",
+    "bool bt_hid_host_poll_scan_early(",
     "static void security_changed(",
     "static void l2cap_server_ensure_conn(",
     "static int l2cap_ctrl_server_accept(",
@@ -135,12 +152,67 @@ static void setup(void) {
     pages=channel_count=disconnects=scan_calls=delays=0;
     fifo_resets=cache_resets=dse_resets=0; disconnect_error=0;
     connectable=discoverable=false; switch_pending=false; tick=100;
+    fail_create=false;
+}
+static void discover_new_peer(bool early) {
+    /* Preserve A as the remembered peer; B is a newly discovered gamepad. */
+    hid_ctx.conn=NULL; hid_ctx.state=BT_HID_STATE_IDLE;
+    hid_ctx.has_target=true; hid_ctx.target_addr.val[0]=1;
+    assert(bt_hid_host_scan_start(0)==0);
+    assert(!hid_ctx.has_target && hid_ctx.target_addr.val[0]==1);
+    discovery_results[0].addr.val[0]=2;
+    discovery_results[0].cod[0]=0x08; discovery_results[0].cod[1]=0x25;
+    if (early) assert(bt_hid_host_poll_scan_early());
+    else discovery_complete(discovery_results,1);
+    assert(hid_ctx.connect_pending && hid_ctx.pending_addr.val[0]==2);
+    assert(!hid_ctx.connect_retry_count && !hid_ctx.connect_pending_tick);
 }
 int main(void) {
     /* A saved peer must not block the task that performs auth/initialization. */
     setup(); reconnect_result=0; startup();
     assert(!delays && !scan_calls && !pages);
-    reconnect_result=-1; startup(); assert(scan_calls==1 && !delays);
+    reconnect_result=-1; hid_ctx.conn=NULL; hid_ctx.state=BT_HID_STATE_IDLE;
+    startup(); assert(scan_calls==1 && !delays);
+
+    /* Both inquiry paths must allow B after A was saved, without clearing A. */
+    setup(); discover_new_peer(true);
+    assert(bt_hid_host_poll_connect() && pages==1);
+    setup(); discover_new_peer(false);
+    assert(bt_hid_host_poll_connect() && pages==1);
+
+    /* Refused scans do not alter the active connection/pending attempt. */
+    setup(); hid_ctx.has_target=true; hid_ctx.connect_retry_count=1;
+    assert(bt_hid_host_scan_start(0)<0 && hid_ctx.has_target && !scan_calls);
+    hid_ctx.conn=NULL; hid_ctx.state=BT_HID_STATE_IDLE; hid_ctx.connect_pending=true;
+    assert(bt_hid_host_scan_start(0)<0 && hid_ctx.has_target);
+    assert(hid_ctx.connect_retry_count==1);
+
+    /* Failed submission followed by success cannot shorten the NEXT budget. */
+    setup(); discover_new_peer(true); fail_create=true;
+    assert(bt_hid_host_poll_connect() && pages==1 && hid_ctx.connect_pending);
+    tick+=499; assert(!bt_hid_host_poll_connect() && pages==1);
+    tick++; fail_create=false;
+    assert(bt_hid_host_poll_connect() && pages==2 && !hid_ctx.connect_pending);
+    assert(!hid_ctx.connect_retry_count && !hid_ctx.connect_pending_tick);
+    discover_new_peer(false); fail_create=true;
+    unsigned before=pages;
+    for (unsigned n=1; n<=3; ++n) {
+        assert(bt_hid_host_poll_connect() && pages==before+n);
+        assert(hid_ctx.connect_pending==(n<3));
+        tick+=500;
+    }
+    assert(!hid_ctx.connect_retry_count && !hid_ctx.connect_pending_tick);
+
+    /* Incoming ACL or another advanced state cancels the whole retry session. */
+    setup(); discover_new_peer(true); fail_create=true;
+    assert(bt_hid_host_poll_connect()); hid_ctx.conn=&current;
+    assert(!bt_hid_host_poll_connect() && !hid_ctx.connect_pending);
+    assert(!hid_ctx.connect_retry_count && !hid_ctx.connect_pending_tick);
+    discover_new_peer(false);
+    assert(bt_hid_host_poll_connect()); tick+=500;
+    hid_ctx.state=BT_HID_STATE_HANDSHAKE;
+    assert(!bt_hid_host_poll_connect() && !hid_ctx.connect_pending);
+    assert(!hid_ctx.connect_retry_count && !hid_ctx.connect_pending_tick);
 
     /* Incoming reconnect: authenticate, accept Control, then Interrupt.
      * No locally created HID channel, including a stale SDP work item. */
@@ -240,7 +312,7 @@ int main(void) {
     l2cap_ctrl_connected(&hid_ctx.ctrl_chan.chan);
     assert(channel_count==2 && channels[1]==HID_PSM_INTERRUPT);
     assert(!critical_depth);
-    puts("PASS: nonblocking startup, passive incoming HID, discovery races, event-ordered teardown, single cleanup and outgoing pairing");
+    puts("PASS: new-peer inquiry, isolated retry budgets, passive reconnect, discovery races, event-ordered teardown and outgoing pairing");
 }
 '''
 with tempfile.TemporaryDirectory(prefix="ds5-reconnect-") as directory:

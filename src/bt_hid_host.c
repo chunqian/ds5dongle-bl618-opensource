@@ -301,6 +301,7 @@ static struct {
 
     volatile bool connect_pending;
     volatile TickType_t connect_pending_tick;
+    volatile uint8_t connect_retry_count;
     bt_addr_t     pending_addr;
 
     volatile bool sdp_pending;
@@ -1079,6 +1080,7 @@ static void conn_connected(struct bt_conn *conn, uint8_t err)
 
     hid_ctx.connect_pending = false;
     hid_ctx.connect_pending_tick = 0;
+    hid_ctx.connect_retry_count = 0;
 
     set_state(BT_HID_STATE_CONNECTING);
 
@@ -1160,6 +1162,7 @@ bool bt_hid_host_poll_disconnect(void)
     hid_ctx.sdp_pending = false;
     hid_ctx.connect_pending = false;
     hid_ctx.connect_pending_tick = 0;
+    hid_ctx.connect_retry_count = 0;
     first_intr_logged = false;
     first_output_logged = false;
     app_tx_fifo_reset();
@@ -1227,6 +1230,7 @@ static void discovery_complete(struct bt_br_discovery_result *results,
             bt_addr_copy(&hid_ctx.pending_addr, &results[i].addr);
             hid_ctx.connect_pending = true;
             hid_ctx.connect_pending_tick = 0;
+            hid_ctx.connect_retry_count = 0;
             /* Set CONNECTING instead of IDLE to prevent the auto-reconnect
              * logic from starting a new scan before poll_connect runs. */
             set_state(BT_HID_STATE_CONNECTING);
@@ -1577,6 +1581,12 @@ int bt_hid_host_scan_start(uint8_t duration_sec)
         return -2;
     }
 
+    /* An explicit inquiry searches for a new controller. The remembered
+     * peer is for passive reconnect/selection, not an inquiry address filter.
+     * Keep the persisted active address and its link key unchanged. */
+    hid_ctx.has_target = false;
+    hid_ctx.connect_pending_tick = 0;
+    hid_ctx.connect_retry_count = 0;
     set_state(BT_HID_STATE_SCANNING);
 
     memset(discovery_results, 0, sizeof(discovery_results));
@@ -1635,6 +1645,7 @@ bool bt_hid_host_poll_scan_early(void)
             bt_addr_copy(&hid_ctx.pending_addr, &discovery_results[i].addr);
             hid_ctx.connect_pending = true;
             hid_ctx.connect_pending_tick = 0;
+            hid_ctx.connect_retry_count = 0;
             set_state(BT_HID_STATE_CONNECTING);
             return true;
         }
@@ -1653,6 +1664,7 @@ bool bt_hid_host_poll_connect(void)
                "state=%d)\n", hid_ctx.state);
         hid_ctx.connect_pending = false;
         hid_ctx.connect_pending_tick = 0;
+        hid_ctx.connect_retry_count = 0;
         return false;
     }
 
@@ -1673,6 +1685,7 @@ bool bt_hid_host_poll_connect(void)
                hid_ctx.state);
         hid_ctx.connect_pending = false;
         hid_ctx.connect_pending_tick = 0;
+        hid_ctx.connect_retry_count = 0;
         return false;
     }
 
@@ -1687,21 +1700,22 @@ bool bt_hid_host_poll_connect(void)
            hid_ctx.state, hid_ctx.conn);
     int rc = bt_hid_host_connect(hid_ctx.pending_addr.val);
     if (rc != 0) {
-        static uint8_t retry_count = 0;
-        retry_count++;
-        if (retry_count >= 3) {
-            LOG_WRN("[BT] Discovery: gave up after %d attempts\n", retry_count);
-            retry_count = 0;
+        hid_ctx.connect_retry_count++;
+        if (hid_ctx.connect_retry_count >= 3) {
+            LOG_WRN("[BT] Discovery: gave up after %d attempts\n",
+                    hid_ctx.connect_retry_count);
+            hid_ctx.connect_retry_count = 0;
             hid_ctx.connect_pending = false;
             hid_ctx.connect_pending_tick = 0;
         } else {
             LOG_WRN("[BT] Discovery: attempt %d failed (%d), retry in 500ms\n",
-                   retry_count, rc);
+                   hid_ctx.connect_retry_count, rc);
             hid_ctx.connect_pending_tick = xTaskGetTickCount();
         }
     } else {
         hid_ctx.connect_pending = false;
         hid_ctx.connect_pending_tick = 0;
+        hid_ctx.connect_retry_count = 0;
     }
     return true;
 }
@@ -2126,6 +2140,8 @@ int bt_hid_host_switch_next(void)
         hid_ctx.security_done = false;
         hid_ctx.sdp_pending = false;
         hid_ctx.connect_pending = false;
+        hid_ctx.connect_pending_tick = 0;
+        hid_ctx.connect_retry_count = 0;
         memset(&hid_ctx.handshake, 0, sizeof(hid_ctx.handshake));
 
         app_tx_fifo_reset();
@@ -2181,6 +2197,8 @@ void bt_hid_host_clear_bonds(void)
     if (hid_ctx.state == BT_HID_STATE_SCANNING)
         bt_br_discovery_stop();
     hid_ctx.connect_pending = false;
+    hid_ctx.connect_pending_tick = 0;
+    hid_ctx.connect_retry_count = 0;
     clear_bonds_pending = true;
     if (hid_ctx.conn) {
         /* The SDK can still write a link key while the ACL is alive. */

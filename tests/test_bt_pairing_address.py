@@ -55,6 +55,7 @@ static struct {
     bool acl_disconnected;
     struct bt_l2cap_br_chan ctrl_chan, intr_chan;
     unsigned connect_pending_tick;
+    uint8_t connect_retry_count;
     bool has_target;
     bt_addr_t target_addr;
     enum bt_hid_host_state state;
