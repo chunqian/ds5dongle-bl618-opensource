@@ -29,6 +29,7 @@ production = r'''
 #include "ds5_protocol.h"
 #include "usb_gamepad.h"
 #include "state_mgr.h"
+#include "bflb_irq.h"
 #define LOG_INF(...) ((void)0)
 static struct config_body cfg;
 struct config_body *config_get(void) { return &cfg; }
@@ -103,6 +104,7 @@ reference = r'''
 extern "C" {
 #include "config.h"
 #include "state_mgr.h"
+#include "bflb_irq.h"
 void initialize(struct config_body config);
 void check_host_frames(void);
 }

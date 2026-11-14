@@ -69,4 +69,7 @@ bool usb_gamepad_set_bt_visible(bool visible);
 void usb_soft_disconnect(void);
 void usb_soft_connect(void);
 
+/* BT task owns deferred Feature submissions and Edge sequencing. */
+void usb_gamepad_process_feature_sets(void);
+
 #endif /* USB_GAMEPAD_H */

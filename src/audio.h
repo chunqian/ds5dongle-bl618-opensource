@@ -67,4 +67,7 @@ void audio_mic_task(void *arg);
  */
 bool audio_check_respawn(void);
 
+/* Start workers; failed allocations are retried by the USB task. */
+void audio_start_tasks(void);
+
 #endif /* AUDIO_H */

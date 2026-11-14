@@ -91,6 +91,7 @@ static uint32_t app_tx_generation=1;
 static unsigned sent[256], sent_count, fail_count[256], cached[256];
 static unsigned events[256], event_count, primers, primer_failures;
 static unsigned deleted_keys, disconnected, edge_unlocks, notifications, encryptions;
+static bool rx_context;
 static bool immediate_response, optional_response, reset_on_send, disconnect_on_unlock;
 static bool reject_initialization, reject_probe;
 static bool reply_during_primer, disconnect_during_primer;
@@ -106,7 +107,7 @@ static void set_state(enum bt_hid_host_state s) {
 }
 static void feature_cache_store(uint8_t id, const uint8_t *data, uint16_t len) { ++cached[id]; }
 static void dse_on_edge_detected(void) {
-    assert(primers==1 && hid_ctx.handshake.primer_done && !critical_depth);
+    assert(!rx_context && primers==1 && hid_ctx.handshake.primer_done && !critical_depth);
     event(0x65); event(0x80);
     ++edge_unlocks;
     if (disconnect_on_unlock) {
@@ -131,11 +132,11 @@ static int l2cap_ctrl_recv(struct bt_l2cap_chan *, struct net_buf *);
 static void handshake_begin(void);
 static void reply(uint8_t id) {
     uint8_t data[]={0xA3,id,0x55}; struct net_buf b={data,sizeof(data)};
-    l2cap_ctrl_recv(&control,&b);
+    rx_context=true; l2cap_ctrl_recv(&control,&b); rx_context=false;
 }
 static void reject(void) {
     uint8_t data[]={2}; struct net_buf b={data,sizeof(data)};
-    l2cap_ctrl_recv(&control,&b);
+    rx_context=true; l2cap_ctrl_recv(&control,&b); rx_context=false;
 }
 static int primer(uint32_t session) {
     assert(session==app_tx_generation);
@@ -232,7 +233,7 @@ int main(void) {
      * Repeated ticks do not resend successful requests before probe retry. */
     reply(0x20); reply(0x22); reply(5); tick=900; bt_hid_host_handshake_tick();
     assert(sent_count==5 && sent[4]==0x70);
-    reply(0x70); assert(hid_ctx.state==BT_HID_STATE_CONNECTED && hid_ctx.is_dse && edge_unlocks==1);
+    reply(0x70); bt_hid_host_handshake_tick(); assert(hid_ctx.state==BT_HID_STATE_CONNECTED && hid_ctx.is_dse && edge_unlocks==1);
     assert(cached[0x20]==1 && cached[5]==1 && !disconnected);
     assert(event_count==9 && events[6]==0x65 && events[7]==0x80 && events[8]==0x100);
 
@@ -248,7 +249,7 @@ int main(void) {
      * 0x70 and classify DS5 on its first INVALID_ID, without another probe. */
     setup(); reject();
     assert(hid_ctx.state==BT_HID_STATE_HANDSHAKE && !hid_ctx.check_dse);
-    bt_hid_host_handshake_tick(); reject();
+    bt_hid_host_handshake_tick(); reject(); bt_hid_host_handshake_tick();
     assert(hid_ctx.state==BT_HID_STATE_CONNECTED && !hid_ctx.is_dse && !edge_unlocks);
     assert(!hid_ctx.check_dse && hid_ctx.handshake.probe_attempts==1);
     reject(); reply(0x70); tick=1000; bt_hid_host_handshake_tick();
@@ -261,7 +262,7 @@ int main(void) {
     setup(); reject_initialization=immediate_response=true; bt_hid_host_handshake_tick();
     assert(sent_count==5 && hid_ctx.state==BT_HID_STATE_CONNECTED && hid_ctx.is_dse);
 
-    setup(); optional_response=true; bt_hid_host_handshake_tick(); reject();
+    setup(); optional_response=true; bt_hid_host_handshake_tick(); reject(); bt_hid_host_handshake_tick();
     assert(hid_ctx.state==BT_HID_STATE_CONNECTED && !hid_ctx.is_dse);
 
     setup(); immediate_response=true; bt_hid_host_handshake_tick();
@@ -278,7 +279,7 @@ int main(void) {
     assert(edge_unlocks==1 && hid_ctx.state==BT_HID_STATE_IDLE && !hid_ctx.conn);
     setup(); bt_hid_host_handshake_tick(); tick=1000; fail_count[0x70]=1;
     bt_hid_host_handshake_tick(); assert(hid_ctx.check_dse);
-    tick=2000; bt_hid_host_handshake_tick(); reply(0x70);
+    tick=2000; bt_hid_host_handshake_tick(); reply(0x70); bt_hid_host_handshake_tick();
     assert(hid_ctx.state==BT_HID_STATE_CONNECTED && hid_ctx.is_dse);
 
     setup(); for(tick=0;tick<10000;tick+=100) bt_hid_host_handshake_tick();
@@ -336,7 +337,7 @@ int main(void) {
     assert(!primers && hid_ctx.handshake.probe_attempts==6);
     primer_failures=0; tick=6000; bt_hid_host_handshake_tick();
     assert(primers==1 && hid_ctx.handshake.primer_done);
-    reply(0x70); assert(hid_ctx.state==BT_HID_STATE_CONNECTED);
+    reply(0x70); bt_hid_host_handshake_tick(); assert(hid_ctx.state==BT_HID_STATE_CONNECTED);
     puts("PASS: GET batch -> 0x32 -> detection/unlock, synchronous replies, reconnects, retries, SDK auth errors and timeout bond preservation");
 }
 '''

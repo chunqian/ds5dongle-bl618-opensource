@@ -218,19 +218,36 @@ static volatile uint32_t mic_ring_rd = 0;
 static volatile bool     mic_active  = false;
 static bool host_speaker_open, host_mic_open, audio_visible, audio_suspended;
 static volatile uint32_t stream_generation;
+/* Host intent survives transient endpoint errors. Only accepted transfers own
+ * the DMA buffers; task polling retries failed starts without double arming. */
+static bool speaker_ep_busy, mic_ep_busy;
+static uint64_t speaker_retry_us, mic_retry_us;
 uint32_t usb_audio_session(void) { return stream_generation; }
 
 
 static uint8_t USB_NOCACHE_RAM_SECTION iso_mic_tx_buf[USB_AUDIO_MIC_MPS];
 
+static void speaker_arm(uint8_t busid)
+{
+    if (!stream_active || speaker_ep_busy || bflb_mtimer_get_time_us() < speaker_retry_us)
+        return;
+    speaker_ep_busy = true;
+    int ret = usbd_ep_start_read(busid, USB_AUDIO_EP_OUT, iso_rx_buf, sizeof(iso_rx_buf));
+    if (ret < 0) {
+        speaker_ep_busy = false;
+        speaker_retry_us = bflb_mtimer_get_time_us() + 10000;
+    }
+}
+
 /* ---- ISO OUT endpoint callback (ISR context) ---- */
 static void audio_ep_out_handler(uint8_t busid, uint8_t ep, uint32_t nbytes)
 {
     (void)ep;
+    speaker_ep_busy = false;
 
     if (nbytes == 0 || !stream_active) {
         if (stream_active) {
-            usbd_ep_start_read(busid, USB_AUDIO_EP_OUT, iso_rx_buf, sizeof(iso_rx_buf));
+            speaker_arm(busid);
         }
         return;
     }
@@ -263,12 +280,13 @@ static void audio_ep_out_handler(uint8_t busid, uint8_t ep, uint32_t nbytes)
         }
     }
 
-    usbd_ep_start_read(busid, USB_AUDIO_EP_OUT, iso_rx_buf, sizeof(iso_rx_buf));
+    speaker_arm(busid);
 }
 
 /* ---- Mic EP IN: feed next packet from ring buffer ---- */
 static void mic_send_next(uint8_t busid)
 {
+    if (!mic_active || mic_ep_busy || bflb_mtimer_get_time_us() < mic_retry_us) return;
     uint32_t rd = mic_ring_rd;
     uint32_t wr = mic_ring_wr;
     uint32_t avail = (wr >= rd) ? (wr - rd) : (MIC_RING_SIZE - rd + wr);
@@ -285,17 +303,21 @@ static void mic_send_next(uint8_t busid)
         tx[i * 2]     = 0;
         tx[i * 2 + 1] = 0;
     }
-    mic_ring_rd = (rd + to_send) % MIC_RING_SIZE;
-
+    mic_ep_busy = true;
     int ret = usbd_ep_start_write(busid, USB_AUDIO_MIC_EP_IN,
                                   iso_mic_tx_buf, samples_per_pkt * 2 * sizeof(int16_t));
-    if (ret < 0)
-        LOG_ERR("[AUDIO] mic EP write failed: %d\n", ret);
+    if (ret < 0) {
+        mic_ep_busy = false;
+        mic_retry_us = bflb_mtimer_get_time_us() + 10000;
+    } else {
+        mic_ring_rd = (rd + to_send) % MIC_RING_SIZE;
+    }
 }
 
 static void audio_mic_ep_in_handler(uint8_t busid, uint8_t ep, uint32_t nbytes)
 {
     (void)ep; (void)nbytes;
+    mic_ep_busy = false;
     if (mic_active)
         mic_send_next(busid);
 }
@@ -315,14 +337,15 @@ void usbd_audio_open(uint8_t busid, uint8_t intf)
             pcm_ready = false;
             state_mgr_set_spk_active(true);
             audio_reset_encoder();
-            int ret = usbd_ep_start_read(busid, USB_AUDIO_EP_OUT, iso_rx_buf, sizeof(iso_rx_buf));
-            if (ret < 0) LOG_ERR("[AUDIO] start speaker endpoint failed: %d\n", ret);
+            speaker_retry_us = 0;
+            speaker_arm(busid);
         }
     } else if (intf == USB_AUDIO_INTF_MIC) {
         host_mic_open = true;
         if (!audio_suspended && !mic_active) {
             mic_active = true;
             mic_ring_wr = mic_ring_rd = 0;
+            mic_retry_us = 0;
             audio_set_mic_active(true);
             mic_send_next(busid);
         }
@@ -474,7 +497,8 @@ void usb_audio_stop(void)
 {
     uintptr_t irq = bflb_irq_save();
     ++stream_generation;
-    host_speaker_open = stream_active = false;
+    host_speaker_open = stream_active = speaker_ep_busy = false;
+    speaker_retry_us = 0;
     audio_suspended = false;
     pcm_write_pos = pcm_write_idx = 0;
     pcm_ready = false;
@@ -539,8 +563,19 @@ void usb_audio_mic_stop(void)
 {
     uintptr_t irq = bflb_irq_save();
     ++stream_generation;
-    host_mic_open = mic_active = false;
+    host_mic_open = mic_active = mic_ep_busy = false;
+    mic_retry_us = 0;
     usb_audio_discard_mic();
     audio_set_mic_active(false);
+    bflb_irq_restore(irq);
+}
+
+void usb_audio_poll(void)
+{
+    uintptr_t irq = bflb_irq_save();
+    if (audio_visible && !audio_suspended) {
+        speaker_arm(0);
+        mic_send_next(0);
+    }
     bflb_irq_restore(irq);
 }

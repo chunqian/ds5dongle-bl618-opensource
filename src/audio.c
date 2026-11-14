@@ -72,6 +72,9 @@ static volatile bool encoder_reset_pending;
 static volatile bool encoder_full_reset_pending, encoder_reinit_pending;
 static volatile uint32_t encoder_generation;
 static volatile bool audio_task_killed;
+static uint32_t audio_restart_generation;
+static bool audio_tasks_enabled, mic_task_started;
+static uint64_t audio_restart_us, mic_restart_us;
 static volatile uint64_t encode_start_us;
 static TaskHandle_t audio_task_handle;
 static TimerHandle_t encode_watchdog;
@@ -341,6 +344,8 @@ static int send_audio_report(uint32_t session, uint32_t stream, uint32_t generat
     (((bytes) + sizeof(StackType_t) - 1) / sizeof(StackType_t))
 #define AUDIO_TASK_STACK_SIZE STACK_WORDS(1024*32)
 #define AUDIO_TASK_PRIORITY   (configMAX_PRIORITIES - 2)
+#define MIC_TASK_STACK_SIZE STACK_WORDS(1024*12)
+#define MIC_TASK_PRIORITY (configMAX_PRIORITIES - 4)
 
 #define ENCODE_TIMEOUT_US  15000  /* 15ms — normal encode takes ~5-7ms */
 #define WATCHDOG_PERIOD_MS 20
@@ -360,23 +365,53 @@ static void encode_watchdog_cb(TimerHandle_t timer)
     encoding_in_progress = false;
     encoder_reinit_pending = true;
     audio_reset_encoder();
+    uintptr_t irq = bflb_irq_save();
+    ++audio_restart_generation;
     audio_task_killed = true;
+    audio_restart_us = 0;
+    bflb_irq_restore(irq);
 }
 
 bool audio_check_respawn(void)
 {
-    if (!audio_task_killed) return false;
-    audio_task_killed = false;
-
-    if (audio_task_handle) {
-        vTaskDelete(audio_task_handle);
-        audio_task_handle = NULL;
+    if (!audio_tasks_enabled) return false;
+    uint64_t now = bflb_mtimer_get_time_us();
+    if (!mic_task_started && decoder && mic_queue && now >= mic_restart_us) {
+        mic_task_started = xTaskCreate(audio_mic_task, "mic", MIC_TASK_STACK_SIZE,
+                                       NULL, MIC_TASK_PRIORITY, NULL) == pdPASS;
+        if (!mic_task_started) mic_restart_us = now + 1000000;
     }
-
-    xTaskCreate(audio_task, "audio", AUDIO_TASK_STACK_SIZE,
-                NULL, AUDIO_TASK_PRIORITY, NULL);
-    LOG_ERR("[WD-OPUS] respawned\n");
+    uintptr_t irq = bflb_irq_save();
+    if (!audio_task_killed || now < audio_restart_us) {
+        bflb_irq_restore(irq);
+        return false;
+    }
+    uint32_t generation = audio_restart_generation;
+    TaskHandle_t old = audio_task_handle;
+    audio_task_handle = NULL;
+    bflb_irq_restore(irq);
+    if (old) vTaskDelete(old); /* Delete the suspended owner exactly once. */
+    BaseType_t result = xTaskCreate(audio_task, "audio", AUDIO_TASK_STACK_SIZE,
+                                    NULL, AUDIO_TASK_PRIORITY, &audio_task_handle);
+    irq = bflb_irq_save();
+    if (generation == audio_restart_generation) {
+        if (result == pdPASS) audio_task_killed = false;
+        else audio_restart_us = now + 1000000;
+    }
+    bflb_irq_restore(irq);
+    if (result != pdPASS) {
+        LOG_ERR("[WD-OPUS] task creation failed; retry retained\n");
+        return false;
+    }
+    LOG_INF("[WD-OPUS] audio task created\n");
     return true;
+}
+
+void audio_start_tasks(void)
+{
+    audio_tasks_enabled = true;
+    audio_task_killed = true;
+    audio_check_respawn();
 }
 
 int audio_init(void)

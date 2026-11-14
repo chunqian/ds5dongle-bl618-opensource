@@ -76,7 +76,7 @@ static int xQueueSendFromISR(int q,const void *p,void *wake) {
 }
 static bool feature_set_rejected;
 '''
-harness += extract(src,'static void process_feature_sets(')+'\n'
+harness += extract(src,'void usb_gamepad_process_feature_sets(')+'\n'
 harness += 'static void forward(uint8_t report_id,uint8_t report_type,const uint8_t *payload,uint32_t payload_len) {\n'
 harness += extract(src,'    if (report_type == 0x03 &&\n        (report_id == 0x60')+'\n}\n'
 harness += r'''
@@ -136,21 +136,21 @@ int main(void) {
     /* Actual deferred queue head survives failure and stays ahead of successors. */
     setup(); clock_us=20000000; uint8_t body[59]={0};
     forward(0x60,3,body,sizeof(body)); forward(0x61,3,body,sizeof(body));
-    failures=1; process_feature_sets(); assert(queued==2 && calls==1 && ids[0]==0x60);
-    clock_us+=9999; process_feature_sets(); assert(calls==1);
-    ++clock_us; process_feature_sets(); assert(!queued && calls==3 && ids[1]==0x60 && ids[2]==0x61);
+    failures=1; usb_gamepad_process_feature_sets(); assert(queued==2 && calls==1 && ids[0]==0x60);
+    clock_us+=9999; usb_gamepad_process_feature_sets(); assert(calls==1);
+    ++clock_us; usb_gamepad_process_feature_sets(); assert(!queued && calls==3 && ids[1]==0x60 && ids[2]==0x61);
     for(unsigned i=0;i<4;i++) forward(0x60,3,body,sizeof(body));
     assert(queued==4 && !feature_set_rejected);
     forward(0x61,3,body,sizeof(body)); assert(feature_set_rejected && queued==4);
-    ++session; process_feature_sets(); assert(!queued && calls==3); /* stale writes discarded */
+    ++session; usb_gamepad_process_feature_sets(); assert(!queued && calls==3); /* stale writes discarded */
     forward(0x60,3,body,0); assert(feature_set_rejected && !queued);
     forward(0x60,3,body,65); assert(feature_set_rejected && !queued);
     forward(0x60,3,body,sizeof(body)); bt_state=BT_HID_STATE_DISCONNECTING;
-    process_feature_sets(); assert(!queued && calls==3);
+    usb_gamepad_process_feature_sets(); assert(!queued && calls==3);
     forward(0x60,3,body,sizeof(body)); assert(feature_set_rejected && !queued);
     bt_state=BT_HID_STATE_CONNECTED; forward(0x60,3,body,sizeof(body));
-    reset_on_send=true; process_feature_sets();
-    clock_us+=10000; process_feature_sets(); assert(!queued && dse.phase==OFF);
+    reset_on_send=true; usb_gamepad_process_feature_sets();
+    clock_us+=10000; usb_gamepad_process_feature_sets(); assert(!queued && dse.phase==OFF);
     struct usb_setup_packet request={1,0x370}; uint8_t *data=body; uint32_t len=0;
     assert(gamepad_class_request(0,&request,&data,&len)==-1);
     len=64; assert(gamepad_class_request(0,&request,&data,&len)==0);

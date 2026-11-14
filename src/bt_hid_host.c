@@ -94,6 +94,9 @@ static void feature_cache_store(uint8_t report_id,
 static bt_addr_t blacklist_addrs[BLACKLIST_MAX];
 static int       blacklist_count;
 static volatile bool blacklist_dirty;
+static uint32_t blacklist_version;
+static TickType_t blacklist_retry_tick;
+static bool blacklist_retry_wait;
 
 static void blacklist_load(void)
 {
@@ -114,48 +117,72 @@ static void blacklist_load(void)
 
 static void blacklist_persist(void)
 {
-    if (blacklist_count == 0) {
-        settings_delete(NV_BLACKLIST_KEY);
-    } else {
-        bt_settings_set_bin(NV_BLACKLIST_KEY,
-                            (const u8_t *)blacklist_addrs,
-                            blacklist_count * sizeof(bt_addr_t));
+    bt_addr_t snapshot[BLACKLIST_MAX];
+    taskENTER_CRITICAL();
+    TickType_t now = xTaskGetTickCount();
+    if (!blacklist_dirty || (blacklist_retry_wait &&
+        (TickType_t)(now - blacklist_retry_tick) < pdMS_TO_TICKS(1000))) {
+        taskEXIT_CRITICAL();
+        return;
     }
+    int count = blacklist_count;
+    uint32_t version = blacklist_version;
+    memcpy(snapshot, blacklist_addrs, count * sizeof(bt_addr_t));
+    taskEXIT_CRITICAL();
+    int result = count ? bt_settings_set_bin(NV_BLACKLIST_KEY,
+                       (const u8_t *)snapshot, count * sizeof(bt_addr_t)) :
+                       settings_delete(NV_BLACKLIST_KEY);
+    taskENTER_CRITICAL();
+    if (!result && version == blacklist_version) blacklist_dirty = false;
+    blacklist_retry_wait = result != 0;
+    if (result) blacklist_retry_tick = now;
+    taskEXIT_CRITICAL();
+}
+
+static void blacklist_clear(void)
+{
+    taskENTER_CRITICAL();
+    blacklist_count = 0;
+    blacklist_dirty = true;
+    ++blacklist_version;
+    taskEXIT_CRITICAL();
 }
 
 static bool blacklist_contains(const bt_addr_t *addr)
 {
-    for (int i = 0; i < blacklist_count; i++) {
-        if (bt_addr_cmp(addr, &blacklist_addrs[i]) == 0)
-            return true;
-    }
-    return false;
+    taskENTER_CRITICAL();
+    bool found = false;
+    for (int i = 0; i < blacklist_count; i++)
+        if (bt_addr_cmp(addr, &blacklist_addrs[i]) == 0) { found = true; break; }
+    taskEXIT_CRITICAL();
+    return found;
 }
 
 static void __attribute__((unused)) blacklist_add(const bt_addr_t *addr)
 {
-    if (blacklist_count >= BLACKLIST_MAX || blacklist_contains(addr))
-        return;
-    bt_addr_copy(&blacklist_addrs[blacklist_count++], addr);
-    char a[BT_ADDR_STR_LEN];
-    bt_addr_to_str(addr, a, sizeof(a));
-    LOG_INF("[BT] Blacklist: added %s\n", a);
+    taskENTER_CRITICAL();
+    if (blacklist_count < BLACKLIST_MAX && !blacklist_contains(addr)) {
+        bt_addr_copy(&blacklist_addrs[blacklist_count++], addr);
+        blacklist_dirty = true;
+        ++blacklist_version;
+    }
+    taskEXIT_CRITICAL();
 }
 
 static void blacklist_remove(const bt_addr_t *addr)
 {
+    taskENTER_CRITICAL();
     for (int i = 0; i < blacklist_count; i++) {
         if (bt_addr_cmp(addr, &blacklist_addrs[i]) == 0) {
             for (int j = i; j < blacklist_count - 1; j++)
                 bt_addr_copy(&blacklist_addrs[j], &blacklist_addrs[j + 1]);
             blacklist_count--;
-            char a[BT_ADDR_STR_LEN];
-            bt_addr_to_str(addr, a, sizeof(a));
-            LOG_INF("[BT] Blacklist: removed %s, %d remaining\n",
-                   a, blacklist_count);
-            return;
+            blacklist_dirty = true;
+            ++blacklist_version;
+            break;
         }
     }
+    taskEXIT_CRITICAL();
 }
 
 /* ---------- multi-controller memory ---------- */
@@ -295,6 +322,8 @@ static struct {
     TickType_t last_activity_tick;
     bt_addr_t target_addr;
     bool has_target;
+    bool selection_only;
+    bt_addr_t selection_addr;
 
     struct bt_l2cap_br_chan ctrl_chan;
     struct bt_l2cap_br_chan intr_chan;
@@ -566,6 +595,8 @@ static void set_state(enum bt_hid_host_state new_state)
         }
     }
 
+    if (new_state == BT_HID_STATE_CONNECTED)
+        hid_ctx.selection_only = false;
     if (hid_ctx.state_cb)
         hid_ctx.state_cb(new_state);
 }
@@ -713,7 +744,6 @@ static int l2cap_ctrl_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
             hid_ctx.is_dse = false;
             LOG_INF("[HID] DualSense (non-Edge) confirmed\n");
             hid_ctx.handshake.detection_ready = true;
-            handshake_finish_detection();
         }
         break;
 
@@ -731,7 +761,6 @@ static int l2cap_ctrl_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
                     hid_ctx.is_dse    = true;
                     LOG_INF("[HID] DualSense Edge detected\n");
                     hid_ctx.handshake.detection_ready = true;
-                    handshake_finish_detection();
                 }
             } else {
                 LOG_WRN("[HID] Feature DATA too short (len=%d), skipping\n",
@@ -1103,6 +1132,17 @@ static void security_changed(struct bt_conn *conn, bt_security_t level,
     LOG_DBG("[BT-CB] security_changed EXIT\n");
 }
 
+/* Explicit controller switching reserves admission until that peer completes
+ * initialization, or the user requests a fresh scan/clears pairing. */
+static bool selection_accepts(const bt_addr_t *remote)
+{
+    taskENTER_CRITICAL();
+    bool allowed = !hid_ctx.selection_only ||
+        (remote && bt_addr_cmp(remote, &hid_ctx.selection_addr) == 0);
+    taskEXIT_CRITICAL();
+    return allowed;
+}
+
 static void conn_connected(struct bt_conn *conn, uint8_t err)
 {
     LOG_DBG("[BT-CB] conn_connected ENTER conn=%p err=%d state=%d\n",
@@ -1129,6 +1169,11 @@ static void conn_connected(struct bt_conn *conn, uint8_t err)
     else
         snprintf(addr_str, sizeof(addr_str), "??:??:??:??:??:??");
     LOG_INF("[BT] Connected to %s\n", addr_str);
+
+    if (!selection_accepts(remote)) {
+        bt_conn_disconnect(conn, BT_HCI_ERR_CONN_LIMIT_EXCEEDED);
+        return;
+    }
 
     if (hid_ctx.conn != NULL && conn != hid_ctx.conn) {
         LOG_WRN("[BT] Already connected, rejecting second ACL from %s\n",
@@ -1363,6 +1408,7 @@ static int l2cap_ctrl_server_accept(struct bt_conn *conn,
            HID_PSM_CONTROL, addr_str, state_name(hid_ctx.state),
            conn, hid_ctx.conn);
 
+    if (!selection_accepts(remote)) return -EACCES;
     int err = l2cap_server_reject_blacklisted(conn);
     if (err) return err;
 
@@ -1403,6 +1449,7 @@ static int l2cap_intr_server_accept(struct bt_conn *conn,
            HID_PSM_INTERRUPT, addr_str, state_name(hid_ctx.state),
            conn, hid_ctx.conn);
 
+    if (!selection_accepts(remote)) return -EACCES;
     int err = l2cap_server_reject_blacklisted(conn);
     if (err) return err;
 
@@ -1671,6 +1718,7 @@ int bt_hid_host_scan_start(uint8_t inquiry_length)
      * peer is for passive reconnect/selection, not an inquiry address filter.
      * Keep the persisted active address and its link key unchanged. */
     hid_ctx.has_target = false;
+    hid_ctx.selection_only = false;
     hid_ctx.connect_pending_tick = 0;
     hid_ctx.connect_retry_count = 0;
     hid_ctx.discovery_active = true;
@@ -2252,6 +2300,8 @@ int bt_hid_host_switch_next(void)
     pairing_addr_pending = false; /* Explicit user selection supersedes pairing. */
     bonded_list_select_index((active_idx + 1) % bonded_count);
     bt_addr_t selected = active_addr;
+    hid_ctx.selection_addr = selected;
+    hid_ctx.selection_only = true;
     taskEXIT_CRITICAL();
     bonded_list_persist();
 
@@ -2321,14 +2371,14 @@ uint8_t bt_hid_host_get_active_idx(void)
 static void clear_bond_storage(void)
 {
     bt_keys_link_key_clear_addr(NULL);
-    blacklist_count = 0;
+    blacklist_clear();
     blacklist_persist();
-    blacklist_dirty = false;
     pairing_addr_pending = false;
     bonded_list_refresh();
     active_addr_dirty = true;
     bonded_list_persist();
     hid_ctx.has_target = false;
+    hid_ctx.selection_only = false;
     memset(&hid_ctx.target_addr, 0, sizeof(hid_ctx.target_addr));
     clear_bonds_pending = false;
     LOG_INF("[BT] All link keys, blacklist and active selection cleared\n");
@@ -2445,13 +2495,11 @@ void bt_hid_host_persist_if_dirty(void)
     if (bonded_refresh_pending || pairing_addr_pending)
         bonded_list_refresh();
     bonded_list_persist();
-    if (blacklist_dirty) {
-        blacklist_dirty = false;
-        blacklist_persist();
-    }
+    blacklist_persist();
 }
 
 void bt_hid_host_handshake_tick(void)
 {
     handshake_send_pending();
+    handshake_finish_detection(); /* RX only records detection; SDK work stays in BT task. */
 }

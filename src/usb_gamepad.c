@@ -919,7 +919,7 @@ void usb_gamepad_request_config_save(void)
 
 /* One consumer. Peek keeps failed work ahead of later writes; the USB ISR
  * may append but never removes/reorders it. Bound each task pass. */
-static void process_feature_sets(void)
+void usb_gamepad_process_feature_sets(void)
 {
     static uint64_t retry_at;
     set_report_entry_t entry;
@@ -1001,9 +1001,9 @@ void usb_gamepad_process_deferred(void)
 
     deferred_store_process();
 
-    process_feature_sets();
 
     aux_flush();
+    usb_audio_poll();
 
     /* Recover a failed queue attempt even when the controller stops sending. */
     try_send_pending();

@@ -85,4 +85,6 @@ void state_mgr_vol_ack(uint32_t version);
  */
 void state_mgr_set_led_color(uint8_t r, uint8_t g, uint8_t b);
 
+void state_mgr_merge_snapshot(uint8_t *data, uint8_t size);
+
 #endif /* STATE_MGR_H */

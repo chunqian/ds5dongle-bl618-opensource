@@ -48,6 +48,7 @@ static uint32_t vol_version;
 
 void state_mgr_init(const uint8_t *init_data, uint8_t len)
 {
+    uintptr_t irq = bflb_irq_save();
     memset(state, 0, SET_STATE_SIZE);
     if (len > SET_STATE_SIZE)
         len = SET_STATE_SIZE;
@@ -55,6 +56,7 @@ void state_mgr_init(const uint8_t *init_data, uint8_t len)
     spk_active = false;
     vol_dirty = false;
     ++vol_version;
+    bflb_irq_restore(irq);
 }
 
 void state_mgr_update(const uint8_t *data, uint8_t len)
@@ -62,6 +64,7 @@ void state_mgr_update(const uint8_t *data, uint8_t len)
     if (len < SET_STATE_SIZE)
         return;
 
+    uintptr_t irq = bflb_irq_save();
     uint8_t f0 = data[0], f1 = data[1];
     struct config_body *cfg = config_get();
     /* Keep the initialized Allow flags; only the rumble mode bits follow
@@ -73,13 +76,10 @@ void state_mgr_update(const uint8_t *data, uint8_t len)
     state[3] = rumble ? data[3] : 0;
     if (f0 & 0x04) memcpy(state + 10, data + 10, 11);
     if (f0 & 0x08) memcpy(state + 21, data + 21, 11);
-    /* A SAVE interrupt must observe both volume fields from one host report. */
-    uintptr_t irq = bflb_irq_save();
     if (!cfg->lock_volume && (f0 & 0x10))
         cfg->headset_volume = state[4] = data[4];
     if (!cfg->lock_volume && (f0 & 0x20))
         cfg->speaker_volume = state[5] = data[5];
-    bflb_irq_restore(irq);
     if (f0 & 0x40) state[6] = data[6];
     if (f0 & 0x80) state[7] = data[7];
     if (f1 & 0x01) state[8] = data[8];
@@ -99,18 +99,22 @@ void state_mgr_update(const uint8_t *data, uint8_t len)
     if (data[38] & 0x01) state[42] = data[42];
     if (f1 & 0x10) state[43] = data[43];
     if (f1 & 0x04) memcpy(state + 44, data + 44, 3);
+    bflb_irq_restore(irq);
 }
 
 void state_mgr_get(uint8_t *out, uint8_t size)
 {
+    uintptr_t irq = bflb_irq_save();
     if (size > SET_STATE_SIZE)
         size = SET_STATE_SIZE;
     memcpy(out, state, size);
+    bflb_irq_restore(irq);
 }
 
 void state_mgr_apply_config(uint8_t spk_vol, uint8_t hp_vol, uint8_t spk_gain,
                             uint8_t trigger_reduce)
 {
+    uintptr_t irq = bflb_irq_save();
     state[4] = hp_vol;          /* VolumeHeadphones */
     state[5] = spk_vol;         /* VolumeSpeaker */
     if (spk_gain)
@@ -119,6 +123,7 @@ void state_mgr_apply_config(uint8_t spk_vol, uint8_t hp_vol, uint8_t spk_gain,
         /* state[36] high nibble = TriggerMotorPowerReduction [0..10] */
         state[36] = (state[36] & 0x0F) | ((trigger_reduce & 0x0F) << 4);
     }
+    bflb_irq_restore(irq);
 }
 
 void state_mgr_set_spk_active(bool active)
@@ -200,7 +205,19 @@ void state_mgr_vol_ack(uint32_t version)
 
 void state_mgr_set_led_color(uint8_t r, uint8_t g, uint8_t b)
 {
+    uintptr_t irq = bflb_irq_save();
     state[44] = r;
     state[45] = g;
     state[46] = b;
+    bflb_irq_restore(irq);
+}
+
+/* Merge and snapshot as one transaction: an ISR cannot splice a configuration
+ * update into the output of this host report. Input and output may alias. */
+void state_mgr_merge_snapshot(uint8_t *data, uint8_t size)
+{
+    uintptr_t irq = bflb_irq_save();
+    state_mgr_update(data, size);
+    state_mgr_get(data, size);
+    bflb_irq_restore(irq);
 }

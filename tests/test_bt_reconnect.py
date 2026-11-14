@@ -139,6 +139,7 @@ static void vTaskDelay(TickType_t delay) { ++delays; tick+=delay; }
 void bt_hid_host_disconnect(void);
 '''
 for signature in (
+    "static bool selection_accepts(",
     "static void handshake_maybe_begin(",
     "static bool discovery_is_peripheral(",
     "static bool discovery_stop(",
@@ -167,7 +168,7 @@ harness += SOURCE[SOURCE.index("static struct bt_l2cap_server l2cap_hid_ctrl_ser
                   SOURCE.index("/* ---------- SDP Service Record")]
 start = MAIN.index('    LOG_INF("[BT_TASK] Startup inquiry')
 end = MAIN.index('    LOG_INF("[BT_TASK] Entering main loop', start)
-harness += "\nstatic void startup(void) {\n" + MAIN[start:end] + "\n}\n"
+harness += "\nstatic void startup(void) { int err=0;\n" + MAIN[start:end] + "\n}\n"
 # The main loop must not invoke a hidden reverse-connect/periodic-inquiry path.
 assert "bt_hid_host_poll_incoming_l2cap_fallback" not in MAIN
 assert "bt_hid_host_force_disconnect" not in MAIN
@@ -465,6 +466,21 @@ int main(void) {
     l2cap_intr_connected(&hid_ctx.intr_chan.chan);
     assert(handshakes==1);
     assert(!critical_depth);
+    /* A selected controller reserves both ACL and L2CAP admission. */
+    setup(); hid_ctx.conn=NULL; hid_ctx.state=BT_HID_STATE_IDLE;
+    current.addr.val[0]=1; other.addr.val[0]=2;
+    hid_ctx.selection_only=true; hid_ctx.selection_addr=other.addr;
+    conn_connected(&current,0);
+    assert(!hid_ctx.conn && disconnects==1 && hid_ctx.selection_only);
+    struct bt_l2cap_chan *selected_channel=NULL;
+    assert(l2cap_ctrl_server_accept(&current,&selected_channel)==-EACCES);
+    assert(l2cap_intr_server_accept(&current,&selected_channel)==-EACCES);
+    assert(!hid_ctx.ctrl_accepting && !hid_ctx.intr_accepting);
+    conn_connected(&other,0); assert(hid_ctx.conn==&other && hid_ctx.selection_only);
+    setup(); hid_ctx.conn=NULL; hid_ctx.state=BT_HID_STATE_IDLE;
+    hid_ctx.selection_only=true; hid_ctx.selection_addr=other.addr;
+    assert(bt_hid_host_scan_start(0)==0 && !hid_ctx.selection_only);
+    conn_connected(&current,0); assert(hid_ctx.conn==&current);
     puts("PASS: startup inquiry, Peripheral filtering, cancel barriers/races, isolated retries, ordered encrypted HID, passive reconnect and teardown");
 }
 '''

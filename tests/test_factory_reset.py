@@ -114,6 +114,7 @@ enum { BTN_IDLE, BTN_PRESSING, BTN_HELD, BTN_WAIT } btn_fsm;
 enum { LED_RED_BLINK, LED_BLINK_TRIPLE, LED_GREEN_SOLID, LED_PURPLE_BLINK_SLOW };
 static uint8_t btn_press_samples,btn_wait_samples,btn_click_count,scan_fail_count;
 static uint64_t btn_press_start_us;
+static bool bt_init_failed;
 static bool btn_reset_requested,ds5_connected,scan_after_disconnect,request_ok=true;
 static unsigned idle_ticks,requests,reboots,switches,scans;
 static void led_status_set(int p) {(void)p;}
@@ -129,7 +130,7 @@ static void step(uint64_t btn_now,bool pressed) {
 }
 static void fresh(void) {
     btn_fsm=BTN_IDLE;btn_press_samples=btn_wait_samples=btn_click_count=0;
-    requests=reboots=switches=scans=0;btn_reset_requested=false;request_ok=true;
+    requests=reboots=switches=scans=0;btn_reset_requested=false;request_ok=true;bt_init_failed=false;
 }
 int main(void) {
     fresh();step(1,true);step(2900001,true);step(3000000,true);assert(requests==0);
@@ -148,6 +149,11 @@ int main(void) {
     fresh();step(0,true);step(100000,false);step(200000,true);step(300000,false);
     for(int i=0;i<5;i++) step(400000+i*100000,false);
     assert(scans==1 && requests==0);
+    fresh();bt_init_failed=true;step(0,true);step(100000,false);
+    for(int i=0;i<5;i++) step(200000+i*100000,false);
+    assert(reboots==1 && !switches && !scans && !requests);
+    fresh();bt_init_failed=true;step(0,true);step(3000000,true);step(3100000,false);
+    assert(requests==1 && reboots==1 && !scans);
     puts("PASS: exact 3-second threshold, delayed polls, release-only reboot, failed request retry, single/double click");
 }
 '''

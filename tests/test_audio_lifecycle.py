@@ -33,6 +33,12 @@ harness=r'''
 #define OPUS_SET_COMPLEXITY(x) (x)
 #define OPUS_SET_FORCE_CHANNELS(x) (x)
 #define OPUS_RESET_STATE 99
+#define PCM_BUF_SAMPLES USB_AUDIO_ACCUM_SAMPLES
+#define pdFALSE 0
+typedef int BaseType_t;
+static int audio_sem;
+static void xSemaphoreGiveFromISR(int sem, int *woken) { (void)sem; (void)woken; }
+#define portYIELD_FROM_ISR(x) ((void)(x))
 #define PCM_BUF_BYTES (USB_AUDIO_ACCUM_SAMPLES*USB_AUDIO_CHANNELS*sizeof(int16_t))
 #define MIC_RING_SIZE USB_AUDIO_MIC_RING_SAMPLES
 #define BT_HID_STATE_CONNECTED 3
@@ -48,15 +54,17 @@ static bool spk_active;
 static void state_mgr_set_spk_active(bool on) { spk_active=on; }
 static bool state_mgr_is_spk_active(void) { return spk_active; }
 static unsigned reads, writes, closed, queue_resets, status_sent, audio_sent;
-static bool fail_status, toggle_during_send;
+static bool fail_status, toggle_during_send, fail_read, fail_write;
+static uint64_t clock_us;
+static uint64_t bflb_mtimer_get_time_us(void) { return clock_us; }
 static bool last_mic_status;
 static int usbd_ep_start_read(uint8_t bus,uint8_t ep,uint8_t *data,uint32_t len) {
     (void)bus; assert(masked && ep==USB_AUDIO_EP_OUT && data && len==USB_AUDIO_OUT_MPS);
-    reads++; return 0;
+    reads++; return fail_read ? -1 : 0;
 }
 static int usbd_ep_start_write(uint8_t bus,uint8_t ep,const uint8_t *data,uint32_t len) {
     (void)bus; assert(masked && ep==USB_AUDIO_MIC_EP_IN && data && len==192);
-    writes++; return 0;
+    writes++; return fail_write ? -1 : 0;
 }
 static void usbd_ep_close(uint8_t bus,uint8_t ep) { (void)bus;(void)ep; closed++; }
 static void xQueueReset(unsigned q) { assert(q); queue_resets++; }
@@ -70,6 +78,8 @@ static int bt_hid_host_send_output_session(const uint8_t *data,unsigned len,uint
     return fail_status?-1:0;
 }
 static bool stream_active, mic_active, host_speaker_open, host_mic_open, audio_visible, audio_suspended;
+static bool speaker_ep_busy, mic_ep_busy;
+static uint64_t speaker_retry_us, mic_retry_us;
 static uint32_t stream_generation, pcm_write_pos, mic_ring_wr, mic_ring_rd;
 static uint8_t pcm_write_idx, pcm_read_idx;
 static bool pcm_ready;
@@ -102,11 +112,11 @@ static void opus_encoder_init(int *enc,unsigned rate,unsigned channels,unsigned 
     (void)app; assert(owner_context && enc==encoder && rate==48000 && channels==2); codec_inits++;
 }
 '''
-for sig in ('uint32_t usb_audio_session(', 'static void mic_send_next(', 'void usbd_audio_open(',
+for sig in ('uint32_t usb_audio_session(', 'static void speaker_arm(', 'static void mic_send_next(', 'void usbd_audio_open(',
             'void usbd_audio_close(', 'void usb_audio_suspend(', 'void usb_audio_resume(',
             'void usb_audio_set_visible(', 'bool usb_audio_is_active(', 'void usb_audio_stop(',
             'void usb_audio_discard_pending(', 'bool usb_audio_read(', 'bool usb_audio_mic_is_active(',
-            'void usb_audio_discard_mic(', 'void usb_audio_mic_stop('):
+            'void usb_audio_discard_mic(', 'void usb_audio_mic_stop(', 'void usb_audio_poll(', 'static void audio_mic_ep_in_handler(', 'static void audio_ep_out_handler('):
     harness+=extract(usb,sig)
 for sig in ('void audio_set_mic_active(', 'bool audio_mic_active(', 'void audio_reset_encoder(',
             'void audio_reset(', 'static void audio_owner_reset(', 'static int send_mic_status(',
@@ -182,6 +192,30 @@ int main(void) {
     assert(reads==before && !host_speaker_open && !host_mic_open);
     usb_audio_set_visible(true); usb_audio_resume(); assert(reads==before);
     assert(!masked && closed==1);
+    /* Initial/resumed/rearmed transfers retry without needing another SET_INTERFACE. */
+    fail_read=fail_write=true;
+    usbd_audio_open(0,USB_AUDIO_INTF_STREAM); usbd_audio_open(0,USB_AUDIO_INTF_MIC);
+    assert(stream_active && mic_active && !speaker_ep_busy && !mic_ep_busy);
+    mic_ring_wr=96; mic_ring_rd=0;
+    before=reads; unsigned before_write=writes;
+    usb_audio_poll(); assert(reads==before && writes==before_write);
+    clock_us=10000; fail_read=fail_write=false; usb_audio_poll();
+    assert(reads==before+1 && writes==before_write+1 && mic_ring_rd==48);
+    usb_audio_poll(); assert(reads==before+1 && writes==before_write+1);
+    fail_read=fail_write=true; masked=1;
+    audio_mic_ep_in_handler(0,USB_AUDIO_MIC_EP_IN,192);
+    audio_ep_out_handler(0,USB_AUDIO_EP_OUT,0); masked=0;
+    assert(!speaker_ep_busy && !mic_ep_busy && mic_ring_rd==48);
+    clock_us=20000; fail_read=fail_write=false; usb_audio_poll();
+    assert(speaker_ep_busy && mic_ep_busy && mic_ring_rd==96);
+    usb_audio_suspend(); fail_read=fail_write=true; usb_audio_resume();
+    assert(host_speaker_open && host_mic_open && !speaker_ep_busy && !mic_ep_busy);
+    clock_us=30000; fail_read=fail_write=false; usb_audio_poll();
+    assert(speaker_ep_busy && mic_ep_busy);
+    usb_audio_suspend(); usb_audio_resume();
+    fail_read=true; masked=1; audio_ep_out_handler(0,USB_AUDIO_EP_OUT,0); masked=0;
+    usb_audio_set_visible(false); before=reads; clock_us=40000; usb_audio_poll();
+    assert(reads==before && !speaker_ep_busy && !mic_ep_busy);
     puts("PASS: retained alternate settings, suspend/resume, BT reconnect, mic-status retries, config flags, codec ownership and stale-frame rejection");
 }
 '''

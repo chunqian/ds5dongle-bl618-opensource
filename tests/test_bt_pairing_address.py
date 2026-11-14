@@ -56,7 +56,8 @@ static struct {
     struct bt_l2cap_br_chan ctrl_chan, intr_chan;
     unsigned connect_pending_tick;
     uint8_t connect_retry_count;
-    bool has_target;
+    bool has_target, selection_only;
+    bt_addr_t selection_addr;
     bt_addr_t target_addr;
     enum bt_hid_host_state state;
     bool ctrl_connected, intr_connected, ctrl_accepting, intr_accepting;
@@ -116,6 +117,7 @@ void bt_keys_link_key_clear_addr(const bt_addr_t *addr) {
     }
 }
 static bool blacklist_dirty;
+static void blacklist_clear(void) { blacklist_count=0; blacklist_dirty=true; }
 static void blacklist_persist(void) { assert(!critical_depth); }
 static int bt_conn_get_info(const struct bt_conn *conn, struct bt_conn_info *info) {
     if (info_error) return -1;
@@ -247,6 +249,7 @@ int main(void) {
     /* Public switch/reconnect paths use refreshed keys and persist the address. */
     hid_ctx.conn=NULL; hid_ctx.state=BT_HID_STATE_IDLE;
     assert(bt_hid_host_switch_next()==1); expect_active(keys[1]);
+    assert(hid_ctx.selection_only && !memcmp(&hid_ctx.selection_addr,&keys[1],6));
     assert(!memcmp(&saved_address,&keys[1],6));
     swap=keys[1]; keys[1]=keys[3]; keys[3]=swap;
     assert(bt_hid_host_try_reconnect()==0 && active_idx==3);
@@ -260,7 +263,7 @@ int main(void) {
     assert(hid_ctx.state==BT_HID_STATE_DISCONNECTING && !bt_hid_host_poll_disconnect());
     conn_disconnected(&first,0x13);
     assert(bt_hid_host_poll_disconnect() && first.refs==0);
-    assert(!key_count && !bonded_count && !pairing_addr_pending && !hid_ctx.has_target);
+    assert(!key_count && !bonded_count && !pairing_addr_pending && !hid_ctx.has_target && !hid_ctx.selection_only);
     expect_active(zero); assert(!memcmp(&saved_address,&zero,6));
     auth_pairing_complete(&first,true); /* Late callback from the cleared ACL. */
     bt_hid_host_persist_if_dirty(); assert(!pairing_addr_pending && !bonded_count);

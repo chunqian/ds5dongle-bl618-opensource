@@ -95,4 +95,7 @@ bool usb_audio_mic_is_active(void);
  */
 void usb_audio_mic_stop(void);
 
+/* USB task: retry failed endpoint submissions while the host keeps alt=1. */
+void usb_audio_poll(void);
+
 #endif /* DS5_USB_AUDIO_H */

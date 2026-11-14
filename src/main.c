@@ -35,10 +35,6 @@
 #define BT_TASK_PRIORITY      (configMAX_PRIORITIES - 3)
 #define USB_TASK_STACK_SIZE   STACK_WORDS(1024*12)
 #define USB_TASK_PRIORITY     (configMAX_PRIORITIES - 1)
-#define AUDIO_TASK_STACK_SIZE STACK_WORDS(1024*32)
-#define AUDIO_TASK_PRIORITY   (configMAX_PRIORITIES - 2)
-#define MIC_TASK_STACK_SIZE   STACK_WORDS(1024*12)
-#define MIC_TASK_PRIORITY     (configMAX_PRIORITIES - 4)
 #define LED_TASK_STACK_SIZE   STACK_WORDS(1024*2)
 #define LED_TASK_PRIORITY     (tskIDLE_PRIORITY + 1)
 #define BOOT_HOLD_US         (3ULL * 1000000ULL)
@@ -56,6 +52,7 @@ static volatile bool ds5_connected = false;
 static volatile bool bt_disconnect_pending_usb = false;
 static volatile bool battery_low = false;
 static volatile bool bt_init_done = false;
+static volatile bool bt_init_failed;
 
 static volatile uint8_t cached_battery_level = 0xFF;
 static volatile uint8_t cached_battery_state = 0;
@@ -133,6 +130,7 @@ static const uint8_t init_set_state[DS5_USB_OUTPUT_PAYLOAD_LEN] = {
 
 static int send_led_primer(uint32_t session)
 {
+    uintptr_t irq = bflb_irq_save();
     state_mgr_init(init_set_state, DS5_USB_OUTPUT_PAYLOAD_LEN);
     struct config_body *cfg = config_get();
     state_mgr_apply_config(cfg->speaker_volume, cfg->headset_volume,
@@ -140,6 +138,7 @@ static int send_led_primer(uint32_t session)
     state_mgr_set_led_color(cfg->led_r, cfg->led_g, cfg->led_b);
     uint8_t merged[DS5_USB_OUTPUT_PAYLOAD_LEN];
     state_mgr_get(merged, sizeof(merged));
+    bflb_irq_restore(irq);
     uint8_t buf[DS5_BT_OUTPUT_EXT_SIZE];
     build_bt_output_ext(merged, sizeof(merged), buf);
     return bt_hid_host_send_output_reliable_session(buf, sizeof(buf), session);
@@ -366,24 +365,22 @@ static void bt_task(void *arg)
     int err = bt_hid_host_init(&cfg);
     if (err) {
         LOG_ERR("[MAIN] BT init failed: %d\n", err);
-        vTaskDelete(NULL);
-        return;
     }
+    bt_init_failed = err != 0;
 
-    /* BT init complete — re-enable USB peripheral clock that BT may have disabled */
+    /* End the wait on success or failure; BT setup may have disabled USB clocks. */
     GLB_Set_USB_CLK_From_WIFIPLL(1);
     bt_init_done = true;
-    LOG_INF("[BT_TASK] BT init done, USB clock re-enabled, signaling usb_task\n");
+    LOG_INF("[BT_TASK] BT init result=%d; USB clock restored, releasing usb_task\n", err);
 
-    LOG_INF("[BT_TASK] led -> PURPLE_BLINK_SLOW\n");
-    led_status_set(LED_PURPLE_BLINK_SLOW);
+    led_status_set(err ? LED_RED_BLINK : LED_PURPLE_BLINK_SLOW);
     LOG_INF("[BT_TASK] led OK\n");
 
     /* DS5Dongle performs one startup inquiry, including with saved bonds.
      * Page scan remains enabled so a paired controller may reconnect first.
      * Enter the task loop immediately to process authentication and HID. */
     LOG_INF("[BT_TASK] Startup inquiry\n");
-    bt_hid_host_scan_start(0);
+    if (!err) bt_hid_host_scan_start(0);
     LOG_INF("[BT_TASK] Entering main loop\n");
 
     struct output_message output;
@@ -409,8 +406,6 @@ static void bt_task(void *arg)
     conn_led_start_us = bflb_mtimer_get_time_us();
 
     for (;;) {
-        audio_check_respawn();
-
         loop_count++;
         if ((loop_count % 50) == 1) {
             LOG_DBG("[BT_TASK] loop #%u state=%d conn=%d\n",
@@ -501,7 +496,11 @@ static void bt_task(void *arg)
                     btn_fsm = BTN_IDLE;
                     btn_press_samples = 0;
 
-                    if (clicks == 1) {
+                    if (bt_init_failed && clicks) {
+                        /* Do not re-enter a partly initialized SDK. A user
+                         * click retries through a complete system restart. */
+                        GLB_SW_System_Reset();
+                    } else if (clicks == 1) {
                         if (bt_hid_host_get_bonded_count() > 1) {
                             int next = bt_hid_host_switch_next();
                             LOG_INF("[BTN] Single click — switching to controller %d\n", next);
@@ -528,6 +527,11 @@ static void bt_task(void *arg)
             }
         }
 
+        if (bt_init_failed) {
+            /* Keep USB configuration and BOOT recovery available. */
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
         bt_hid_host_persist_if_dirty();
 
         /* Periodic RSSI read (~every 5 s) */
@@ -559,6 +563,8 @@ static void bt_task(void *arg)
 
         bt_hid_host_poll_security_ready();
         bt_hid_host_poll_tx();
+        usb_gamepad_process_feature_sets();
+        dse_task();
 
         /* React to disable_led config toggle in real-time */
         bool cur_led_disabled = config_led_disabled();
@@ -626,8 +632,7 @@ static void bt_task(void *arg)
                 while (xQueueReceive(output_queue, &output, 0) == pdTRUE) {
                     if (output.session != bt_hid_host_session()) continue;
                     uint8_t *payload = usb_out + 1;
-                    state_mgr_update(payload, DS5_USB_OUTPUT_PAYLOAD_LEN);
-                    state_mgr_get(payload, DS5_USB_OUTPUT_PAYLOAD_LEN);
+                    state_mgr_merge_snapshot(payload, DS5_USB_OUTPUT_PAYLOAD_LEN);
 
                     uint8_t bt_out[DS5_BT_OUTPUT_REPORT_SIZE];
                     build_bt_output(payload, DS5_USB_OUTPUT_PAYLOAD_LEN,
@@ -640,8 +645,7 @@ static void bt_task(void *arg)
                 if (output.session != bt_hid_host_session()) continue;
                 uint8_t *payload = usb_out + 1;
 
-                state_mgr_update(payload, DS5_USB_OUTPUT_PAYLOAD_LEN);
-                state_mgr_get(payload, DS5_USB_OUTPUT_PAYLOAD_LEN);
+                state_mgr_merge_snapshot(payload, DS5_USB_OUTPUT_PAYLOAD_LEN);
 
                 uint8_t bt_out[DS5_BT_OUTPUT_REPORT_SIZE];
                 build_bt_output(payload, DS5_USB_OUTPUT_PAYLOAD_LEN,
@@ -684,7 +688,7 @@ static void usb_task(void *arg)
                                   usb_wake_on_resume,
                                   usb_wake_on_configured);
 
-    if (config_usb_stealth()) {
+    if (config_usb_stealth() && !bt_init_failed) {
         vTaskDelay(pdMS_TO_TICKS(150));
         taskENTER_CRITICAL();
         if (!ds5_connected && !usb_wake_host_suspended())
@@ -735,6 +739,7 @@ static void usb_task(void *arg)
                    (unsigned long)*(volatile uint32_t *)(USB_BASE + 0x100),
                    (unsigned long)*(volatile uint32_t *)(USB_BASE + 0x0C4));
         }
+        audio_check_respawn(); /* Run before input paths that may continue early. */
         usb_gamepad_process_deferred();
 
         uint32_t session = bt_hid_host_session();
@@ -972,7 +977,6 @@ static void usb_task(void *arg)
         }
 
         usb_wake_task();
-        dse_task();
     }
 }
 
@@ -1065,16 +1069,14 @@ int main(void)
         while (1) {}
     }
 
-    xTaskCreate(bt_task,    "bt",    BT_TASK_STACK_SIZE,
-                NULL, BT_TASK_PRIORITY, NULL);
+    if (xTaskCreate(bt_task, "bt", BT_TASK_STACK_SIZE,
+                    NULL, BT_TASK_PRIORITY, NULL) != pdPASS) {
+        bt_init_failed = bt_init_done = true;
+        LOG_ERR("[B] BT task allocation failed; USB configuration remains available\n");
+    }
     xTaskCreate(usb_task,  "usb",   USB_TASK_STACK_SIZE,
                 NULL, USB_TASK_PRIORITY, NULL);
-    if (audio_ok) {
-        xTaskCreate(audio_task, "audio", AUDIO_TASK_STACK_SIZE,
-                    NULL, AUDIO_TASK_PRIORITY, NULL);  /* handle stored in audio_task() */
-        xTaskCreate(audio_mic_task, "mic", MIC_TASK_STACK_SIZE,
-                    NULL, MIC_TASK_PRIORITY, NULL);
-    }
+    if (audio_ok) audio_start_tasks();
     xTaskCreate(led_task,  "led",   LED_TASK_STACK_SIZE,
                 NULL, LED_TASK_PRIORITY, NULL);
     LOG_INF("[B] init done, starting scheduler\n");
