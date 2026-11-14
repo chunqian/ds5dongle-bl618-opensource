@@ -172,7 +172,7 @@ def build_platform(args, platform, native_info, revision, source_tree):
             "Firmware source snapshot: source/firmware-source.tar.gz\n"
             "Repository: https://github.com/chunqian/ds5dongle-bl618-opensource\n"
             f"SDK / FlashCube source and binaries: https://github.com/sqlCRT/bouffalo_sdk/tree/{SDK_COMMIT}\n"
-            "Build: SDK in ../bouffalo_sdk, install the RISC-V toolchain, then USB_SPEED=hs bash build_macos.sh build\n"
+            "Build: SDK in ../bouffalo_sdk, install the RISC-V toolchain, then bash build_macos.sh build\n"
             "Wrapper sources: source/easy_flash (GPL-3.0-or-later)\n"
             "Upstream license texts and release notes: licenses/\n"
             "Stock utils/pem files are public SDK test material; this package does not enable firmware signing or efuse programming.\n"

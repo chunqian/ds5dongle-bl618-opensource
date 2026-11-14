@@ -14,7 +14,7 @@ Ported from [awalol/DS5Dongle](https://github.com/awalol/DS5Dongle) (Raspberry P
 |-------|------|-----|-----|-------|
 | **LCTech BL616** (default) | BL616 QFN32 | Type-C native | 1x blue (GPIO27) | External USB-TTL |
 
-> **Only LCTech BL616 is supported.** macOS and Windows build scripts generate its FS/HS firmware.
+> **Only LCTech BL616 is supported.** macOS and Windows build scripts generate its HS firmware.
 
 LED pins in `board_config.h` are fixed to the LCTech BL616 layout.
 
@@ -72,20 +72,15 @@ bash build_macos.sh build      # incremental compile (-j auto)
 bash build_macos.sh rebuild    # clean + compile
 # or: bash build_lctech616.sh rebuild
 
-# USB speed — Full-Speed is the default (best cable compatibility);
-# use USB_SPEED=hs for the High-Speed 480 Mbps variant
-USB_SPEED=hs bash build_macos.sh rebuild
-
 # Other commands
 bash build_macos.sh clean      # clean only
 bash build_macos.sh strip      # remove .o/.a to shrink build dir
 ```
 
 - **Supported board: LCTech BL616 only.**
-- **Default USB speed: Full-Speed (12 Mbps)**; pass `USB_SPEED=hs` to build the High-Speed variant (higher polling ceiling, more sensitive to cable quality).
-- Switching `USB_SPEED` triggers an automatic clean rebuild (CMake cache incompatible).
+- **High-Speed (480 Mbps) firmware only.** There is no USB speed build option.
 
-Output: `firmware/lctech616/ds5dongle-lctech616.bin` (~800 KB) plus boot2/partition files and a `flash_prog_cfg.ini`. Built binaries are git-ignored — attach them to a GitHub Release if you want to distribute prebuilt firmware.
+Output: `firmware/lctech616/ds5dongle-lctech616-hs.bin` (~800 KB) plus boot2/partition files and a `flash_prog_cfg.ini`. Built binaries are git-ignored — attach them to a GitHub Release if you want to distribute prebuilt firmware.
 
 #### Windows
 
@@ -94,13 +89,11 @@ On Windows, clone the T-Head toolchain and use the provided script:
 ```bat
 git clone https://gitee.com/bouffalolab/toolchain_gcc_t-head_windows.git
 
-build_windows.bat both         rem build Full-Speed + High-Speed variants
-build_windows.bat rebuild      rem LCTech BL616, Full-Speed
+build_windows.bat rebuild      rem LCTech BL616, High-Speed
 build_windows.bat              rem incremental build
 build_windows.bat flash COM5   rem flash via serial
 ```
 
-`build_windows.bat both` produces both `ds5dongle-lctech616.bin` (Full-Speed) and `ds5dongle-lctech616-hs.bin` (High-Speed); a single High-Speed build is also possible via `USB_SPEED=hs build_windows.bat rebuild`.
 
 The script expects the DS5Dongle BL618 SDK fork at `..\bouffalo_sdk` (step 1) and the toolchain at `%USERPROFILE%\Desktop\toolchain_gcc_t-head_windows` by default. Override with the `BL_SDK_BASE` / `TOOLCHAIN_PATH` environment variables.
 
@@ -108,13 +101,13 @@ The script expects the DS5Dongle BL618 SDK fork at `..\bouffalo_sdk` (step 1) an
 
 #### LCTech BL616 — Dev Cube (UART/ISP mode)
 
-1. Build the firmware first — the build script outputs `ds5dongle-lctech616.bin`, `boot2_bl616_isp_release_v8.1.8.bin` and `partition_cfg_4M_nosec.toml` into `firmware/lctech616/`.
+1. Build the firmware first — the build script outputs `ds5dongle-lctech616-hs.bin`, `boot2_bl616_isp_release_v8.1.8.bin` and `partition_cfg_4M_nosec.toml` into `firmware/lctech616/`.
 2. Hold the **BOOT** button on the LCTech BL616, then plug the board into the PC via USB-C, keeping BOOT held until the board enters UART (ISP) download mode.
 3. Open [Bouffalo Lab Dev Cube](https://dev.bouffalolab.com/download), select chip **BL616**, and use the **ISP (UART)** flashing mode.
 4. Select the board's COM port, then load these files:
    - Partition table: `firmware/lctech616/partition_cfg_4M_nosec.toml`
    - Boot2: `firmware/lctech616/boot2_bl616_isp_release_v8.1.8.bin`
-   - Firmware: `firmware/lctech616/ds5dongle-lctech616.bin`
+   - Firmware: `firmware/lctech616/ds5dongle-lctech616-hs.bin`
 5. Start the download.
 
 > Use the `_nosec` partition table (`partition_cfg_4M_nosec.toml`), not `partition_cfg_4M.toml`.

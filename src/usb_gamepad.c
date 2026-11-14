@@ -25,11 +25,7 @@
 #include "task.h"
 #include "queue.h"
 
-#ifdef FORCE_FS_MODE
-#define FIRMWARE_VERSION "LCT616-DS5 3.18-HidAudio-R5"
-#else
 #define FIRMWARE_VERSION "LCT616-DS5 3.18H-HidAudio-R5"
-#endif
 
 #define USBD_MAX_POWER      250
 #define USBD_LANGID         0x0409
@@ -439,6 +435,8 @@ static const uint8_t *desc_qualifier_cb(uint8_t speed)
 
 static uint8_t other_speed_desc[USB_HID_CONFIG_SIZE];
 
+/* HS devices still expose the USB other-speed configuration descriptor.
+ * This describes the alternate bus speed; it is not an FS firmware variant. */
 static const uint8_t *desc_other_speed_cb(uint8_t speed)
 {
     (void)speed;
@@ -458,11 +456,7 @@ static const uint8_t *desc_other_speed_cb(uint8_t speed)
             if ((bmAttr & 0x03) == 0x01)
                 other_speed_desc[i + 6] = 1;   /* ISO: FS bInterval=1 (1ms) */
             else if ((bmAttr & 0x03) == 0x03) {
-#ifdef FORCE_FS_MODE
-                other_speed_desc[i + 6] = (applied_polling_mode == 0 ? 6 : applied_polling_mode == 1 ? 5 : 3);
-#else
                 other_speed_desc[i + 6] = (applied_polling_mode == 0 ? 4 : applied_polling_mode == 1 ? 2 : 1);
-#endif
             }
         }
         i += len;
@@ -958,9 +952,9 @@ int usb_gamepad_init(usb_gamepad_output_cb_t output_cb)
         volatile uint32_t *phy_tst = (volatile uint32_t *)(USB_BASE + 0x114);
         LOG_INF("[USB-INIT] POST-init (raw): DEV_CTL=0x%08lx PHY_TST=0x%08lx\n",
                (unsigned long)*dev_ctl, (unsigned long)*phy_tst);
-        LOG_INF("[USB-INIT]   GLINT_EN=%d CHIP_EN=%d FORCE_FS=%d UNPLUG=%d\n",
+        LOG_INF("[USB-INIT]   GLINT_EN=%d CHIP_EN=%d UNPLUG=%d\n",
                (int)((*dev_ctl >> 2) & 1), (int)((*dev_ctl >> 5) & 1),
-               (int)((*dev_ctl >> 9) & 1), (int)(*phy_tst & 1));
+               (int)(*phy_tst & 1));
     }
 
     {
@@ -982,10 +976,9 @@ int usb_gamepad_init(usb_gamepad_output_cb_t output_cb)
 
         LOG_INF("[USB-INIT] POST-fixup final state:\n");
         LOG_INF("[USB-INIT]   PDS_USB_CTL=0x%08lx\n", (unsigned long)*pds_usb_ctl);
-        LOG_INF("[USB-INIT]   DEV_CTL=0x%08lx (GLINT_EN=%d CHIP_EN=%d FORCE_FS=%d)\n",
+        LOG_INF("[USB-INIT]   DEV_CTL=0x%08lx (GLINT_EN=%d CHIP_EN=%d)\n",
                (unsigned long)*usb_dev_ctl,
-               (int)((*usb_dev_ctl >> 2) & 1), (int)((*usb_dev_ctl >> 5) & 1),
-               (int)((*usb_dev_ctl >> 9) & 1));
+               (int)((*usb_dev_ctl >> 2) & 1), (int)((*usb_dev_ctl >> 5) & 1));
         LOG_INF("[USB-INIT]   PHY_TST=0x%08lx (UNPLUG=%d) — expect 0\n",
                (unsigned long)*usb_phy_tst, (int)(*usb_phy_tst & 1));
         LOG_INF("[USB-INIT]   GLB_INT=0x%08lx OTG_CSR=0x%08lx\n",
@@ -1009,21 +1002,12 @@ void usb_gamepad_set_suspend_hooks(void (*on_suspend)(void),
 static void apply_polling_rate(uint8_t mode)
 {
     uint8_t interval;
-#ifdef FORCE_FS_MODE
-    /* FS: bInterval is the actual polling period in milliseconds. */
-    switch (mode) {
-    case 0:  interval = 4; break;  /* FS 250Hz */
-    case 1:  interval = 2; break;  /* FS 500Hz */
-    default: interval = 1; break;  /* FS 1ms = 1000Hz USB (BT-limited ~750Hz) */
-    }
-#else
     /* HS: bInterval = 2^(N-1) microframes */
     switch (mode) {
     case 0:  interval = 6; break;  /* HS 4ms = 250Hz */
     case 1:  interval = 5; break;  /* HS 2ms = 500Hz */
     default: interval = 3; break;  /* HS 2^2=4µf  = 0.5ms → 2000Hz, effective ~750Hz */
     }
-#endif
     config_desc[BINTERVAL_GAMEPAD_EP_IN_OFF]  = interval;
     LOG_INF("[USB] Polling rate: mode=%d bInterval=%d\n", mode, interval);
 }

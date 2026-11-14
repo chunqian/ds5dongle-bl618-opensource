@@ -10,11 +10,6 @@ endif()
 
 include(proj.conf)
 
-# FORCE_FS=1 env var → remove CONFIG_USB_HS so SDK sets FORCE_FS bit
-if(DEFINED ENV{FORCE_FS})
-    unset(CONFIG_USB_HS)
-endif()
-
 find_package(bouffalo_sdk REQUIRED HINTS $ENV{BL_SDK_BASE})
 
 # Existing-key authentication failures must reach the same application handler
@@ -109,12 +104,7 @@ sdk_set_linker_script_macro("${OPUS_RAM_LINKER_SCRIPT}")
 message(STATUS "Target board: LCTech BL616 (only supported board)")
 
 target_compile_definitions(app PRIVATE HAVE_CONFIG_H)
-if(DEFINED ENV{FORCE_FS})
-    target_compile_definitions(app PRIVATE FORCE_FS_MODE=1)
-    message(STATUS "USB mode: Full-Speed (compatibility variant)")
-else()
-    message(STATUS "USB mode: High-Speed (default)")
-endif()
+message(STATUS "USB mode: High-Speed (only supported firmware)")
 target_compile_options(app PRIVATE
     $<$<COMPILE_LANGUAGE:C>:-include${CMAKE_CURRENT_LIST_DIR}/lib/opus_config.h>
 )

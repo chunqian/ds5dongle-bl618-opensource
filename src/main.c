@@ -696,11 +696,10 @@ static void usb_task(void *arg)
         /* Periodic USB status check (every ~10 seconds) */
         if (++usb_check_cnt >= 10000) {
             usb_check_cnt = 0;
-            LOG_DBG("[USB-MON] UNPLUG=%d GLINT=%d FORCE_FS=%d "
+            LOG_DBG("[USB-MON] UNPLUG=%d GLINT=%d "
                    "DEV_CTL=0x%08lx GLB_INT=0x%08lx\n",
                    (int)(*(volatile uint32_t *)(USB_BASE + 0x114) & 1),
                    (int)((*(volatile uint32_t *)(USB_BASE + 0x100) >> 2) & 1),
-                   (int)((*(volatile uint32_t *)(USB_BASE + 0x100) >> 9) & 1),
                    (unsigned long)*(volatile uint32_t *)(USB_BASE + 0x100),
                    (unsigned long)*(volatile uint32_t *)(USB_BASE + 0x0C4));
         }

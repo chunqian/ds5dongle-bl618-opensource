@@ -12,7 +12,7 @@
 |--------|------|-----|-----|------|
 | **LCTech BL616**（默认） | BL616 QFN32 | Type-C 原生 | 1x 蓝色（GPIO27） | 外接 USB-TTL |
 
-> **仅支持 LCTech BL616。** macOS 和 Windows 构建入口均只生成该板型的 FS／HS 固件。
+> **仅支持 LCTech BL616。** macOS 和 Windows 构建入口均只生成该板型的 HS 固件。
 
 LED 引脚在 `board_config.h` 中固定为 LCTech BL616 配置。
 
@@ -70,20 +70,15 @@ bash build_macos.sh build      # 增量编译（-j 自动并行）
 bash build_macos.sh rebuild    # 清理后重新编译
 # 或：bash build_lctech616.sh rebuild
 
-# USB 速度 — 默认 Full-Speed（线材兼容性最好）；
-# 需要 High-Speed 480Mbps 变体时加 USB_SPEED=hs
-USB_SPEED=hs bash build_macos.sh rebuild
-
 # 其他命令
 bash build_macos.sh clean      # 仅清理
 bash build_macos.sh strip      # 删除 .o/.a 中间文件，缩小 build 目录
 ```
 
 - **仅支持 LCTech BL616。**
-- **默认 USB 速度：Full-Speed（12Mbps）**；传 `USB_SPEED=hs` 可构建 High-Speed 变体（轮询上限更高，但对线材更敏感）。
-- 切换 `USB_SPEED` 会自动触发一次干净重编（CMake 缓存不兼容）。
+- **仅构建 High-Speed（480Mbps）固件。** 不再提供 USB 速度构建选项。
 
-产物位于 `firmware/lctech616/ds5dongle-lctech616.bin`（约 800KB），以及 boot2/partition 文件和 `flash_prog_cfg.ini`。编译产物已被 git 忽略 —— 如需分发预编译固件，建议附加到 GitHub Release。
+产物位于 `firmware/lctech616/ds5dongle-lctech616-hs.bin`（约 800KB），以及 boot2/partition 文件和 `flash_prog_cfg.ini`。编译产物已被 git 忽略 —— 如需分发预编译固件，建议附加到 GitHub Release。
 
 #### Windows 编译
 
@@ -92,13 +87,11 @@ Windows 下先克隆 T-Head 工具链，然后使用仓库自带的脚本：
 ```bat
 git clone https://gitee.com/bouffalolab/toolchain_gcc_t-head_windows.git
 
-build_windows.bat both         rem 构建 Full-Speed + High-Speed 两个版本
-build_windows.bat rebuild      rem LCTech BL616，Full-Speed
+build_windows.bat rebuild      rem LCTech BL616，High-Speed
 build_windows.bat              rem 增量编译
 build_windows.bat flash COM5   rem 串口烧录
 ```
 
-`build_windows.bat both` 会同时产出 `ds5dongle-lctech616.bin`（Full-Speed）和 `ds5dongle-lctech616-hs.bin`（High-Speed）；只构建 High-Speed 单版本也可用 `USB_SPEED=hs build_windows.bat rebuild`。
 
 脚本默认要求 DS5Dongle BL618 SDK 分支位于 `..\bouffalo_sdk`（见步骤 1），工具链位于 `%USERPROFILE%\Desktop\toolchain_gcc_t-head_windows`。可通过环境变量 `BL_SDK_BASE` / `TOOLCHAIN_PATH` 覆盖。
 
@@ -112,13 +105,13 @@ macOS 另提供可复制到另一台 Mac 的 Developer ID 签名、公证工具�
 
 #### LCTech BL616 — Dev Cube（UART/ISP 模式）
 
-1. 先完成编译——构建脚本会把 `ds5dongle-lctech616.bin`、`boot2_bl616_isp_release_v8.1.8.bin` 和 `partition_cfg_4M_nosec.toml` 输出到 `firmware/lctech616/`。
+1. 先完成编译——构建脚本会把 `ds5dongle-lctech616-hs.bin`、`boot2_bl616_isp_release_v8.1.8.bin` 和 `partition_cfg_4M_nosec.toml` 输出到 `firmware/lctech616/`。
 2. 按住 LCTech BL616 的 **BOOT** 键，然后通过 USB-C 插入电脑，保持按住直到开发板进入 UART（ISP）下载模式。
 3. 打开 [Bouffalo Lab Dev Cube](https://dev.bouffalolab.com/download)，选择芯片 **BL616**，使用 **ISP（UART）烧录模式**。
 4. 选择开发板对应的串口，然后加载以下文件：
    - 分区表：`firmware/lctech616/partition_cfg_4M_nosec.toml`
    - Boot2：`firmware/lctech616/boot2_bl616_isp_release_v8.1.8.bin`
-   - 固件：`firmware/lctech616/ds5dongle-lctech616.bin`
+   - 固件：`firmware/lctech616/ds5dongle-lctech616-hs.bin`
 5. 开始烧录。
 
 > 请使用 `_nosec` 分区表（`partition_cfg_4M_nosec.toml`），不要使用 `partition_cfg_4M.toml`。
@@ -324,7 +317,7 @@ Auto 模式的手柄类型使用独立的 `detected_type` 记录，不再自动�
   `XX=01` 开启，`XX=00` 关闭。主机必须先检查上述专用标记，不能仅凭 Sony VID/PID
   向原装手柄或旧固件发送命令。重复发送相同状态不会触发重新枚举。
 
-构建：`USB_SPEED=hs bash build_macos.sh build`。
+构建：`bash build_macos.sh build`。
 本地验证：
 
 ```bash

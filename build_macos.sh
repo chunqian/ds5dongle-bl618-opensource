@@ -11,18 +11,7 @@ if [[ "${BOARD_TYPE:-lctech616}" != "lctech616" || -n "${BOARD_M0S_DOCK+x}" ]]; 
 fi
 BOARD_TYPE=lctech616
 
-# ── USB 速度 ──
-#   fs  — Full-Speed 12Mbps（默认，线材兼容性好）
-#   hs  — High-Speed 480Mbps（高轮询率，线材兼容性较差）
-USB_SPEED="${USB_SPEED:-fs}"
-
-unset FORCE_FS 2>/dev/null || true
-if [[ "$USB_SPEED" == "fs" ]]; then
-    export FORCE_FS=1
-fi
-echo "[build] Target: LCTech BL616"
-
-echo "[build] USB:  ${USB_SPEED}"
+echo "[build] Target: LCTech BL616, USB High-Speed"
 
 # ── 环境变量（仅脚本执行期间生效） ──
 export BL_SDK_BASE="${SCRIPT_DIR}/../bouffalo_sdk"
@@ -117,7 +106,7 @@ ACTION="${1:-build}"
 BIN_PATH="build/build_out/ds5dongle_bl618_bl616.bin"
 
 # Board-type + USB-speed guard: auto-clean when switching config
-BUILD_KEY="${BOARD_TYPE}-${USB_SPEED}"
+BUILD_KEY="lctech616-hs"
 BOARD_STAMP="build/.board_type"
 if [[ -f "$BOARD_STAMP" ]]; then
     PREV_KEY=$(cat "$BOARD_STAMP")
@@ -128,12 +117,8 @@ if [[ -f "$BOARD_STAMP" ]]; then
     fi
 fi
 
-SPEED_SUFFIX=""
-if [[ "$USB_SPEED" == "hs" ]]; then
-    SPEED_SUFFIX="-hs"
-fi
-BIN_NAME="ds5dongle-${BOARD_TYPE}${SPEED_SUFFIX}.bin"
-OUT_DIR="firmware/${BOARD_TYPE}"
+BIN_NAME="ds5dongle-lctech616-hs.bin"
+OUT_DIR="firmware/lctech616"
 
 # ── 输出 .bin（线刷用） ──
 gen_bin() {
@@ -190,7 +175,7 @@ case "$ACTION" in
         do_build
         do_output
         echo ""
-        echo "[build] Done (${BOARD_TYPE}, usb=${USB_SPEED}). Output: ${OUT_DIR}/"
+        echo "[build] Done (${BOARD_TYPE}, USB High-Speed). Output: ${OUT_DIR}/"
         ;;
     clean)
         ${MAKE_CMD} clean
@@ -206,13 +191,13 @@ case "$ACTION" in
         do_build
         do_output
         echo ""
-        echo "[build] Rebuilt (${BOARD_TYPE}, usb=${USB_SPEED}). Output: ${OUT_DIR}/"
+        echo "[build] Rebuilt (${BOARD_TYPE}, USB High-Speed). Output: ${OUT_DIR}/"
         ;;
     strip)
         strip_intermediates
         ;;
     *)
-        echo "Usage: [USB_SPEED=hs|fs] ./build_macos.sh [build|clean|flash|rebuild|strip]"
+        echo "Usage: ./build_macos.sh [build|clean|flash|rebuild|strip]"
         echo ""
         echo "  build   - 编译项目（默认）"
         echo "  clean   - 清除构建产物"
@@ -222,13 +207,9 @@ case "$ACTION" in
         echo ""
         echo "Board: LCTech BL616 only"
         echo ""
-        echo "USB speed:"
-        echo "  fs  — Full-Speed 12Mbps（默认，线材兼容性好）"
-        echo "  hs  — High-Speed 480Mbps（高轮询率，线材兼容性较差）"
+        echo "USB: High-Speed only"
         echo ""
-        echo "Examples:"
-        echo "  ./build_macos.sh rebuild                                # FS .bin (默认)"
-        echo "  USB_SPEED=hs ./build_macos.sh rebuild                   # HS .bin"
+        echo "Example: bash build_macos.sh rebuild"
         exit 1
         ;;
 esac

@@ -114,11 +114,7 @@ int main(void) {
         requested_dse_mode=edge;
         audio_control.visible=aud;
         apply_usb_profile();
-#ifdef FORCE_FS_MODE
-        unsigned poll=mode==0?4:mode==1?2:1;
-#else
         unsigned poll=mode==0?6:mode==1?5:3;
-#endif
         check_descriptors(edge,aud,keys==1,poll);
         assert(usb_profile_matches_config());
         const uint8_t *other=desc_other_speed_cb(0);
@@ -126,11 +122,7 @@ int main(void) {
         for(unsigned i=9;i<u16(other+2);i+=other[i]) {
             if(other[i+1]!=5 || (other[i+3]&3)!=3) continue;
             assert(other[i+2]==USB_GAMEPAD_EP_IN);
-#ifdef FORCE_FS_MODE
-            assert(other[i+6]==(mode==0?6:mode==1?5:3));
-#else
             assert(other[i+6]==(mode==0?4:mode==1?2:1));
-#endif
         }
     }
     /* A pending host setting must not mutate an attached descriptor set. */
@@ -154,8 +146,7 @@ assert 'GLB_SW_System_Reset' not in source
 with tempfile.TemporaryDirectory() as tmp:
     path = Path(tmp)
     (path / 'test.c').write_text(harness)
-    for variant in ([], ['-DFORCE_FS_MODE']):
-        subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', *variant,
-                        '-I', str(root / 'src'), str(path / 'test.c'),
-                        str(root / 'src/usb_audio_control.c'), '-o', str(path / 'test')], check=True)
-        subprocess.run([str(path / 'test')], check=True)
+    subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
+                    '-I', str(root / 'src'), str(path / 'test.c'),
+                    str(root / 'src/usb_audio_control.c'), '-o', str(path / 'test')], check=True)
+    subprocess.run([str(path / 'test')], check=True)
