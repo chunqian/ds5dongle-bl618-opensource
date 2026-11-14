@@ -69,10 +69,11 @@ int bt_hid_host_init(const struct bt_hid_host_config *config);
 
 /**
  * Start scanning for BT Classic HID devices.
- * @param duration_sec  scan duration in seconds (0 = indefinite)
+ * @param inquiry_length  HCI units of 1.28 seconds, 1..0x30;
+ *                        0 uses DS5Dongle's default of 30 units (38.4 seconds).
  * @return 0 on success
  */
-int bt_hid_host_scan_start(uint8_t duration_sec);
+int bt_hid_host_scan_start(uint8_t inquiry_length);
 
 /**
  * Stop scanning.
@@ -222,9 +223,9 @@ void bt_hid_host_handshake_tick(void);
 bool bt_hid_host_poll_connect(void);
 
 /**
- * Poll discovery_results[] for early termination: if a gamepad
- * appears before the full inquiry period, stop inquiry immediately
- * and initiate connection. Call from task context at ~10 Hz.
+ * Poll for a Peripheral-class device. Confirm inquiry cancellation before
+ * scheduling a connection; also stop inquiry after an incoming reconnect.
+ * Call from task context at ~10 Hz.
  * @return true if early termination triggered
  */
 bool bt_hid_host_poll_scan_early(void);

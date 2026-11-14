@@ -21,7 +21,7 @@
 #include "bl616_glb.h"
 
 
-#define BT_INQUIRY_LEN         5
+#define BT_INQUIRY_LEN         30 /* HCI units of 1.28 s, as in DS5Dongle. */
 #define BT_MAX_DISCOVERED      8
 #define L2CAP_BR_MTU           672
 
@@ -300,6 +300,7 @@ static struct {
     volatile bool check_dse;
 
     volatile bool connect_pending;
+    volatile bool discovery_active;
     volatile TickType_t connect_pending_tick;
     volatile uint8_t connect_retry_count;
     bt_addr_t     pending_addr;
@@ -553,6 +554,18 @@ static void handshake_begin(void)
     set_state(BT_HID_STATE_HANDSHAKE);
 }
 
+static void handshake_maybe_begin(void)
+{
+    /* Incoming channels and the SDK security callback may arrive in either
+     * order. Initialize once, only after encryption and BOTH HID channels. */
+    if (hid_ctx.conn && hid_ctx.security_done &&
+        hid_ctx.ctrl_connected && hid_ctx.intr_connected &&
+        hid_ctx.state != BT_HID_STATE_DISCONNECTING &&
+        hid_ctx.state != BT_HID_STATE_HANDSHAKE &&
+        hid_ctx.state != BT_HID_STATE_CONNECTED)
+        handshake_begin();
+}
+
 /* RX may identify the controller before GET 0x70 returns in the BT task.
  * Finish the initial GET batch and state/0x32 first, as in DS5Dongle's
  * channel-open handler, before unlocking Edge or exposing CONNECTED. */
@@ -741,7 +754,8 @@ static void l2cap_ctrl_connected(struct bt_l2cap_chan *chan)
 {
     LOG_DBG("[HID-CB] l2cap_ctrl_connected ENTER chan=%p state=%d\n",
            chan, hid_ctx.state);
-    if (chan->conn != hid_ctx.conn || hid_ctx.state == BT_HID_STATE_DISCONNECTING)
+    if (!hid_ctx.conn || chan->conn != hid_ctx.conn ||
+        hid_ctx.state == BT_HID_STATE_DISCONNECTING || hid_ctx.ctrl_connected)
         return;
     hid_ctx.ctrl_accepting = false;
     hid_ctx.ctrl_connected = true;
@@ -749,24 +763,29 @@ static void l2cap_ctrl_connected(struct bt_l2cap_chan *chan)
     /* Only create outgoing interrupt channel if WE initiated the connection
      * (via inquiry → connect). For controller-initiated reconnects, the
      * controller will open the interrupt channel via the L2CAP server. */
-    if (hid_ctx.outgoing) {
+    if (hid_ctx.outgoing && !hid_ctx.intr_connected && !hid_ctx.intr_accepting &&
+        !hid_ctx.intr_chan.chan.conn) {
+        hid_ctx.intr_accepting = true;
         set_state(BT_HID_STATE_L2CAP_INTERRUPT);
 
         int err = bt_l2cap_chan_connect(hid_ctx.conn,
                                         &hid_ctx.intr_chan.chan,
                                         HID_PSM_INTERRUPT);
         if (err) {
+            hid_ctx.intr_accepting = false;
             LOG_ERR("[HID] Failed to connect interrupt channel: %d\n", err);
-            bt_conn_disconnect(hid_ctx.conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+            bt_hid_host_disconnect();
         }
     }
+    handshake_maybe_begin();
 }
 
 static void l2cap_intr_connected(struct bt_l2cap_chan *chan)
 {
     LOG_DBG("[HID-CB] l2cap_intr_connected ENTER chan=%p state=%d\n",
            chan, hid_ctx.state);
-    if (chan->conn != hid_ctx.conn || hid_ctx.state == BT_HID_STATE_DISCONNECTING)
+    if (!hid_ctx.conn || chan->conn != hid_ctx.conn ||
+        hid_ctx.state == BT_HID_STATE_DISCONNECTING || hid_ctx.intr_connected)
         return;
     hid_ctx.intr_accepting = false;
     hid_ctx.intr_connected = true;
@@ -805,7 +824,7 @@ static void l2cap_intr_connected(struct bt_l2cap_chan *chan)
     }
 
     /* The BT task sends the initial GET batch followed by the 0x32 primer. */
-    handshake_begin();
+    handshake_maybe_begin();
 
 }
 
@@ -891,8 +910,23 @@ static uint8_t sdp_discover_cb(struct bt_conn *conn,
 
 static void auth_passkey_confirm(struct bt_conn *conn, unsigned int passkey)
 {
+    if (conn != hid_ctx.conn || hid_ctx.state == BT_HID_STATE_DISCONNECTING)
+        return;
     LOG_INF("[BT] SSP confirm passkey: %06u (auto-accepting)\n", passkey);
     bt_conn_auth_passkey_confirm(conn);
+}
+
+static void auth_pincode_entry(struct bt_conn *conn, bool secure)
+{
+    (void)secure;
+    if (conn != hid_ctx.conn || hid_ctx.state == BT_HID_STATE_DISCONNECTING)
+        return;
+    /* Legacy pairing compatibility, matching DS5Dongle's PIN response. */
+    int err = bt_conn_auth_pincode_entry(conn, "0000");
+    if (err) {
+        LOG_WRN("[BT] PIN reply failed (%d)\n", err);
+        bt_hid_host_disconnect();
+    }
 }
 
 static void auth_passkey_display(struct bt_conn *conn, unsigned int passkey)
@@ -956,6 +990,7 @@ static void auth_pairing_failed(struct bt_conn *conn,
 }
 
 static struct bt_conn_auth_cb auth_callbacks = {
+    .pincode_entry     = auth_pincode_entry,
     .passkey_display   = auth_passkey_display,
     .passkey_confirm   = auth_passkey_confirm,
     .cancel            = auth_cancel,
@@ -1026,6 +1061,7 @@ static void security_changed(struct bt_conn *conn, bt_security_t level,
          * Controller will create L2CAP channels via our servers. */
         LOG_INF("[BT] security OK (incoming), waiting for controller L2CAP\n");
     }
+    handshake_maybe_begin();
     LOG_DBG("[BT-CB] security_changed EXIT\n");
 }
 
@@ -1063,8 +1099,8 @@ static void conn_connected(struct bt_conn *conn, uint8_t err)
         return;
     }
 
-    if (hid_ctx.state == BT_HID_STATE_SCANNING)
-        bt_br_discovery_stop();
+    /* The BT task stops any active inquiry. Do not wait for Inquiry Cancel
+     * from the RX callback that also delivers its completion. */
 
     if (!hid_ctx.outgoing && remote && blacklist_contains(remote)) {
         LOG_WRN("[BT] Rejecting blacklisted device %s "
@@ -1195,13 +1231,36 @@ static struct bt_conn_cb conn_callbacks = {
 
 /* ---------- Inquiry / Discovery ---------- */
 
+static bool discovery_is_peripheral(const struct bt_br_discovery_result *result)
+{
+    uint32_t cod = result->cod[0] | ((uint32_t)result->cod[1] << 8) |
+                   ((uint32_t)result->cod[2] << 16);
+    return (cod & 0x000F00) == 0x000500;
+}
+
+/* Task context only. A successful SDK stop includes the controller's
+ * Inquiry Cancel completion and detaches the result callback. */
+static bool discovery_stop(void)
+{
+    if (!hid_ctx.discovery_active)
+        return true;
+    int err = bt_br_discovery_stop();
+    if (err && err != -EALREADY) {
+        LOG_WRN("[BT] Inquiry stop failed (%d); not paging\n", err);
+        return false;
+    }
+    hid_ctx.discovery_active = false;
+    return true;
+}
+
 static void discovery_complete(struct bt_br_discovery_result *results,
                                size_t count)
 {
     LOG_INF("[BT] Inquiry complete, found %zu device(s)\n", count);
 
-    if (hid_ctx.conn) {
-        LOG_INF("[BT] Inquiry ended but ACL already established, skipping\n");
+    hid_ctx.discovery_active = false;
+    if (hid_ctx.conn || hid_ctx.state != BT_HID_STATE_SCANNING) {
+        LOG_INF("[BT] Inquiry ended after connection state advanced, skipping\n");
         return;
     }
 
@@ -1209,24 +1268,11 @@ static void discovery_complete(struct bt_br_discovery_result *results,
         char addr_str[BT_ADDR_STR_LEN];
         bt_addr_to_str(&results[i].addr, addr_str, sizeof(addr_str));
 
-        uint32_t cod = results[i].cod[0]
-                     | ((uint32_t)results[i].cod[1] << 8)
-                     | ((uint32_t)results[i].cod[2] << 16);
-        uint8_t major = (cod >> 8) & 0x1F;
-        uint8_t minor = (cod >> 2) & 0x3F;
+        LOG_DBG("[BT] Device: %s COD=0x%02x%02x%02x\n", addr_str,
+                results[i].cod[2], results[i].cod[1], results[i].cod[0]);
 
-        LOG_DBG("[BT] Device: %s COD=0x%06x (major=%d minor=%d)\n",
-               addr_str, cod, major, minor);
-
-        /* CoD Major Class 0x05 = Peripheral, Minor bit 1 = Gamepad */
-        bool is_gamepad = (major == 0x05) && (minor & 0x02);
-
-        if (is_gamepad || hid_ctx.has_target) {
-            if (hid_ctx.has_target &&
-                bt_addr_cmp(&results[i].addr, &hid_ctx.target_addr) != 0)
-                continue;
-
-            LOG_INF("[BT] Gamepad found, deferring connect to task context\n");
+        if (discovery_is_peripheral(&results[i])) {
+            LOG_INF("[BT] Peripheral found, deferring connect to task context\n");
             bt_addr_copy(&hid_ctx.pending_addr, &results[i].addr);
             hid_ctx.connect_pending = true;
             hid_ctx.connect_pending_tick = 0;
@@ -1238,7 +1284,7 @@ static void discovery_complete(struct bt_br_discovery_result *results,
         }
     }
 
-    LOG_INF("[BT] No gamepad found, will retry via bt_task\n");
+    LOG_INF("[BT] No peripheral found; waiting for incoming connection\n");
     set_state(BT_HID_STATE_IDLE);
 }
 
@@ -1290,7 +1336,7 @@ static int l2cap_ctrl_server_accept(struct bt_conn *conn,
         return -EACCES;
     }
 
-    if (hid_ctx.ctrl_connected || hid_ctx.ctrl_accepting) {
+    if (hid_ctx.ctrl_connected || hid_ctx.ctrl_accepting || hid_ctx.ctrl_chan.chan.conn) {
         LOG_WRN("[HID] Control channel already connected/accepting\n");
         return -ENOMEM;
     }
@@ -1329,7 +1375,7 @@ static int l2cap_intr_server_accept(struct bt_conn *conn,
         return -EACCES;
     }
 
-    if (hid_ctx.intr_connected || hid_ctx.intr_accepting) {
+    if (hid_ctx.intr_connected || hid_ctx.intr_accepting || hid_ctx.intr_chan.chan.conn) {
         LOG_WRN("[HID] Interrupt channel already connected/accepting\n");
         return -ENOMEM;
     }
@@ -1347,11 +1393,13 @@ static int l2cap_intr_server_accept(struct bt_conn *conn,
 
 static struct bt_l2cap_server l2cap_hid_ctrl_server = {
     .psm    = HID_PSM_CONTROL,
+    .sec_level = BT_SECURITY_L2,
     .accept = l2cap_ctrl_server_accept,
 };
 
 static struct bt_l2cap_server l2cap_hid_intr_server = {
     .psm    = HID_PSM_INTERRUPT,
+    .sec_level = BT_SECURITY_L2,
     .accept = l2cap_intr_server_accept,
 };
 
@@ -1569,9 +1617,9 @@ int bt_hid_host_init(const struct bt_hid_host_config *config)
     return 0;
 }
 
-int bt_hid_host_scan_start(uint8_t duration_sec)
+int bt_hid_host_scan_start(uint8_t inquiry_length)
 {
-    if (hid_ctx.state != BT_HID_STATE_IDLE || hid_ctx.conn)
+    if (hid_ctx.state != BT_HID_STATE_IDLE || hid_ctx.conn || hid_ctx.discovery_active)
         return -1;
 
     /* Don't scan if an outgoing connect retry is pending —
@@ -1587,12 +1635,13 @@ int bt_hid_host_scan_start(uint8_t duration_sec)
     hid_ctx.has_target = false;
     hid_ctx.connect_pending_tick = 0;
     hid_ctx.connect_retry_count = 0;
+    hid_ctx.discovery_active = true;
     set_state(BT_HID_STATE_SCANNING);
 
     memset(discovery_results, 0, sizeof(discovery_results));
 
     struct bt_br_discovery_param param = {
-        .length     = duration_sec ? duration_sec : BT_INQUIRY_LEN,
+        .length     = inquiry_length ? inquiry_length : BT_INQUIRY_LEN,
         .limited    = false,
     };
 
@@ -1600,8 +1649,10 @@ int bt_hid_host_scan_start(uint8_t duration_sec)
                                      BT_MAX_DISCOVERED,
                                      discovery_complete);
     if (err) {
+        hid_ctx.discovery_active = false;
         LOG_ERR("[BT] Discovery start failed: %d\n", err);
-        set_state(BT_HID_STATE_IDLE);
+        if (!hid_ctx.conn && hid_ctx.state == BT_HID_STATE_SCANNING)
+            set_state(BT_HID_STATE_IDLE);
         return err;
     }
 
@@ -1611,38 +1662,35 @@ int bt_hid_host_scan_start(uint8_t duration_sec)
 
 void bt_hid_host_scan_stop(void)
 {
-    bt_br_discovery_stop();
-    if (hid_ctx.state == BT_HID_STATE_SCANNING)
+    if (discovery_stop() && hid_ctx.state == BT_HID_STATE_SCANNING)
         set_state(BT_HID_STATE_IDLE);
 }
 
 bool bt_hid_host_poll_scan_early(void)
 {
-    if (hid_ctx.state != BT_HID_STATE_SCANNING)
+    if (!hid_ctx.discovery_active)
         return false;
+
+    if (hid_ctx.conn || hid_ctx.state != BT_HID_STATE_SCANNING) {
+        discovery_stop(); /* Incoming reconnect wins over the inquiry. */
+        return false;
+    }
 
     for (int i = 0; i < BT_MAX_DISCOVERED; i++) {
         static const bt_addr_t zero = {{0}};
         if (bt_addr_cmp(&discovery_results[i].addr, &zero) == 0)
             break;
 
-        uint32_t cod = discovery_results[i].cod[0]
-                     | ((uint32_t)discovery_results[i].cod[1] << 8)
-                     | ((uint32_t)discovery_results[i].cod[2] << 16);
-        uint8_t major = (cod >> 8) & 0x1F;
-        uint8_t minor = (cod >> 2) & 0x3F;
-        bool is_gamepad = (major == 0x05) && (minor & 0x02);
-
-        if (is_gamepad || (hid_ctx.has_target &&
-            bt_addr_cmp(&discovery_results[i].addr, &hid_ctx.target_addr) == 0)) {
-
-            if (hid_ctx.has_target &&
-                bt_addr_cmp(&discovery_results[i].addr, &hid_ctx.target_addr) != 0)
-                continue;
-
-            LOG_INF("[BT] Early termination: gamepad found during inquiry\n");
-            bt_br_discovery_stop();
-            bt_addr_copy(&hid_ctx.pending_addr, &discovery_results[i].addr);
+        if (discovery_is_peripheral(&discovery_results[i])) {
+            /* Snapshot before the blocking SDK call: RX may finish inquiry
+             * or accept an incoming ACL while we await command completion. */
+            bt_addr_t candidate = discovery_results[i].addr;
+            if (!discovery_stop())
+                return false;
+            if (hid_ctx.conn || hid_ctx.state != BT_HID_STATE_SCANNING)
+                return false;
+            LOG_INF("[BT] Inquiry stopped; connecting to peripheral\n");
+            bt_addr_copy(&hid_ctx.pending_addr, &candidate);
             hid_ctx.connect_pending = true;
             hid_ctx.connect_pending_tick = 0;
             hid_ctx.connect_retry_count = 0;
@@ -1690,10 +1738,11 @@ bool bt_hid_host_poll_connect(void)
     }
 
     /* If scanning is in progress, cancel it first (HCI can't do both) */
-    if (hid_ctx.state == BT_HID_STATE_SCANNING) {
-        LOG_INF("[BT] poll_connect: cancelling active scan first\n");
-        bt_br_discovery_stop();
-        set_state(BT_HID_STATE_IDLE);
+    if (hid_ctx.discovery_active) {
+        if (!discovery_stop())
+            return false;
+        /* Let the next poll recheck state/ownership after the blocking stop. */
+        return false;
     }
 
     LOG_INF("[BT] Discovery: attempting outgoing connect (state=%d conn=%p)\n",
@@ -1767,6 +1816,8 @@ bool bt_hid_host_poll_sdp(void)
     hid_ctx.sdp_pending = false;
 
     if (!hid_ctx.outgoing || !hid_ctx.security_done ||
+        hid_ctx.ctrl_connected || hid_ctx.ctrl_accepting ||
+        hid_ctx.ctrl_chan.chan.conn ||
         hid_ctx.state != BT_HID_STATE_CONNECTING) {
         LOG_DBG("[BT] poll_sdp: state already advanced (%s), skipping\n",
                state_name(hid_ctx.state));
@@ -1780,19 +1831,25 @@ bool bt_hid_host_poll_sdp(void)
     set_state(BT_HID_STATE_L2CAP_CONTROL);
 
     memset(&hid_ctx.ctrl_chan, 0, sizeof(hid_ctx.ctrl_chan));
-    memset(&hid_ctx.intr_chan, 0, sizeof(hid_ctx.intr_chan));
-
     hid_ctx.ctrl_chan.chan.ops = &ctrl_ops;
     hid_ctx.ctrl_chan.rx.mtu  = L2CAP_BR_MTU;
-    hid_ctx.intr_chan.chan.ops = &intr_ops;
-    hid_ctx.intr_chan.rx.mtu  = L2CAP_BR_MTU;
+    /* A peer may already have opened Interrupt while encryption completed.
+     * Never overwrite channel storage still owned by the SDK. */
+    if (!hid_ctx.intr_connected && !hid_ctx.intr_accepting &&
+        !hid_ctx.intr_chan.chan.conn) {
+        memset(&hid_ctx.intr_chan, 0, sizeof(hid_ctx.intr_chan));
+        hid_ctx.intr_chan.chan.ops = &intr_ops;
+        hid_ctx.intr_chan.rx.mtu = L2CAP_BR_MTU;
+    }
 
+    hid_ctx.ctrl_accepting = true;
     int err = bt_l2cap_chan_connect(hid_ctx.conn,
                                     &hid_ctx.ctrl_chan.chan,
                                     HID_PSM_CONTROL);
     if (err) {
+        hid_ctx.ctrl_accepting = false;
         LOG_DBG("[BT] poll_sdp: L2CAP control connect failed: %d\n", err);
-        bt_conn_disconnect(hid_ctx.conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+        bt_hid_host_disconnect();
     }
     return true;
 }
@@ -1824,6 +1881,7 @@ bool bt_hid_host_poll_security_watchdog(void)
         if (hid_ctx.outgoing) {
             hid_ctx.sdp_pending = true;
         }
+        handshake_maybe_begin();
         return true;
     }
 
@@ -1842,11 +1900,8 @@ int bt_hid_host_connect(const uint8_t *addr)
            addr[5], addr[4], addr[3], addr[2], addr[1], addr[0],
            hid_ctx.state, hid_ctx.conn);
 
-    if (hid_ctx.state == BT_HID_STATE_SCANNING) {
-        LOG_DBG("[BT] connect [1] stopping scan...\n");
-        int stop_err = bt_br_discovery_stop();
-        LOG_DBG("[BT] connect [2] scan stop rc=%d\n", stop_err);
-    }
+    if (hid_ctx.discovery_active)
+        return -EBUSY; /* Poll path must confirm Inquiry Cancel first. */
 
     if (hid_ctx.conn) {
         LOG_DBG("[BT] connect: already have conn=%p, skip create\n", hid_ctx.conn);
@@ -2119,6 +2174,8 @@ int bt_hid_host_switch_next(void)
     char addr_str[BT_ADDR_STR_LEN];
     bt_addr_to_str(addr, addr_str, sizeof(addr_str));
 
+    /* Inquiry Cancel can yield to an incoming ACL. Recheck ownership AFTER it. */
+    discovery_stop();
     if (hid_ctx.conn) {
         switch_pending = true;
 
@@ -2128,9 +2185,6 @@ int bt_hid_host_switch_next(void)
         /* The disconnect completion path will handle full cleanup and
          * enable connectable only after old ACL is fully torn down. */
     } else {
-        if (hid_ctx.state == BT_HID_STATE_SCANNING)
-            bt_br_discovery_stop();
-
         hid_ctx.ctrl_accepting = false;
         hid_ctx.intr_accepting = false;
         hid_ctx.outgoing = false;
@@ -2194,8 +2248,7 @@ static void clear_bond_storage(void)
 
 void bt_hid_host_clear_bonds(void)
 {
-    if (hid_ctx.state == BT_HID_STATE_SCANNING)
-        bt_br_discovery_stop();
+    discovery_stop(); /* If it fails, IDLE prevents discovery from paging a peer. */
     hid_ctx.connect_pending = false;
     hid_ctx.connect_pending_tick = 0;
     hid_ctx.connect_retry_count = 0;

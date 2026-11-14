@@ -70,7 +70,7 @@ static int blacklist_count, cached_rssi;
 static bool switch_pending, first_intr_logged, first_output_logged, clear_bonds_pending;
 static void clear_bond_storage(void);
 void bt_hid_host_disconnect(void);
-static void bt_br_discovery_stop(void) {}
+static bool discovery_stop(void) { return true; } /* Exercised in reconnect tests. */
 static int bt_conn_disconnect(struct bt_conn *conn, int reason) { (void)conn; (void)reason; return 0; }
 static struct bt_conn *bt_conn_ref(struct bt_conn *conn) { ++conn->refs; return conn; }
 static void bt_conn_unref(struct bt_conn *conn) { assert(conn->refs); --conn->refs; }

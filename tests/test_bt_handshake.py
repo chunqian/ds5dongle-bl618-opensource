@@ -166,7 +166,8 @@ int bt_hid_host_get_feature(uint8_t id) {
 '''
 support += constants
 for signature in (
-    "static void handshake_begin(", "static void handshake_finish_detection(",
+    "static void handshake_begin(", "static void handshake_maybe_begin(",
+    "static void handshake_finish_detection(",
     "static void handshake_send_pending(",
     "static int l2cap_ctrl_recv(", "void bt_hid_host_handshake_tick(",
     "void bt_hid_host_disconnect(", "static void clear_rejected_key(",
@@ -339,7 +340,10 @@ with tempfile.TemporaryDirectory(prefix="ds5-handshake-test-") as directory:
     patched_text = patched.read_text()
     actual_auth = extract(patched_text, "static void auth_complete(")
     old_auth = extract(before.decode(), "static void auth_complete(")
-    assert patched_text.replace(actual_auth, old_auth) == before.decode()
+    actual_io = extract(patched_text, "static void io_capa_req(")
+    old_io = extract(before.decode(), "static void io_capa_req(")
+    assert patched_text.replace(actual_auth, old_auth).replace(actual_io, old_io) == before.decode()
+    assert "cp->authentication = BT_HCI_GENERAL_BONDING;" in actual_io
     assert actual_auth.count("bt_conn_security_changed(conn, security_err_get(evt->status));") == 1
     again = work / "again.c"
     script.write_text(f'include("{ROOT / "cmake/bt_auth_notify.cmake"}")\n'

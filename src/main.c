@@ -544,17 +544,11 @@ static void bt_task(void *arg)
     led_status_set(LED_PURPLE_BLINK_SLOW);
     LOG_INF("[BT_TASK] led OK\n");
 
-    LOG_INF("[BT_TASK] try_reconnect...\n");
-    if (bt_hid_host_try_reconnect() == 0) {
-        /* Passive reconnect: page scan is enabled, wait for the
-         * controller to page us and create L2CAP channels. */
-        LOG_INF("[MAIN] Waiting for controller to reconnect...\n");
-        /* Enter the task loop immediately: authentication, HID initialization
-         * and output processing run there even during a passive reconnect. */
-    } else {
-        LOG_INF("[MAIN] No bonded device, starting scan\n");
-        bt_hid_host_scan_start(0);
-    }
+    /* DS5Dongle performs one startup inquiry, including with saved bonds.
+     * Page scan remains enabled so a paired controller may reconnect first.
+     * Enter the task loop immediately to process authentication and HID. */
+    LOG_INF("[BT_TASK] Startup inquiry\n");
+    bt_hid_host_scan_start(0);
     LOG_INF("[BT_TASK] Entering main loop\n");
 
     uint8_t usb_out[USB_OUTPUT_BUF_SZ];
