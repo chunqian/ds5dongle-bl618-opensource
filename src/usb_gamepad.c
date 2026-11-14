@@ -8,6 +8,7 @@
 #include "ds5_protocol.h"
 #include "dse.h"
 #include "config.h"
+#include "deferred_store.h"
 #include "state_mgr.h"
 #include "remap.h"
 #include "usbd_core.h"
@@ -58,12 +59,9 @@ static void apply_usb_profile(void);
 static bool usb_profile_matches_config(void);
 static void request_usb_profile(void);
 
-static volatile bool usb_config_save_pending = false;
 static struct usb_audio_control audio_control;
 
 static volatile bool usb_reset_pending = false;
-static volatile bool usb_remap_save_pending  = false;
-static volatile uint8_t usb_remap_save_profile = 0;
 static uint8_t remap_read_profile = 0;
 static bool first_usb_send_logged = false;
 
@@ -782,9 +780,7 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
         usb_configured = false;
         ep_in_busy = false;
         kbd_ep_busy = false;
-        usb_audio_stop();
-        usb_audio_mic_stop();
-        audio_set_mic_active(false);
+        usb_audio_suspend();
         LOG_INF("[USB-EVT] SUSPEND\n");
         /* Our own detach must not masquerade as a sleeping host, otherwise
          * BT reconnect would refuse to reattach USB indefinitely. */
@@ -794,6 +790,7 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
         break;
     case USBD_EVENT_RESUME:
         usb_configured = true;
+        usb_audio_resume();
         ep_in_busy = false;
         kbd_ep_busy = false;
         LOG_INF("[USB-EVT] RESUME\n");
@@ -900,7 +897,7 @@ void usb_gamepad_set_dse_mode(bool dse)
 
 void usb_gamepad_request_config_save(void)
 {
-    usb_config_save_pending = true;
+    config_request_save();
 }
 
 ATTR_TCM_SECTION
@@ -957,22 +954,7 @@ void usb_gamepad_process_deferred(void)
                 enabled, usb_bt_hidden);
     }
 
-    if (usb_config_save_pending) {
-        static uint64_t retry_at;
-        uint64_t now = bflb_mtimer_get_time_us();
-        if (now >= retry_at) {
-            usb_config_save_pending = false;
-            if (!config_save()) {
-                usb_config_save_pending = true;
-                retry_at = now + 1000000ULL;
-            } else retry_at = 0;
-        }
-    }
-    if (usb_remap_save_pending) {
-        usb_remap_save_pending = false;
-        remap_save_profile(usb_remap_save_profile);
-        LOG_INF("[USB] Remap profile %d saved to flash\n", usb_remap_save_profile);
-    }
+    deferred_store_process();
 
     set_report_entry_t entry;
     while (set_report_queue &&
@@ -1416,7 +1398,9 @@ void usbd_hid_get_report(uint8_t busid, uint8_t intf, uint8_t report_id,
         feature_resp_buf[0] = report_id;
 
         if (report_id == 0xF7) {
-            struct config_body *cfg = config_get();
+            struct config_body snapshot;
+            config_snapshot(&snapshot);
+            const struct config_body *cfg = &snapshot;
             uint16_t cfg_len = sizeof(struct config_body);
             if (cfg_len > FEATURE_DATA_MAX)
                 cfg_len = FEATURE_DATA_MAX;
@@ -1439,8 +1423,10 @@ void usbd_hid_get_report(uint8_t busid, uint8_t intf, uint8_t report_id,
 
             feature_resp_buf[1] = (uint8_t)bt_hid_host_get_cached_rssi();
             uint8_t aflags = 0x80;
-            if (state_mgr_is_spk_active())        aflags |= 0x02;
-            if (usb_audio_mic_is_active())         aflags |= 0x01;
+            if (state_mgr_is_spk_active() && !config_get()->disable_speaker &&
+                bt_hid_host_get_state() == BT_HID_STATE_CONNECTED) aflags |= 0x02;
+            if (audio_mic_active() && !config_get()->disable_mic &&
+                bt_hid_host_get_state() == BT_HID_STATE_CONNECTED) aflags |= 0x01;
             feature_resp_buf[2] = aflags;
             /* Layout kept identical to the private firmware so the companion
              * web tool can parse RSSI / audio / battery. OTA fields are
@@ -1550,7 +1536,7 @@ void usbd_hid_set_report(uint8_t busid, uint8_t intf, uint8_t report_id,
                 state_mgr_restore_config_volume();
             LOG_INF("[USB] CMD 0x01: config updated\n");
         } else if (cmd == 0x02) {
-            usb_config_save_pending = true;
+            config_request_save();
         } else if (cmd == 0x04) {
             usb_audio_control_command(&audio_control, payload, payload_len,
                                       bflb_mtimer_get_time_us());
@@ -1570,14 +1556,12 @@ void usbd_hid_set_report(uint8_t busid, uint8_t intf, uint8_t report_id,
                 uint8_t prof = payload[1];
                 if (prof >= REMAP_PROFILE_COUNT) prof = 0;
                 remap_set_profile(prof, payload + 2, (uint8_t)(payload_len - 2));
-                usb_remap_save_profile = prof;
-                usb_remap_save_pending = true;
+                remap_request_save(prof);
                 LOG_INF("[USB] CMD 0xFB/0x01: profile %d updated (%d bytes)\n", prof, payload_len - 2);
             } else if (payload_len >= 1 + REMAP_OLD_BTN_COUNT * (int)sizeof(remap_entry_t)) {
                 /* backward compat: no profile byte → profile 0 */
                 remap_set_profile(0, payload + 1, (uint8_t)(payload_len - 1));
-                usb_remap_save_profile = 0;
-                usb_remap_save_pending = true;
+                remap_request_save(0);
                 LOG_INF("[USB] CMD 0xFB/0x01: profile 0 updated (compat)\n");
             }
         } else if (cmd == 0x02) {
@@ -1585,8 +1569,7 @@ void usbd_hid_set_report(uint8_t busid, uint8_t intf, uint8_t report_id,
             uint8_t prof = (payload_len >= 2) ? payload[1] : remap_get_active_profile();
             if (prof >= REMAP_PROFILE_COUNT) prof = 0;
             remap_reset_profile(prof);
-            usb_remap_save_profile = prof;
-            usb_remap_save_pending = true;
+            remap_request_save(prof);
             LOG_INF("[USB] CMD 0xFB/0x02: profile %d reset\n", prof);
         } else if (cmd == 0x03 && payload_len >= 2) {
             /* 0x03 [profile] — select profile to read on next GET_REPORT */

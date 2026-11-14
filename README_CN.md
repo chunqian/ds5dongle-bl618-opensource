@@ -335,6 +335,16 @@ Mac 应用需要重新发送命令。关闭声卡时音频驱动的 HD 震动和
 `HidAudio-R2` 将时间采样与 HID 请求状态读取放入同一临界区，并检查时间先后关系，
 防止新命令插入时无符号时间差下溢、跳过 100ms 的 USB 控制传输完成等待。
 
+音频接口的主机打开状态与蓝牙手柄连接状态分别维护：USB 挂起时暂停端点，恢复时按
+原有接口选择重新启动；仅蓝牙断开时清空旧音频，保留 USB 接口状态。若 USB 没有重新
+枚举，手柄重连后会重新发送麦克风启停指令，发送失败继续重试。USB reset、拔插和
+HID 关闭声卡仍撤销接口状态。编码器及其帧缓存只由音频任务重置，过期会话的数据不再提交。
+
+Auto 模式的手柄类型使用独立的 `detected_type` 记录，不再自动保存整份用户配置。
+普通设置在收到 `0xF6/0x02` 保存命令时复制快照；重映射写入、重置和档位选择命令也
+分别排队，由任务写 Flash，失败后间隔一秒重试。连续修改两个重映射档位不会相互覆盖
+待保存请求。`0xF9` 音频活动标志同时考虑连接状态及扬声器／麦克风禁用设置。
+
 协议（下列偏移均包含 Report ID）：
 
 - `GET_FEATURE 0xF9`：原有前 14 字节保持不变；字节 14–17 为 ASCII `DAUD`，
@@ -352,6 +362,8 @@ clang -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -Isrc \
 /tmp/test-usb-audio-control
 python3 tests/test_ds5_calibration.py
 python3 tests/test_usb_audio_reconnect.py
+python3 tests/test_audio_lifecycle.py
+python3 tests/test_config_persistence.py
 ```
 
 配套的网页配置工具出于维护早期用户利益考虑，**不开源**。当前网页地址：[ps5.ds5678.top](https://ps5.ds5678.top)。开源固件仍可通过网页调整各项配置（USB Feature Report 0xF6–0xF9 / 0xFB），但**本开源版本不支持在线 OTA**。有一定动手能力的开发者可以自行实现自己的网页配置页——结合 AI 辅助，实现起来非常简单。

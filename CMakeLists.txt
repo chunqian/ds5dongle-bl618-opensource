@@ -30,6 +30,7 @@ target_sources(app PRIVATE
     src/usb_wake.c
     src/led_status.c
     src/state_mgr.c
+    src/deferred_store.c
     src/config.c
     src/factory_reset.c
     src/dse.c

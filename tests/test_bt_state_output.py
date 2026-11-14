@@ -166,9 +166,10 @@ assert main.count('send_led_primer();') == 1
 assert 'primer_resend_us' not in main and 'stealth_primer_countdown' not in main
 with tempfile.TemporaryDirectory(prefix='ds5-state-') as directory:
     path=Path(directory)
+    (path/'bflb_irq.h').write_text('#include <stdint.h>\nstatic inline uintptr_t bflb_irq_save(void) { return 0; }\nstatic inline void bflb_irq_restore(uintptr_t x) { (void)x; }\n')
     (path/'production.c').write_text(production)
     (path/'reference.cpp').write_text(reference)
-    flags=['-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-I'+str(ROOT/'src')]
+    flags=['-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-I'+str(ROOT/'src'),'-I'+str(path)]
     objects=[]
     for file in (path/'production.c', ROOT/'src/state_mgr.c', ROOT/'src/ds5_protocol.c'):
         obj=path/(file.stem+'.o'); objects.append(str(obj))

@@ -56,10 +56,9 @@ static void remap_on_disconnect(void) {}
 static void led_status_set(unsigned value) { (void)value; }
 static void bt_hid_host_scan_start(unsigned value) { (void)value; }
 static void usb_gamepad_set_dse_mode(bool value) { (void)value; }
-static void usb_gamepad_request_config_save(void) {}
+static void config_note_controller(bool edge) { config.dse_detected=edge; }
 static bool bt_hid_host_is_dse(void) { return true; }
 static uint8_t config_controller_mode(void) { return 2; }
-static uint8_t config_dse_detected(void) { return config.dse_detected; }
 #define config_get() (&config)
 '''
 harness += extract((ROOT / "src/bt_hid_host.h").read_text(), "enum bt_hid_host_state {") + ";\n"

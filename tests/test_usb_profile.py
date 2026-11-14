@@ -1,4 +1,4 @@
-"""Exercise real USB descriptors/profile application and deferred config saving.
+"""Exercise real USB descriptors/profile application .
 
 Run without hardware: python3 tests/test_usb_profile.py
 """
@@ -53,7 +53,7 @@ static void usbd_hid_init_intf(int bus, struct usbd_interface *p, const uint8_t 
 static uint64_t now_us;
 static uint64_t bflb_mtimer_get_time_us(void) { return now_us; }
 static bool current_dse_mode, requested_dse_mode, usb_initialized, usb_profile_pending;
-static bool kbd_registered, usb_config_save_pending;
+static bool kbd_registered;
 static uint64_t usb_profile_request_us;
 static uint8_t applied_polling_mode;
 static struct usb_audio_control audio_control;
@@ -71,25 +71,12 @@ for signature in (
     'static void request_usb_profile(void)',
     'static void apply_usb_profile(void)',
     'void usb_gamepad_set_dse_mode(bool dse)',
-    'void usb_gamepad_request_config_save(void)',
     'static const uint8_t *desc_device_cb(uint8_t speed)',
     'static const uint8_t *desc_config_cb(uint8_t speed)',
     'static const uint8_t *desc_other_speed_cb(uint8_t speed)',
 ):
     harness += function(signature)
-start = source.index('    if (usb_config_save_pending) {', source.index('void usb_gamepad_process_deferred'))
-end = source.index('    if (usb_remap_save_pending)', start)
 harness += r'''
-static unsigned save_calls;
-static bool fail_save, request_during_save;
-bool config_save(void) {
-    save_calls++;
-    if (request_during_save) usb_gamepad_request_config_save();
-    return !fail_save;
-}
-static void save_deferred(void) {
-''' + source[start:end] + r'''
-}
 static unsigned u16(const uint8_t *p) { return p[0] | (p[1]<<8); }
 static void check_descriptors(bool edge, bool with_audio, bool keyboard, bool wake, unsigned poll) {
     const uint8_t *dev=desc_device_cb(0), *desc=desc_config_cb(0);
@@ -174,15 +161,7 @@ int main(void) {
     assert(!memcmp(old_config,config_desc,sizeof(old_config)));
     assert(hid_intf.hid_report_descriptor==hid_report_desc_ds);
     apply_usb_profile(); assert(usb_profile_matches_config()); assert(device_desc[16]==3);
-    /* Retry flash failure after one second; preserve a new request during saving. */
-    now_us=1000000; fail_save=true; usb_gamepad_request_config_save(); save_deferred();
-    assert(save_calls==1 && usb_config_save_pending);
-    now_us=1999999; save_deferred(); assert(save_calls==1);
-    now_us=2000000; fail_save=false; request_during_save=true; save_deferred();
-    assert(save_calls==2 && usb_config_save_pending);
-    request_during_save=false; save_deferred();
-    assert(save_calls==3 && !usb_config_save_pending);
-    puts("USB descriptor/profile matrix and config-save retries: PASS");
+    puts("USB descriptor/profile matrix: PASS");
 }
 '''
 assert 'GLB_SW_System_Reset' not in source

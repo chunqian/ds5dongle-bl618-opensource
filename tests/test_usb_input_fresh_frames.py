@@ -94,6 +94,8 @@ static void usb_soft_disconnect(void) {}
 static void apply_audio_profile(void) {}
 static void aux_reset(void) {}
 static void usb_audio_stop(void) {}
+static void usb_audio_suspend(void) {}
+static void usb_audio_resume(void) {}
 static void usb_audio_mic_stop(void) {}
 static void audio_set_mic_active(bool enabled) { (void)enabled; }
 static void audio_reset_encoder(void) {}

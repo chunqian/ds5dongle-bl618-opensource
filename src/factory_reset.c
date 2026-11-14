@@ -10,7 +10,7 @@
 /* All application settings plus BR/EDR and BLE bonds. Keep the device's own
  * Bluetooth identity and factory RF data; these are not user preferences. */
 static const char *const reset_keys[] = {
-    "dongle_cfg", "btn_remap", "btn_remap_1", "remap_prof",
+    "dongle_cfg", "detected_type", "btn_remap", "btn_remap_1", "remap_prof",
     "link_key", "KEY_POOL", "DS5_BLK", "active_ctrl", "active_addr",
 };
 

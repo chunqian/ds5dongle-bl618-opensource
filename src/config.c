@@ -1,4 +1,6 @@
 #include "config.h"
+#include "deferred_store.h"
+#include "bflb_irq.h"
 #include <string.h>
 #include "debug_log.h"
 #include <math.h>
@@ -11,6 +13,8 @@ extern int bt_settings_get_bin(const char *key, uint8_t *value,
 #define CONFIG_EF_KEY  "dongle_cfg"
 
 static struct config_body cfg;
+static bool detected_type_stored;
+_Static_assert(sizeof(struct config_body) <= 128, "configuration snapshot too large");
 
 void config_validate(void)
 {
@@ -114,6 +118,11 @@ void config_load(void)
         cfg.tp_mode_enabled_mask = 0x03;
     }
     config_validate();
+    uint8_t detected;
+    size_t detected_len = 0;
+    detected_type_stored = bt_settings_get_bin("detected_type", &detected, 1, &detected_len) == 0 &&
+                           detected_len == 1 && detected <= 1;
+    if (detected_type_stored) cfg.dse_detected = detected;
     LOG_INF("[CFG] Loaded: wake=%d led_off=%d inactive=%dmin poll=%d ps=%d\n",
            cfg.enable_wake, cfg.disable_led, cfg.inactive_time,
            cfg.polling_rate_mode, cfg.ps_shortcut_enabled);
@@ -124,8 +133,10 @@ void config_load(void)
 
 bool config_save(void)
 {
-    int rc = bt_settings_set_bin(CONFIG_EF_KEY, (const uint8_t *)&cfg,
-                                 sizeof(cfg));
+    struct config_body snapshot;
+    config_snapshot(&snapshot);
+    int rc = bt_settings_set_bin(CONFIG_EF_KEY, (const uint8_t *)&snapshot,
+                                 sizeof(snapshot));
     if (rc == 0) {
         LOG_INF("[CFG] Saved to flash\n");
         return true;
@@ -134,6 +145,28 @@ bool config_save(void)
     return false;
 }
 
+void config_snapshot(struct config_body *out)
+{
+    uintptr_t irq = bflb_irq_save();
+    memcpy(out, &cfg, sizeof(cfg));
+    bflb_irq_restore(irq);
+}
+void config_request_save(void)
+{
+    uintptr_t irq = bflb_irq_save();
+    deferred_store_request(STORE_CONFIG, &cfg, sizeof(cfg));
+    bflb_irq_restore(irq);
+}
+void config_note_controller(bool edge)
+{
+    uintptr_t irq = bflb_irq_save();
+    if (!detected_type_stored || cfg.dse_detected != (uint8_t)edge) {
+        cfg.dse_detected = edge;
+        deferred_store_request(STORE_CONTROLLER_TYPE, &cfg.dse_detected, 1);
+        detected_type_stored = true; /* worker retains failures until saved */
+    }
+    bflb_irq_restore(irq);
+}
 struct config_body *config_get(void)
 {
     return &cfg;
@@ -141,8 +174,12 @@ struct config_body *config_get(void)
 
 void config_set(const uint8_t *data, uint16_t len)
 {
+    uintptr_t irq = bflb_irq_save();
+    uint8_t detected = cfg.dse_detected;
     uint16_t copy_len = len < sizeof(cfg) ? len : sizeof(cfg);
     memcpy(&cfg, data, copy_len);
     config_validate();
+    cfg.dse_detected = detected; /* runtime detection is not a host preference */
+    bflb_irq_restore(irq);
     LOG_INF("[CFG] Updated from host (%d bytes)\n", copy_len);
 }

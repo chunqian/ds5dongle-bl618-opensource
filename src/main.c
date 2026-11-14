@@ -262,13 +262,7 @@ static void on_hid_state(enum bt_hid_host_state state)
         connecting_start_tick = 0;
         bool is_dse = bt_hid_host_is_dse();
         uint8_t mode = config_controller_mode();
-        if (mode == 2) {
-            bool need_dse = is_dse;
-            if (need_dse != (bool)config_dse_detected()) {
-                config_get()->dse_detected = need_dse ? 1 : 0;
-                usb_gamepad_request_config_save();
-            }
-        }
+        if (mode == 2) config_note_controller(is_dse);
 
         usb_gamepad_set_dse_mode(mode == 1 || (mode == 2 && is_dse));
         handshake_start_us = 0;

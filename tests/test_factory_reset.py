@@ -22,9 +22,11 @@ storage = r'''
 #include "easyflash.h"
 #include "factory_reset.h"
 #include "config.h"
+#include "deferred_store.h"
+void deferred_store_request(enum deferred_store_key key, const void *data, size_t len) { (void)key;(void)data;(void)len; }
 struct item { const char *key; uint8_t data[64]; size_t len; } items[] = {
     {"dongle_cfg"}, {"btn_remap"}, {"btn_remap_1"}, {"remap_prof"},
-    {"link_key"}, {"KEY_POOL"}, {"DS5_BLK"}, {"active_ctrl"}, {"active_addr"},
+    {"link_key"}, {"KEY_POOL"}, {"DS5_BLK"}, {"active_ctrl"}, {"active_addr"}, {"detected_type"},
     {"LOCAL_ID_ADDR"}, {"RF_FACTORY"}, {"factory_reset"}
 };
 static const char *fail_delete, *fail_read;
@@ -68,13 +70,13 @@ int main(void) {
     seed();assert(factory_reset_apply_pending());assert(deletes==0);
     fail_write=true;assert(!factory_reset_request());assert(!find("factory_reset")->len);
     fail_write=false;
-    for (unsigned i=0;i<10;i++) {
+    for (unsigned i=0;i<11;i++) {
         seed();assert(factory_reset_request());
-        fail_delete=i==9?"factory_reset":items[i].key;
+        fail_delete=i==10?"factory_reset":items[i].key;
         silent_delete=(i%2)==0;
         assert(!factory_reset_apply_pending());assert(find("factory_reset")->len==1);
         fail_delete=NULL;assert(factory_reset_apply_pending());
-        for(unsigned j=0;j<9;j++) assert(items[j].len==0);
+        for(unsigned j=0;j<10;j++) assert(items[j].len==0);
         assert(find("LOCAL_ID_ADDR")->len==1 && find("RF_FACTORY")->len==1);
         assert(!find("factory_reset")->len);
     }
@@ -152,6 +154,7 @@ int main(void) {
 
 with tempfile.TemporaryDirectory(prefix='ds5-factory-reset-') as directory:
     temp = Path(directory)
+    (temp / 'bflb_irq.h').write_text('#include <stdint.h>\nstatic inline uintptr_t bflb_irq_save(void) { return 0; }\nstatic inline void bflb_irq_restore(uintptr_t x) { (void)x; }\n')
     (temp / 'easyflash.h').write_text('''#include <stddef.h>
 typedef enum {EF_NO_ERR, EF_WRITE_ERR} EfErrCode;
 size_t ef_get_env_blob(const char*,void*,size_t,size_t*);

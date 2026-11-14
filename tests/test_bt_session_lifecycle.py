@@ -34,11 +34,12 @@ static void bt_hid_host_disconnect(void) { disconnects++; }
 #define pdTRUE 1
 #define LOG_ERR(...) ((void)0)
 #define LOG_INF(...) ((void)0)
-struct mic_message { uint32_t session; uint8_t data[MIC_OPUS_SIZE]; };
+struct mic_message { uint32_t session, stream, epoch; uint8_t data[MIC_OPUS_SIZE]; };
 static bool mic_enabled=true, decoder_reset_pending, mic_first_frame;
 static int decoder_storage, *decoder=&decoder_storage, mic_queue=1;
 static unsigned queue_index, decoded_count, writes, resets;
-static uint32_t session=2;
+static uint32_t session=2, stream=1, mic_generation=1;
+static uint32_t usb_audio_session(void) { return stream; }
 static jmp_buf finished;
 static uintptr_t masked;
 static uintptr_t bflb_irq_save(void) { uintptr_t old=masked; masked=1; return old; }
@@ -47,9 +48,13 @@ static uint32_t bt_hid_host_session(void) { return session; }
 static void vTaskDelay(unsigned delay) { (void)delay; assert(false); }
 static int xQueueReceive(int queue,void *data,unsigned delay) {
     (void)queue;(void)delay;
-    if(queue_index==3) longjmp(finished,1);
+    if(queue_index==9) longjmp(finished,1);
     struct mic_message *frame=data;
-    frame->session=++queue_index; /* 1 stale, 2 interrupted decode, 3 current */
+    ++queue_index;
+    frame->session=queue_index==1?1:session;
+    frame->stream=queue_index==4?0:stream;
+    frame->epoch=queue_index==7?0:mic_generation;
+    /* Each epoch: stale queue entry, interrupted decode, fresh decode. */
     memset(frame->data,0,sizeof(frame->data)); return pdTRUE;
 }
 static void opus_decoder_ctl(int *codec,unsigned op) {
@@ -59,11 +64,13 @@ static int opus_decode(int *codec,const uint8_t *data,unsigned len,int16_t *out,
     (void)data;(void)fec;
     assert(codec==decoder && len==71 && count==480); decoded_count++;
     memset(out,0,480*sizeof(*out));
-    if(decoded_count==1) { session=3; decoder_reset_pending=true; }
+    if(queue_index==2) session=3;
+    if(queue_index==5) stream=2;
+    if(queue_index==8) mic_generation=2;
     return 480;
 }
 static void usb_audio_mic_write(const int16_t *data,uint32_t count) {
-    (void)data; assert(masked && session==3 && decoded_count==2 && count==480); writes++;
+    (void)data; assert(masked && session==3 && decoded_count%2==0 && count==480); writes++;
 }
 '''+extract(audio,'void audio_mic_task(')+r'''
 int main(void) {
@@ -86,8 +93,8 @@ int main(void) {
     tick=60000; check_inactivity(input,sizeof(input)); assert(disconnects==2);
     decoder_reset_pending=true;
     if(!setjmp(finished)) audio_mic_task(NULL);
-    assert(decoded_count==2 && writes==1 && resets==2);
-    puts("PASS: DS5Dongle inactivity thresholds/raw flags/tick wrap, stale mic queue and in-flight decode isolation");
+    assert(decoded_count==6 && writes==3 && resets==4);
+    puts("PASS: DS5Dongle inactivity thresholds/raw flags/tick wrap, BT/USB/mic epoch stale queue and in-flight decode isolation");
 }
 '''
 for forbidden in ('CONN_WATCHDOG_US','CONNECTING_TIMEOUT_TICKS','L2CAP_CONNECT_TIMEOUT_TICKS','HANDSHAKE_TIMEOUT_US'):

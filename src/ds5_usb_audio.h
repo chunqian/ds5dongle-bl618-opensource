@@ -50,7 +50,7 @@ const uint8_t *usb_audio_get_desc(uint16_t *len);
 bool usb_audio_is_active(void);
 
 /**
- * Read accumulated PCM data when ready. Returns true if a full 512-sample
+ * Read accumulated PCM data when ready. Returns true if a full 1024-sample
  * block is available. Output buffer must be at least
  * USB_AUDIO_ACCUM_SAMPLES * USB_AUDIO_CHANNELS * 2 bytes.
  * Called from audio_task context.
@@ -62,6 +62,11 @@ bool usb_audio_read(int16_t *out);
  * Called on USB RESET to avoid stale flags suppressing 0x31 output.
  */
 void usb_audio_stop(void);
+/* Suspend retains host alternate settings; reset/close/hidden profile revokes them. */
+void usb_audio_suspend(void);
+void usb_audio_resume(void);
+uint32_t usb_audio_session(void);
+void usb_audio_discard_mic(void);
 /* Drop previous BT session PCM without closing the host streaming interface. */
 void usb_audio_discard_pending(void);
 
@@ -86,7 +91,7 @@ bool usb_audio_mic_is_active(void);
 
 /**
  * Reset mic streaming state (ring buffer, active flag).
- * Called together with usb_audio_stop() on disconnect.
+ * Called together with usb_audio_stop() on USB reset/detach, not BT disconnect.
  */
 void usb_audio_mic_stop(void);
 

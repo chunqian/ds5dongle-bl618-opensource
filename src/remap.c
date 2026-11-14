@@ -3,6 +3,8 @@
 #include "debug_log.h"
 #include "easyflash.h"
 #include "config.h"
+#include "deferred_store.h"
+#include "bflb_irq.h"
 #include "bflb_mtimer.h"
 #include <string.h>
 #include <stdbool.h>
@@ -254,11 +256,23 @@ bool remap_save(void)
 bool remap_save_profile(uint8_t profile)
 {
     if (profile >= REMAP_PROFILE_COUNT) return false;
-    int r = ef_set_env_blob(profile_keys[profile],
-                            g_profiles[profile], sizeof(g_profiles[profile]));
+    remap_entry_t snapshot[REMAP_BTN_COUNT];
+    uintptr_t irq = bflb_irq_save();
+    memcpy(snapshot, g_profiles[profile], sizeof(snapshot));
+    bflb_irq_restore(irq);
+    int r = ef_set_env_blob(profile_keys[profile], snapshot, sizeof(snapshot));
     return r == 0;
 }
 
+void remap_request_save(uint8_t profile)
+{
+    if (profile >= REMAP_PROFILE_COUNT) return;
+    _Static_assert(sizeof(g_profiles[0]) <= 128, "remap snapshot too large");
+    uintptr_t irq = bflb_irq_save();
+    deferred_store_request(profile == 0 ? STORE_REMAP_0 : STORE_REMAP_1,
+                           g_profiles[profile], sizeof(g_profiles[profile]));
+    bflb_irq_restore(irq);
+}
 void remap_set(const uint8_t *data, uint8_t len)
 {
     remap_set_profile(active_profile, data, len);
@@ -270,6 +284,7 @@ void remap_set_profile(uint8_t profile, const uint8_t *data, uint8_t len)
     size_t n_entries = len / sizeof(remap_entry_t);
     if (n_entries < REMAP_OLD_BTN_COUNT) return; /* need at least old-format count */
 
+    uintptr_t irq = bflb_irq_save();
     if (n_entries >= REMAP_BTN_COUNT) {
         memcpy(g_profiles[profile], data, REMAP_BTN_COUNT * sizeof(remap_entry_t));
     } else {
@@ -283,6 +298,7 @@ void remap_set_profile(uint8_t profile, const uint8_t *data, uint8_t len)
 
     if (profile == active_profile)
         update_identity_cache();
+    bflb_irq_restore(irq);
     LOG_INF("[REMAP] Profile %d updated, identity=%d\n",
             profile, (int)is_table_identity(g_profiles[profile]));
 }
@@ -295,18 +311,22 @@ void remap_reset(void)
 void remap_reset_profile(uint8_t profile)
 {
     if (profile >= REMAP_PROFILE_COUNT) return;
+    uintptr_t irq = bflb_irq_save();
     reset_table(g_profiles[profile]);
     if (profile == active_profile) {
         g_remap_is_identity = true;
     }
+    bflb_irq_restore(irq);
 }
 
 void remap_switch_profile(uint8_t profile)
 {
     if (profile >= REMAP_PROFILE_COUNT) return;
+    uintptr_t irq = bflb_irq_save();
     active_profile = profile;
     update_identity_cache();
-    ef_set_env_blob("remap_prof", &active_profile, 1);
+    deferred_store_request(STORE_REMAP_ACTIVE, &active_profile, 1);
+    bflb_irq_restore(irq);
     LOG_INF("[REMAP] Switched to profile %d, identity=%d\n",
             active_profile, (int)g_remap_is_identity);
 }

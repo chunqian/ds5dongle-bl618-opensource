@@ -25,14 +25,14 @@ void audio_task(void *arg);
 void audio_set_headset(bool plugged);
 
 /**
- * Reset audio state (called on controller disconnect).
+ * Discard controller-session audio and request codec resets.
+ * USB host alternate settings are retained for Bluetooth reconnect.
  */
 void audio_reset(void);
 
 /**
- * Reset speaker encoder state (called on USB speaker stream close/open).
- * Clears Opus encoder internal prediction and frame_slot to prevent
- * quality degradation across stream close/open cycles.
+ * Request a speaker encoder reset (safe from USB ISR or Bluetooth task).
+ * The audio task alone resets the codec and its frame buffers before reuse.
  */
 void audio_reset_encoder(void);
 

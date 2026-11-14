@@ -1,5 +1,6 @@
 #include "state_mgr.h"
 #include "config.h"
+#include "bflb_irq.h"
 #include <stdbool.h>
 #include <string.h>
 #include "debug_log.h"
@@ -70,10 +71,13 @@ void state_mgr_update(const uint8_t *data, uint8_t len)
     state[3] = rumble ? data[3] : 0;
     if (f0 & 0x04) memcpy(state + 10, data + 10, 11);
     if (f0 & 0x08) memcpy(state + 21, data + 21, 11);
+    /* A SAVE interrupt must observe both volume fields from one host report. */
+    uintptr_t irq = bflb_irq_save();
     if (!cfg->lock_volume && (f0 & 0x10))
         cfg->headset_volume = state[4] = data[4];
     if (!cfg->lock_volume && (f0 & 0x20))
         cfg->speaker_volume = state[5] = data[5];
+    bflb_irq_restore(irq);
     if (f0 & 0x40) state[6] = data[6];
     if (f0 & 0x80) state[7] = data[7];
     if (f1 & 0x01) state[8] = data[8];
@@ -127,14 +131,18 @@ bool state_mgr_is_spk_active(void)
 
 void state_mgr_set_volume(uint8_t spk_vol, uint8_t hp_vol)
 {
-    if (config_get()->lock_volume)
+    uintptr_t irq = bflb_irq_save();
+    if (config_get()->lock_volume) {
+        bflb_irq_restore(irq);
         return;
+    }
     state[0] |= 0x30;
     state[4] = hp_vol;
     state[5] = spk_vol;
     config_get()->headset_volume = hp_vol;
     config_get()->speaker_volume = spk_vol;
     vol_dirty = true;
+    bflb_irq_restore(irq);
 }
 
 void state_mgr_set_mute(bool mute)

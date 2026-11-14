@@ -11,7 +11,7 @@ import tempfile
 root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parents[1]
 source = (root / "src/usb_gamepad.c").read_text()
 start = source.index("void usb_gamepad_process_deferred(void)")
-end = source.index("    if (usb_config_save_pending)", start)
+end = source.index("    deferred_store_process();", start)
 task = source[start:end] + "}\n"
 
 
@@ -79,6 +79,7 @@ static uint64_t bflb_mtimer_get_time_us(void) {
 static void usb_wake_note_usb_reconnect(void) {}
 static void aux_reset(void) {}
 static void usb_audio_stop(void) {}
+static void usb_audio_suspend(void) {}
 static void usb_audio_mic_stop(void) {}
 static void audio_set_mic_active(bool enabled) { (void)enabled; }
 static void audio_reset_encoder(void) {}

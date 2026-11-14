@@ -46,7 +46,12 @@ struct __attribute__((packed)) config_body {
 #define CONFIG_VERSION  2
 
 void config_load(void);
+/* Synchronous helper for startup/task-only callers. Runtime HID uses request_save. */
 bool config_save(void);
+void config_request_save(void);
+/* Independent persisted detection hint; never saves other unsaved preferences. */
+void config_note_controller(bool edge);
+void config_snapshot(struct config_body *out);
 void config_validate(void);
 
 struct config_body *config_get(void);

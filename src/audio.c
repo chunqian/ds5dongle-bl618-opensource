@@ -58,7 +58,8 @@ static volatile bool mic_enabled;   /* host opened mic interface AND config allo
 static volatile bool mic_status_pending;  /* deferred: send 0x32 to controller */
 static int encoder_force_channels;
 
-struct mic_message { uint32_t session; uint8_t data[MIC_OPUS_SIZE]; };
+struct mic_message { uint32_t session, stream, epoch; uint8_t data[MIC_OPUS_SIZE]; };
+static volatile uint32_t mic_generation;
 static QueueHandle_t mic_queue;
 static volatile bool decoder_reset_pending;
 
@@ -68,6 +69,8 @@ static int16_t  spk_resamp[OPUS_FRAME_SAMPLES * 2];
 static bool     mic_first_frame;
 static volatile bool encoding_in_progress;
 static volatile bool encoder_reset_pending;
+static volatile bool encoder_full_reset_pending, encoder_reinit_pending;
+static volatile uint32_t encoder_generation;
 static volatile bool audio_task_killed;
 static volatile uint64_t encode_start_us;
 static TaskHandle_t audio_task_handle;
@@ -275,7 +278,7 @@ static bool haptic_channel_silent(const int16_t *in, uint32_t in_samples)
 
 /* ---- Build and send BT report 0x39 (547 bytes, double-frame) ---- */
 
-static int send_audio_report(uint32_t session)
+static int send_audio_report(uint32_t session, uint32_t stream, uint32_t generation)
 {
     static uint8_t pkt[DS5_BT_AUDIO_REPORT_SIZE];
     memset(pkt, 0, sizeof(pkt));
@@ -317,6 +320,8 @@ static int send_audio_report(uint32_t session)
                              DS5_BT_AUDIO_REPORT_SIZE - 4);
     ds5_write_le32(&pkt[DS5_BT_AUDIO_REPORT_SIZE - 4], crc);
 
+    if (encoder_reset_pending || stream != usb_audio_session() || generation != encoder_generation ||
+        !usb_audio_is_active()) return -1;
     static uint32_t fail_log_count = 0;
     int ret = bt_hid_host_send_output_session(pkt, DS5_BT_AUDIO_REPORT_SIZE, session);
     if (ret) {
@@ -353,7 +358,8 @@ static void encode_watchdog_cb(TimerHandle_t timer)
     }
 
     encoding_in_progress = false;
-    encoder_reset_pending = true;
+    encoder_reinit_pending = true;
+    audio_reset_encoder();
     audio_task_killed = true;
 }
 
@@ -445,10 +451,10 @@ int audio_init(void)
 }
 
 /* ---- Send a 0x32 status report to toggle controller mic streaming ---- */
-static void send_mic_status(void)
+static int send_mic_status(bool enabled, uint32_t session)
 {
     if (bt_hid_host_get_state() != BT_HID_STATE_CONNECTED)
-        return;
+        return -1;
 
     static uint8_t mic_seq = 0;
     uint8_t pkt[DS5_BT_OUTPUT_EXT_SIZE];
@@ -460,13 +466,64 @@ static void send_mic_status(void)
 
     pkt[2] = DS5_AUDIO_TAG_HEADER;
     pkt[3] = 1;
-    pkt[4] = mic_enabled ? 0x03 : 0x02;
+    pkt[4] = enabled ? 0x03 : 0x02;
 
     uint32_t crc = ds5_crc32(DS5_BT_OUTPUT_CRC_SEED, pkt,
                              DS5_BT_OUTPUT_EXT_SIZE - 4);
     ds5_write_le32(&pkt[DS5_BT_OUTPUT_EXT_SIZE - 4], crc);
 
-    bt_hid_host_send_output(pkt, DS5_BT_OUTPUT_EXT_SIZE);
+    return bt_hid_host_send_output_session(pkt, DS5_BT_OUTPUT_EXT_SIZE, session);
+}
+
+/* Runtime Opus mutations and encoding buffers belong exclusively to audio_task.
+ * ISR/BT callers only publish a generation change; they never touch the codec. */
+static void audio_owner_reset(void)
+{
+    uintptr_t irq = bflb_irq_save();
+    bool reset = encoder_reset_pending;
+    bool full = encoder_full_reset_pending;
+    bool reinit = encoder_reinit_pending;
+    encoder_reset_pending = encoder_full_reset_pending = encoder_reinit_pending = false;
+    bflb_irq_restore(irq);
+    if (!reset) return;
+    if (reinit) {
+        /* A watchdog-aborted codec call may leave more than predictor state
+         * incomplete. Reinitialize it after the old task has been deleted. */
+        opus_encoder_init(encoder, 48000, 2, OPUS_APPLICATION_RESTRICTED_CELT);
+        opus_encoder_ctl(encoder, OPUS_SET_EXPERT_FRAME_DURATION(OPUS_FRAMESIZE_10_MS));
+        opus_encoder_ctl(encoder, OPUS_SET_BITRATE(200 * 8 * 100));
+        opus_encoder_ctl(encoder, OPUS_SET_VBR(0));
+        opus_encoder_ctl(encoder, OPUS_SET_COMPLEXITY(0));
+        opus_encoder_ctl(encoder, OPUS_SET_FORCE_CHANNELS(1));
+        encoder_force_channels = 1;
+    } else if (encoder) opus_encoder_ctl(encoder, OPUS_RESET_STATE);
+    memset(opus_slots, 0, sizeof(opus_slots));
+    memset(haptic_slots, 0, sizeof(haptic_slots));
+    if (full) { packet_counter = 0; audio_seq = 0; }
+}
+
+/* Reconcile retained USB intent after BT reconnect and retry failed status sends. */
+static void audio_sync_mic(void)
+{
+    static uint32_t mic_session = UINT32_MAX;
+    uint32_t current_session = bt_hid_host_session();
+    bool connected = bt_hid_host_get_state() == BT_HID_STATE_CONNECTED;
+    audio_set_mic_active(connected && usb_audio_mic_is_active());
+    uintptr_t irq = bflb_irq_save();
+    if (current_session != mic_session) {
+        mic_session = current_session;
+        mic_status_pending = true;
+    }
+    bool pending = mic_status_pending;
+    bool enabled = mic_enabled;
+    uint32_t epoch = mic_generation;
+    bflb_irq_restore(irq);
+    if (pending && connected && send_mic_status(enabled, current_session) == 0) {
+        irq = bflb_irq_save();
+        if (epoch == mic_generation && current_session == bt_hid_host_session())
+            mic_status_pending = false;
+        bflb_irq_restore(irq);
+    }
 }
 
 __attribute__((section(".tcm_code")))
@@ -476,17 +533,16 @@ void audio_task(void *arg)
 
     audio_task_handle = xTaskGetCurrentTaskHandle();
 
-    if (encoder_reset_pending) {
-        encoder_reset_pending = false;
-        opus_encoder_ctl(encoder, OPUS_RESET_STATE);
-        LOG_ERR("[WD-OPUS] encoder reset\n");
-    }
+    audio_owner_reset();
 
     SemaphoreHandle_t sem = (SemaphoreHandle_t)usb_audio_get_semaphore();
     LOG_INF("[AUDIO] Task started\n");
 
     for (;;) {
         if (xSemaphoreTake(sem, pdMS_TO_TICKS(25)) == pdTRUE) {
+            audio_owner_reset();
+            uint32_t generation = encoder_generation;
+            uint32_t stream = usb_audio_session();
             uint32_t session = bt_hid_host_session();
             bool a_active = usb_audio_is_active();
             bool a_read   = a_active ? usb_audio_read(pcm_block) : false;
@@ -533,10 +589,6 @@ void audio_task(void *arg)
                                                   opus_slots[slot], OPUS_OUT_SIZE);
                         encoding_in_progress = false;
 
-                        if (encoder_reset_pending) {
-                            encoder_reset_pending = false;
-                            opus_encoder_ctl(encoder, OPUS_RESET_STATE);
-                        }
                         if (encoded <= 0) {
                             LOG_ERR("[AUDIO] Opus encode error: %d\n", encoded);
                             memset(opus_slots[slot], 0, OPUS_OUT_SIZE);
@@ -551,17 +603,13 @@ void audio_task(void *arg)
 
                 /* A dropped audio packet is not a failed Bluetooth link.
                  * Let ACL/L2CAP error events drive disconnect, as DS5Dongle. */
-                if (send_audio_report(session) != 0)
+                if (send_audio_report(session, stream, generation) != 0)
                     vTaskDelay(1);
             }
         }
 
-        if (mic_status_pending &&
-            bt_hid_host_get_state() == BT_HID_STATE_CONNECTED) {
-            mic_status_pending = false;
-            LOG_INF("[AUDIO] Mic %s\n", mic_enabled ? "enabled" : "disabled");
-            send_mic_status();
-        }
+        audio_owner_reset();
+        audio_sync_mic();
     }
 }
 
@@ -574,34 +622,25 @@ void audio_set_headset(bool plugged)
 
 void audio_reset(void)
 {
-    packet_counter = 0;
+    uintptr_t irq = bflb_irq_save();
     plug_headset = false;
-    mic_enabled = false;
-    mic_status_pending = false;
-    mic_first_frame = false;
-    memset(opus_slots, 0, sizeof(opus_slots));
-    memset(haptic_slots, 0, sizeof(haptic_slots));
-    if (encoding_in_progress) {
-        encoder_reset_pending = true;
-    } else if (encoder) {
-        opus_encoder_ctl(encoder, OPUS_RESET_STATE);
-    }
+    audio_set_mic_active(false);
+    encoder_full_reset_pending = true;
+    audio_reset_encoder();
     decoder_reset_pending = true;
     usb_audio_discard_pending();
-    if (mic_queue)
-        xQueueReset(mic_queue);
-    usb_audio_mic_stop();
+    usb_audio_discard_mic();
+    bflb_irq_restore(irq);
+    if (mic_queue) xQueueReset(mic_queue);
+    /* The host's microphone alternate setting survives a BT-only teardown. */
 }
 
 void audio_reset_encoder(void)
 {
-    memset(opus_slots, 0, sizeof(opus_slots));
-    memset(haptic_slots, 0, sizeof(haptic_slots));
-    if (encoding_in_progress) {
-        encoder_reset_pending = true;
-    } else if (encoder) {
-        opus_encoder_ctl(encoder, OPUS_RESET_STATE);
-    }
+    uintptr_t irq = bflb_irq_save();
+    ++encoder_generation;
+    encoder_reset_pending = true;
+    bflb_irq_restore(irq);
 }
 
 void audio_mic_feed(const uint8_t *opus_data, uint16_t len)
@@ -611,6 +650,8 @@ void audio_mic_feed(const uint8_t *opus_data, uint16_t len)
 
     struct mic_message frame;
     frame.session = bt_hid_host_session();
+    frame.stream = usb_audio_session();
+    frame.epoch = mic_generation;
     memcpy(frame.data, opus_data, MIC_OPUS_SIZE);
     if (xQueueSend(mic_queue, &frame, 0) != pdTRUE) {
         struct mic_message discard;
@@ -621,8 +662,16 @@ void audio_mic_feed(const uint8_t *opus_data, uint16_t len)
 
 void audio_set_mic_active(bool active)
 {
-    mic_enabled = active && !config_get()->disable_mic;
-    mic_status_pending = true;  /* deferred to audio_task (called from USB ISR) */
+    uintptr_t irq = bflb_irq_save();
+    bool enabled = active && !config_get()->disable_mic &&
+                   bt_hid_host_get_state() == BT_HID_STATE_CONNECTED;
+    if (enabled != mic_enabled) {
+        mic_enabled = enabled;
+        ++mic_generation;
+        mic_status_pending = decoder_reset_pending = true;
+        usb_audio_discard_mic();
+    }
+    bflb_irq_restore(irq);
 }
 
 bool audio_mic_active(void)
@@ -651,16 +700,19 @@ void audio_mic_task(void *arg)
         if (xQueueReceive(mic_queue, &frame, portMAX_DELAY) != pdTRUE)
             continue;
 
-        if (!decoder || !mic_enabled || frame.session != bt_hid_host_session())
+        if (!decoder || !mic_enabled || frame.session != bt_hid_host_session() ||
+            frame.stream != usb_audio_session() || frame.epoch != mic_generation)
             continue;
         if (decoder_reset_pending) {
             decoder_reset_pending = false;
+            mic_first_frame = false;
             opus_decoder_ctl(decoder, OPUS_RESET_STATE);
         }
 
         int decoded = opus_decode(decoder, frame.data, MIC_OPUS_SIZE,
                                   mic_mono, OPUS_FRAME_SAMPLES, 0);
-        if (frame.session != bt_hid_host_session()) {
+        if (frame.session != bt_hid_host_session() || frame.stream != usb_audio_session() ||
+            frame.epoch != mic_generation) {
             decoder_reset_pending = true;
             continue;
         }
@@ -680,7 +732,8 @@ void audio_mic_task(void *arg)
             out32[i] = (uint32_t)s | ((uint32_t)s << 16);
         }
         uintptr_t irq = bflb_irq_save();
-        if (frame.session == bt_hid_host_session() && mic_enabled)
+        if (frame.session == bt_hid_host_session() && mic_enabled &&
+            frame.stream == usb_audio_session() && frame.epoch == mic_generation)
             usb_audio_mic_write(mic_stereo, (uint32_t)decoded);
         bflb_irq_restore(irq);
     }

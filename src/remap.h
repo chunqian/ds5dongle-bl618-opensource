@@ -70,8 +70,10 @@ typedef struct {
 /* Public API */
 void remap_init(void);
 void remap_load(void);
+/* Synchronous task-only helpers; HID callbacks must use remap_request_save. */
 bool remap_save(void);
 bool remap_save_profile(uint8_t profile);
+void remap_request_save(uint8_t profile);
 void remap_set(const uint8_t *data, uint8_t len);
 void remap_set_profile(uint8_t profile, const uint8_t *data, uint8_t len);
 void remap_reset(void);
