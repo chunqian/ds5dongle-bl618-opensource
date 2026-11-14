@@ -174,7 +174,7 @@ assert "bt_hid_host_force_disconnect" not in MAIN
 assert "bt_hid_host_drop_stale_conn" not in MAIN
 assert "bt_hid_host_poll_disconnect();" in MAIN
 idle = MAIN[MAIN.index("if (bt_hid_host_get_state() == BT_HID_STATE_HANDSHAKE)"):]
-idle = idle[:idle.index("static bool has_user_activity")]
+idle = idle[:idle.index("static bool should_use_dse")]
 assert "bt_hid_host_scan_start" not in idle
 harness += r'''
 static void setup(void) {

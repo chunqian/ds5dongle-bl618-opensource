@@ -93,9 +93,9 @@ static void ds5_write_le32(uint8_t *out, uint32_t value) {
 }
 '''
 harness += "int bt_hid_host_get_feature(uint8_t report_id);\n"
-harness += fifo + "\n" + function("bt_hid_host_send_output")
+harness += fifo + "\n" + function("bt_hid_host_send_output_session") + "\n" + function("bt_hid_host_send_output")
 harness += "\n" + "\n".join(function(name) for name in (
-    "get_feature_for_session", "bt_hid_host_get_feature", "bt_hid_host_set_feature", "bt_hid_host_set_feature_crc"))
+    "get_feature_for_session", "bt_hid_host_get_feature", "bt_hid_host_set_feature", "bt_hid_host_set_feature_crc_session", "bt_hid_host_set_feature_crc"))
 for name in ("bt_hid_host_refresh_feature", "feature_refresh_poll"):
     start=source.index(("static void " if name=="feature_refresh_poll" else "void ")+name+"(", source.index("int bt_hid_host_get_feature("))
     end=source.index("\n}",start)+2
@@ -251,6 +251,13 @@ int main(void) {
     bt_hid_host_poll_tx(); assert(sends==3);
     bt_hid_host_refresh_feature(0x70); app_tx_fifo_reset();
     bt_hid_host_poll_tx(); assert(sends==3);
+
+    setup();
+    uint32_t old_session=app_tx_generation; app_tx_fifo_reset();
+    uint8_t stale[547]={0x39};
+    assert(bt_hid_host_send_output_session(stale,sizeof(stale),old_session)==-ENOTCONN);
+    assert(bt_hid_host_set_feature_crc_session(0x80,stale,59,old_session)==-ENOTCONN);
+    assert(!sends && !allocated);
 
     /* Old callbacks must not clear busy/drain a newly reset session, even
      * if the SDK reuses the same connection pointer. */

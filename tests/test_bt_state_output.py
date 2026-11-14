@@ -61,14 +61,21 @@ void initialize(struct config_body config) {
 production += r'''
 #define USB_OUTPUT_BUF_SZ 64
 #define pdTRUE 1
+enum { BT_HID_STATE_CONNECTED, BT_HID_STATE_DISCONNECTING };
+static int bt_state=BT_HID_STATE_CONNECTED;
+static int bt_hid_host_get_state(void) { return bt_state; }
 static bool ds5_connected=true;
 static unsigned out_drop_count, accepted;
 static int output_queue;
+struct output_message { uint32_t session; uint8_t data[64]; };
+static uint32_t bt_hid_host_session(void) { return 7; }
 static uint8_t reports[5][64];
 static int xQueueSendToBackFromISR(int queue,const void *msg,void *wake) {
     (void)queue;(void)wake;
     if(accepted==5) return 0;
-    memcpy(reports[accepted++],msg,64); return pdTRUE;
+    const struct output_message *message=msg;
+    assert(message->session==7);
+    memcpy(reports[accepted++],message->data,64); return pdTRUE;
 }
 '''
 production += extract(main, 'static void on_usb_output(')
@@ -78,6 +85,8 @@ void check_host_frames(void) {
     for(unsigned i=0;i<6;i++) { frame[2]=i; on_usb_output(frame,64); }
     assert(accepted==5 && out_drop_count==1);
     for(unsigned i=0;i<5;i++) assert(reports[i][2]==i);
+    accepted=0; bt_state=BT_HID_STATE_DISCONNECTING;
+    on_usb_output(frame,64); assert(!accepted);
 }
 '''
 # Actual reference bit-field layout and functions; no duplicated model.

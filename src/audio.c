@@ -9,6 +9,7 @@
 #include "queue.h"
 #include "timers.h"
 #include "bflb_mtimer.h"
+#include "bflb_irq.h"
 
 #include "opus.h"
 #include <string.h>
@@ -57,7 +58,9 @@ static volatile bool mic_enabled;   /* host opened mic interface AND config allo
 static volatile bool mic_status_pending;  /* deferred: send 0x32 to controller */
 static int encoder_force_channels;
 
+struct mic_message { uint32_t session; uint8_t data[MIC_OPUS_SIZE]; };
 static QueueHandle_t mic_queue;
+static volatile bool decoder_reset_pending;
 
 static int16_t  pcm_block[ACCUM_SAMPLES * USB_AUDIO_CHANNELS];
 
@@ -271,9 +274,8 @@ static bool haptic_channel_silent(const int16_t *in, uint32_t in_samples)
 }
 
 /* ---- Build and send BT report 0x39 (547 bytes, double-frame) ---- */
-#define AUDIO_SEND_FAIL_MAX  50   /* ~1s @ 21ms/frame → force disconnect */
 
-static int send_audio_report(void)
+static int send_audio_report(uint32_t session)
 {
     static uint8_t pkt[DS5_BT_AUDIO_REPORT_SIZE];
     memset(pkt, 0, sizeof(pkt));
@@ -316,7 +318,7 @@ static int send_audio_report(void)
     ds5_write_le32(&pkt[DS5_BT_AUDIO_REPORT_SIZE - 4], crc);
 
     static uint32_t fail_log_count = 0;
-    int ret = bt_hid_host_send_output(pkt, DS5_BT_AUDIO_REPORT_SIZE);
+    int ret = bt_hid_host_send_output_session(pkt, DS5_BT_AUDIO_REPORT_SIZE, session);
     if (ret) {
         fail_log_count++;
         if (fail_log_count <= 3 || (fail_log_count % 100) == 0)
@@ -413,7 +415,7 @@ int audio_init(void)
         decoder = NULL;
     }
 
-    mic_queue = xQueueCreate(MIC_QUEUE_DEPTH, MIC_OPUS_SIZE);
+    mic_queue = xQueueCreate(MIC_QUEUE_DEPTH, sizeof(struct mic_message));
     if (!mic_queue) {
         LOG_ERR("[AUDIO] mic_queue create failed\n");
     }
@@ -483,10 +485,9 @@ void audio_task(void *arg)
     SemaphoreHandle_t sem = (SemaphoreHandle_t)usb_audio_get_semaphore();
     LOG_INF("[AUDIO] Task started\n");
 
-    uint32_t send_fail_streak = 0;
-
     for (;;) {
         if (xSemaphoreTake(sem, pdMS_TO_TICKS(25)) == pdTRUE) {
+            uint32_t session = bt_hid_host_session();
             bool a_active = usb_audio_is_active();
             bool a_read   = a_active ? usb_audio_read(pcm_block) : false;
             bool a_bt     = bt_hid_host_get_state() == BT_HID_STATE_CONNECTED;
@@ -548,22 +549,10 @@ void audio_task(void *arg)
                     }
                 }
 
-                if (send_audio_report() != 0) {
-                    send_fail_streak++;
-                    if (send_fail_streak >= AUDIO_SEND_FAIL_MAX) {
-                        LOG_ERR("[AUDIO] %u consecutive send failures, "
-                                "forcing disconnect\n",
-                                (unsigned)send_fail_streak);
-                        send_fail_streak = 0;
-                        bt_hid_host_disconnect();
-                    } else if (send_fail_streak > 3) {
-                        vTaskDelay(pdMS_TO_TICKS(20));
-                    } else {
-                        vTaskDelay(1);
-                    }
-                } else {
-                    send_fail_streak = 0;
-                }
+                /* A dropped audio packet is not a failed Bluetooth link.
+                 * Let ACL/L2CAP error events drive disconnect, as DS5Dongle. */
+                if (send_audio_report(session) != 0)
+                    vTaskDelay(1);
             }
         }
 
@@ -597,8 +586,8 @@ void audio_reset(void)
     } else if (encoder) {
         opus_encoder_ctl(encoder, OPUS_RESET_STATE);
     }
-    if (decoder)
-        opus_decoder_ctl(decoder, OPUS_RESET_STATE);
+    decoder_reset_pending = true;
+    usb_audio_discard_pending();
     if (mic_queue)
         xQueueReset(mic_queue);
     usb_audio_mic_stop();
@@ -620,12 +609,13 @@ void audio_mic_feed(const uint8_t *opus_data, uint16_t len)
     if (!mic_enabled || !mic_queue) return;
     if (len < MIC_OPUS_SIZE) return;
 
-    uint8_t frame[MIC_OPUS_SIZE];
-    memcpy(frame, opus_data, MIC_OPUS_SIZE);
-    if (xQueueSend(mic_queue, frame, 0) != pdTRUE) {
-        uint8_t discard[MIC_OPUS_SIZE];
-        xQueueReceive(mic_queue, discard, 0);
-        xQueueSend(mic_queue, frame, 0);
+    struct mic_message frame;
+    frame.session = bt_hid_host_session();
+    memcpy(frame.data, opus_data, MIC_OPUS_SIZE);
+    if (xQueueSend(mic_queue, &frame, 0) != pdTRUE) {
+        struct mic_message discard;
+        xQueueReceive(mic_queue, &discard, 0);
+        xQueueSend(mic_queue, &frame, 0);
     }
 }
 
@@ -648,7 +638,7 @@ __attribute__((section(".tcm_code")))
 void audio_mic_task(void *arg)
 {
     (void)arg;
-    static uint8_t  mic_opus_buf[MIC_OPUS_SIZE];
+    static struct mic_message frame;
     static int16_t  mic_mono[OPUS_FRAME_SAMPLES];
     static int16_t  mic_stereo[OPUS_FRAME_SAMPLES * 2];
 
@@ -658,14 +648,22 @@ void audio_mic_task(void *arg)
             continue;
         }
 
-        if (xQueueReceive(mic_queue, mic_opus_buf, portMAX_DELAY) != pdTRUE)
+        if (xQueueReceive(mic_queue, &frame, portMAX_DELAY) != pdTRUE)
             continue;
 
-        if (!decoder || !mic_enabled)
+        if (!decoder || !mic_enabled || frame.session != bt_hid_host_session())
             continue;
+        if (decoder_reset_pending) {
+            decoder_reset_pending = false;
+            opus_decoder_ctl(decoder, OPUS_RESET_STATE);
+        }
 
-        int decoded = opus_decode(decoder, mic_opus_buf, MIC_OPUS_SIZE,
+        int decoded = opus_decode(decoder, frame.data, MIC_OPUS_SIZE,
                                   mic_mono, OPUS_FRAME_SAMPLES, 0);
+        if (frame.session != bt_hid_host_session()) {
+            decoder_reset_pending = true;
+            continue;
+        }
         if (decoded <= 0) {
             LOG_ERR("[MIC] Opus decode error: %d\n", decoded);
             continue;
@@ -681,6 +679,9 @@ void audio_mic_task(void *arg)
             uint16_t s = (uint16_t)mic_mono[i];
             out32[i] = (uint32_t)s | ((uint32_t)s << 16);
         }
-        usb_audio_mic_write(mic_stereo, (uint32_t)decoded);
+        uintptr_t irq = bflb_irq_save();
+        if (frame.session == bt_hid_host_session() && mic_enabled)
+            usb_audio_mic_write(mic_stereo, (uint32_t)decoded);
+        bflb_irq_restore(irq);
     }
 }

@@ -43,12 +43,12 @@
 #define LED_TASK_PRIORITY     (tskIDLE_PRIORITY + 1)
 #define BOOT_HOLD_US         (3ULL * 1000000ULL)
 #define BOOT_CLICK_WINDOW    5    /* 500ms window between clicks */
-#define HANDSHAKE_TIMEOUT_US  (10ULL * 1000000ULL)
-#define CONNECTING_TIMEOUT_TICKS pdMS_TO_TICKS(8000)
-#define L2CAP_CONNECT_TIMEOUT_TICKS pdMS_TO_TICKS(3000)
 
-#define INPUT_QUEUE_ITEM_SZ  DS5_BT_INPUT_REPORT_SIZE
+#define INPUT_QUEUE_ITEM_SZ  sizeof(struct input_message)
 #define USB_OUTPUT_BUF_SZ    64  /* Report ID (1) + SetStateData (up to 63 for DSE) */
+
+struct input_message { uint32_t session; uint8_t data[DS5_BT_INPUT_REPORT_SIZE]; };
+struct output_message { uint32_t session; uint8_t data[USB_OUTPUT_BUF_SZ]; };
 
 static QueueHandle_t input_queue;
 static QueueHandle_t output_queue;
@@ -172,9 +172,10 @@ static void on_hid_input(const uint8_t *data, uint16_t len)
             first_input_logged = true;
             LOG_INF("[MAIN] First input report received (%d bytes)\n", len);
         }
-        uint8_t report[DS5_BT_INPUT_REPORT_SIZE];
-        memcpy(report, data, DS5_BT_INPUT_REPORT_SIZE);
-        xQueueOverwrite(input_queue, report);
+        struct input_message report;
+        report.session = bt_hid_host_session();
+        memcpy(report.data, data, sizeof(report.data));
+        xQueueOverwrite(input_queue, &report);
     }
 }
 
@@ -185,6 +186,8 @@ static void on_hid_state(enum bt_hid_host_state state)
         handshake_start_us = 0;
         connecting_start_tick = 0;
         bool was_connected = ds5_connected;
+        if (input_queue) xQueueReset(input_queue);
+        if (output_queue) xQueueReset(output_queue);
         if (ds5_connected) {
             ds5_connected = false;
             battery_low = false;
@@ -305,19 +308,21 @@ static void on_hid_state(enum bt_hid_host_state state)
 
 static void on_usb_output(const uint8_t *data, uint16_t len)
 {
-    if (!ds5_connected || len < 2)
+    if (!ds5_connected || len < 2 ||
+        bt_hid_host_get_state() != BT_HID_STATE_CONNECTED)
         return;
 
     if (data[0] != DS5_USB_REPORT_ID_OUTPUT)
         return;
 
-    uint8_t msg[USB_OUTPUT_BUF_SZ];
+    struct output_message msg;
+    msg.session = bt_hid_host_session();
     uint16_t copy = (len <= USB_OUTPUT_BUF_SZ) ? len : USB_OUTPUT_BUF_SZ;
-    memcpy(msg, data, copy);
+    memcpy(msg.data, data, copy);
     if (copy < USB_OUTPUT_BUF_SZ)
-        memset(msg + copy, 0, USB_OUTPUT_BUF_SZ - copy);
+        memset(msg.data + copy, 0, USB_OUTPUT_BUF_SZ - copy);
     /* Keep accepted reports in order, matching the downstream DS5Dongle FIFO. */
-    if (xQueueSendToBackFromISR(output_queue, msg, NULL) != pdTRUE)
+    if (xQueueSendToBackFromISR(output_queue, &msg, NULL) != pdTRUE)
         out_drop_count++;
 }
 
@@ -385,7 +390,8 @@ static void bt_task(void *arg)
     bt_hid_host_scan_start(0);
     LOG_INF("[BT_TASK] Entering main loop\n");
 
-    uint8_t usb_out[USB_OUTPUT_BUF_SZ];
+    struct output_message output;
+    uint8_t *usb_out = output.data;
     uint16_t loop_count = 0;
 
     /*
@@ -528,11 +534,6 @@ static void bt_task(void *arg)
 
         bt_hid_host_persist_if_dirty();
 
-        if (usb_wake_radio_wake_pending()) {
-            bt_hid_host_radio_wake();
-            LOG_INF("[MAIN] Radio wake — BT scan re-enabled after standby\n");
-        }
-
         /* Periodic RSSI read (~every 5 s) */
         {
             static uint16_t rssi_tick = 0;
@@ -560,7 +561,7 @@ static void bt_task(void *arg)
             continue;
         }
 
-        bt_hid_host_poll_security_watchdog();
+        bt_hid_host_poll_security_ready();
         bt_hid_host_poll_tx();
 
         if (dse_mode_changed) {
@@ -633,7 +634,8 @@ static void bt_task(void *arg)
              * which has no SetStateData, so state still travels as 0x31 even
              * while audio is active. Never discard the first host reports. */
             if (state_mgr_is_spk_active()) {
-                while (xQueueReceive(output_queue, usb_out, 0) == pdTRUE) {
+                while (xQueueReceive(output_queue, &output, 0) == pdTRUE) {
+                    if (output.session != bt_hid_host_session()) continue;
                     uint8_t *payload = usb_out + 1;
                     state_mgr_update(payload, DS5_USB_OUTPUT_PAYLOAD_LEN);
                     state_mgr_get(payload, DS5_USB_OUTPUT_PAYLOAD_LEN);
@@ -642,10 +644,11 @@ static void bt_task(void *arg)
                     build_bt_output(payload, DS5_USB_OUTPUT_PAYLOAD_LEN,
                                     output_seq, bt_out);
                     output_seq = (output_seq + 1) & 0x0F;
-                    bt_hid_host_send_output(bt_out, DS5_BT_OUTPUT_REPORT_SIZE);
+                    bt_hid_host_send_output_session(bt_out, DS5_BT_OUTPUT_REPORT_SIZE, output.session);
                 }
                 vTaskDelay(pdMS_TO_TICKS(24));
-            } else if (xQueueReceive(output_queue, usb_out, pdMS_TO_TICKS(24)) == pdTRUE) {
+            } else if (xQueueReceive(output_queue, &output, pdMS_TO_TICKS(24)) == pdTRUE) {
+                if (output.session != bt_hid_host_session()) continue;
                 uint8_t *payload = usb_out + 1;
 
                 state_mgr_update(payload, DS5_USB_OUTPUT_PAYLOAD_LEN);
@@ -655,77 +658,15 @@ static void bt_task(void *arg)
                 build_bt_output(payload, DS5_USB_OUTPUT_PAYLOAD_LEN,
                                 output_seq, bt_out);
                 output_seq = (output_seq + 1) & 0x0F;
-                bt_hid_host_send_output(bt_out, DS5_BT_OUTPUT_REPORT_SIZE);
+                bt_hid_host_send_output_session(bt_out, DS5_BT_OUTPUT_REPORT_SIZE, output.session);
             }
         } else {
             vTaskDelay(pdMS_TO_TICKS(100));
 
-            /* CONNECTING timeout: L2CAP channels didn't complete in time */
-            {
-                static TickType_t l2cap_timeout_start = 0;
-                enum bt_hid_host_state s = bt_hid_host_get_state();
-                if ((s == BT_HID_STATE_CONNECTING ||
-                     s == BT_HID_STATE_SDP_QUERY) &&
-                    connecting_start_tick > 0) {
-                    TickType_t elapsed = xTaskGetTickCount() - connecting_start_tick;
-                    if (elapsed > CONNECTING_TIMEOUT_TICKS) {
-                        LOG_WRN("[MAIN] Connecting timeout (%d) — disconnecting\n", s);
-                        connecting_start_tick = 0;
-                        l2cap_timeout_start = 0;
-                        bt_hid_host_disconnect();
-                    }
-                } else if (s == BT_HID_STATE_L2CAP_CONTROL ||
-                           s == BT_HID_STATE_L2CAP_INTERRUPT) {
-                    if (l2cap_timeout_start == 0)
-                        l2cap_timeout_start = xTaskGetTickCount();
-                    TickType_t elapsed = xTaskGetTickCount() - l2cap_timeout_start;
-                    if (elapsed > L2CAP_CONNECT_TIMEOUT_TICKS) {
-                        LOG_WRN("[MAIN] Connecting timeout (%d) — disconnecting\n", s);
-                        connecting_start_tick = 0;
-                        l2cap_timeout_start = 0;
-                        bt_hid_host_disconnect();
-                    }
-                } else {
-                    l2cap_timeout_start = 0;
-                }
-            }
-
-            if (bt_hid_host_get_state() == BT_HID_STATE_HANDSHAKE) {
+            if (bt_hid_host_get_state() == BT_HID_STATE_HANDSHAKE)
                 bt_hid_host_handshake_tick();
-                if (handshake_start_us > 0 &&
-                    (bflb_mtimer_get_time_us() - handshake_start_us) >
-                    HANDSHAKE_TIMEOUT_US) {
-                    LOG_WRN("[MAIN] Handshake timeout — disconnecting\n");
-                    handshake_start_us = 0;
-                    bt_hid_host_disconnect();
-                }
-            }
-
-
         }
     }
-}
-
-/*
- * Check if the current BT input payload has meaningful user activity
- * (buttons, sticks, triggers differ from neutral).
- */
-static bool has_user_activity(const uint8_t *payload)
-{
-    uint8_t lx = payload[0], ly = payload[1];
-    uint8_t rx = payload[2], ry = payload[3];
-    uint8_t l2 = payload[4], r2 = payload[5];
-    uint8_t b7 = payload[7], b8 = payload[8], b9 = payload[9];
-
-    bool stick_moved = (lx < 0x70 || lx > 0x90 ||
-                        ly < 0x70 || ly > 0x90 ||
-                        rx < 0x70 || rx > 0x90 ||
-                        ry < 0x70 || ry > 0x90);
-    bool trigger_pressed = (l2 > 5 || r2 > 5);
-    bool buttons_pressed = ((b7 & 0xF0) != 0x00 || (b7 & 0x0F) != 0x08 ||
-                             b8 != 0x00 || (b9 & 0x03) != 0x00);
-
-    return stick_moved || trigger_pressed || buttons_pressed;
 }
 
 static bool should_use_dse(void)
@@ -762,13 +703,11 @@ static void usb_task(void *arg)
         taskEXIT_CRITICAL();
     }
 
-    uint8_t raw_report[DS5_BT_INPUT_REPORT_SIZE];
-    uint64_t last_activity_us = bflb_mtimer_get_time_us();
-    uint64_t last_input_us    = bflb_mtimer_get_time_us();
-    bool inactive_disconnected = false;
+    struct input_message input;
+    uint8_t *raw_report = input.data;
     uint32_t usb_check_cnt = 0;
-
-#define CONN_WATCHDOG_US (3ULL * 1000000ULL)  /* Request disconnect after input stops. */
+    uint32_t usb_session = bt_hid_host_session();
+    uint8_t prev_mic_bit = 0xFF;
 
     /* PS shortcut state (short press → Win+G, with debounce) */
     bool     ps_debounced    = false;
@@ -808,19 +747,25 @@ static void usb_task(void *arg)
         }
         usb_gamepad_process_deferred();
 
-        /* Connection watchdog: if connected and we've received at least one
-         * report, but then nothing for 3s → controller likely powered off.
-         * Request disconnect; wait for the real ACL/L2CAP teardown events. */
-        if (ds5_connected && bt_hid_host_get_state() == BT_HID_STATE_CONNECTED &&
-            usb_fwd_count > 0 &&
-            (bflb_mtimer_get_time_us() - last_input_us) > CONN_WATCHDOG_US) {
-            LOG_WRN("[MAIN] Watchdog: no input for 3s, requesting disconnect\n");
-            bt_hid_host_disconnect();
+        uint32_t session = bt_hid_host_session();
+        if (session != usb_session) {
+            usb_session = session;
+            prev_mic_bit = 0xFF;
+            ps_debounced = ps_was_pressed = ps_key_scheduled = false;
+            remap_combo_fired = tp_mode_combo_fired = false;
+            if (vol_key_active) {
+                usb_gamepad_send_consumer_report(0);
+                vol_key_active = false;
+            }
         }
 
         TickType_t wait = pdMS_TO_TICKS(10);
-        if (xQueueReceive(input_queue, raw_report, wait) == pdTRUE) {
-            last_input_us = bflb_mtimer_get_time_us();
+        if (xQueueReceive(input_queue, &input, wait) == pdTRUE) {
+            if (input.session != bt_hid_host_session() ||
+                bt_hid_host_get_state() == BT_HID_STATE_DISCONNECTING)
+                continue;
+            /* Wake sees original buttons, before shortcuts/remapping. */
+            usb_wake_on_bt_input(raw_report + 2, DS5_USB_INPUT_PAYLOAD_LEN);
             usb_fwd_count++;
             if (usb_fwd_count == 1)
                 LOG_DBG("[USB-FWD] First BT→USB input forwarded\n");
@@ -926,7 +871,6 @@ static void usb_task(void *arg)
             remap_mouse_tick(raw_report + 2);
             remap_apply(raw_report + 2);
             usb_gamepad_send_raw_input(raw_report + 2);
-            usb_wake_on_bt_input(raw_report + 2, DS5_USB_INPUT_PAYLOAD_LEN);
 
             /* Headset plug detection for audio tag switching (0x93 vs 0x96) */
             audio_set_headset((raw_report[2 + DS5_HEADSET_BYTE] & 1) != 0);
@@ -935,7 +879,6 @@ static void usb_task(void *arg)
              * Controller toggles status_bit only when a game has activated
              * the mic — this is normal PS5 behavior. */
             {
-                static uint8_t prev_mic_bit = 0xFF;
                 uint8_t cur_mic_bit = (raw_report[2 + DS5_HEADSET_BYTE] >> 2) & 1;
                 if (prev_mic_bit != 0xFF && cur_mic_bit != prev_mic_bit) {
                     uint8_t mute_state[DS5_USB_OUTPUT_PAYLOAD_LEN];
@@ -944,17 +887,12 @@ static void usb_task(void *arg)
                     mute_state[8] = cur_mic_bit ? 0x01 : 0x00;
                     uint8_t pkt[DS5_BT_OUTPUT_EXT_SIZE];
                     build_bt_output_ext(mute_state, DS5_USB_OUTPUT_PAYLOAD_LEN, pkt);
-                    bt_hid_host_send_output(pkt, DS5_BT_OUTPUT_EXT_SIZE);
+                    bt_hid_host_send_output_session(pkt, DS5_BT_OUTPUT_EXT_SIZE, input.session);
                 }
                 prev_mic_bit = cur_mic_bit;
             }
 
             if (ds5_connected) {
-                if (has_user_activity(raw_report + 2)) {
-                    last_activity_us = bflb_mtimer_get_time_us();
-                    inactive_disconnected = false;
-                }
-
                 /* Battery monitoring: <=10% red blink */
                 uint8_t batt = raw_report[2 + DS5_BATT_BYTE_OFFSET];
                 uint8_t pct  = batt & DS5_BATT_LEVEL_MASK;
@@ -974,18 +912,6 @@ static void usb_task(void *arg)
                         led_status_set(LED_OFF);
                     else
                         led_status_set(LED_GREEN_SOLID);
-                }
-
-                uint8_t inact_min = config_inactive_minutes();
-                if (inact_min > 0 && !inactive_disconnected && !usb_audio_is_active()) {
-                    uint64_t elapsed_us = bflb_mtimer_get_time_us() - last_activity_us;
-                    uint64_t timeout_us = (uint64_t)inact_min * 60ULL * 1000000ULL;
-                    if (elapsed_us >= timeout_us) {
-                        LOG_INF("[MAIN] Idle timeout (%d min) — disconnecting\n",
-                               inact_min);
-                        bt_hid_host_disconnect();
-                        inactive_disconnected = true;
-                    }
                 }
 
                 /* PS key scheduled send + release (runs unconditionally) */
@@ -1047,8 +973,6 @@ static void usb_task(void *arg)
         }
 
         if (!ds5_connected) {
-            last_activity_us = bflb_mtimer_get_time_us();
-            inactive_disconnected = false;
             ps_debounced = false;
             ps_key_scheduled = false;
             ps_was_pressed = false;
@@ -1149,7 +1073,7 @@ int main(void)
     /* Depth-1: USB ISR always delivers the latest report to usb_task.
      * The 10-deep app_tx_fifo in bt_hid_host.c provides the actual buffering
      * and CAN_SEND_NOW flow control (one BT packet in-flight at a time). */
-    output_queue = xQueueCreate(5, USB_OUTPUT_BUF_SZ);
+    output_queue = xQueueCreate(5, sizeof(struct output_message));
     if (!input_queue || !output_queue) {
         LOG_ERR("[B] queue alloc FAIL\n");
         while (1) {}

@@ -1,6 +1,7 @@
 #include "bt_hid_host.h"
 #include "ds5_protocol.h"
 #include "dse.h"
+#include "config.h"
 
 #include <bluetooth/bluetooth.h>
 #include <bluetooth/conn.h>
@@ -284,6 +285,7 @@ static struct {
     volatile enum bt_hid_host_state state;
     struct bt_conn *conn;
     volatile bool acl_disconnected;
+    TickType_t last_activity_tick;
     bt_addr_t target_addr;
     bool has_target;
 
@@ -364,7 +366,7 @@ static volatile uint8_t  app_tx_tail = 0;   /* next slot to fill */
 static volatile bool     app_tx_busy = false; /* true: one packet is in HCI */
 static uint8_t feature_refresh_pending[32]; /* coalesced GETs, indexed by report ID */
 static void feature_refresh_poll(void);
-static uint32_t app_tx_generation = 1; /* invalidate callbacks across FIFO resets */
+static volatile uint32_t app_tx_generation = 1; /* invalidate callbacks across FIFO resets */
 
 /* bt_conn_tx_cb_t: SDK declaration from conn_internal.h */
 static void hid_tx_drain_one(void);  /* forward declaration */
@@ -634,7 +636,7 @@ static void handshake_send_pending(void)
         (TickType_t)(now - hid_ctx.handshake.probe_tick) < HANDSHAKE_PROBE_TICKS)
         return;
     if (hid_ctx.handshake.probe_attempts >= 6)
-        return; /* Main handshake deadline disconnects; never guess the type. */
+        return; /* Keep waiting for a real reply or stack error; never guess the type. */
 
     hid_ctx.handshake.probe_tick = now;
     ++hid_ctx.handshake.probe_attempts;
@@ -723,6 +725,27 @@ static int l2cap_ctrl_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
     return 0;
 }
 
+/* Raw, pre-remap input and thresholds match DS5Dongle's inactivity check. */
+static void check_inactivity(const uint8_t *data, uint16_t len)
+{
+    uint8_t minutes = config_inactive_minutes();
+    if (len < 13 || !(data[2] & 1) || !minutes)
+        return;
+    TickType_t now = xTaskGetTickCount();
+    bool active = data[3] < 120 || data[3] > 140 ||
+                  data[4] < 120 || data[4] > 140 ||
+                  data[5] < 120 || data[5] > 140 ||
+                  data[6] < 120 || data[6] > 140 ||
+                  data[7] || data[8] || data[10] != 0x08 || data[11] || data[12];
+    if (active) {
+        hid_ctx.last_activity_tick = now;
+    } else if ((TickType_t)(now - hid_ctx.last_activity_tick) >
+               pdMS_TO_TICKS((uint32_t)minutes * 60000u)) {
+        hid_ctx.last_activity_tick = now;
+        bt_hid_host_disconnect();
+    }
+}
+
 static int l2cap_intr_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 {
     if (!hid_ctx.conn || chan->conn != hid_ctx.conn ||
@@ -747,6 +770,7 @@ static int l2cap_intr_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
         if (hid_ctx.input_cb) {
             hid_ctx.input_cb(data + 1, len - 1);
         }
+        check_inactivity(data, len);
     } else {
         LOG_WRN("[HID] intr_recv: unexpected trans=0x%x param=0x%x len=%d\n",
                trans, param, len);
@@ -794,6 +818,7 @@ static void l2cap_intr_connected(struct bt_l2cap_chan *chan)
         return;
     hid_ctx.intr_accepting = false;
     hid_ctx.intr_connected = true;
+    hid_ctx.last_activity_tick = xTaskGetTickCount();
 
     /* Successful L2CAP HID open removes this MAC from the blacklist,
      * treating it as an explicit user re-pair (PS+Share mode). */
@@ -809,24 +834,6 @@ static void l2cap_intr_connected(struct bt_l2cap_chan *chan)
      * DS5Dongle's gap_connectable_control(false) on HID open). */
     bt_br_set_connectable(false);
     bt_br_set_discoverable(false);
-
-    /* Shorten the Link Supervision Timeout so the BL618 controller
-     * detects a dead link within ~5 s instead of the default ~20 s.
-     * HCI Write_Link_Supervision_Timeout: OGF 0x03, OCF 0x0037.
-     * Timeout unit = 0.625 ms; 5 s = 8000 slots = 0x1F40. */
-    if (hid_ctx.conn) {
-        uint16_t handle = hid_ctx.conn->handle;
-        struct net_buf *buf = bt_hci_cmd_create(
-            BT_OP(BT_OGF_BASEBAND, 0x0037), 4);
-        if (buf) {
-            net_buf_add_le16(buf, handle);
-            net_buf_add_le16(buf, 0x1F40);
-            int err = bt_hci_cmd_send_sync(
-                BT_OP(BT_OGF_BASEBAND, 0x0037), buf, NULL);
-            LOG_INF("[BT] Write Link Supervision Timeout: handle=0x%04x "
-                   "timeout=5s err=%d\n", handle, err);
-        }
-    }
 
     /* The BT task sends the initial GET batch followed by the 0x32 primer. */
     handshake_maybe_begin();
@@ -1859,40 +1866,21 @@ bool bt_hid_host_poll_sdp(void)
     return true;
 }
 
-#define SECURITY_TIMEOUT_TICKS  pdMS_TO_TICKS(8000)
-
-bool bt_hid_host_poll_security_watchdog(void)
+/* Recover a missed SDK notification only from actual encryption state.
+ * DS5Dongle leaves authentication/connection deadlines to the BT stack. */
+bool bt_hid_host_poll_security_ready(void)
 {
-    if (hid_ctx.security_done || !hid_ctx.conn)
+    if (hid_ctx.security_done || !hid_ctx.conn ||
+        hid_ctx.state != BT_HID_STATE_CONNECTING)
         return false;
-
-    if (hid_ctx.state != BT_HID_STATE_CONNECTING)
-        return false;
-
-    TickType_t elapsed = xTaskGetTickCount() - hid_ctx.acl_connect_tick;
-    if (elapsed < SECURITY_TIMEOUT_TICKS)
-        return false;
-
     struct bt_conn *conn = hid_ctx.conn;
-    LOG_WRN("[BT] WATCHDOG: security not established after %lu ms! "
-           "sec_level=%d required_sec=%d encrypt=%d\n",
-           (unsigned long)(elapsed * portTICK_PERIOD_MS),
-           conn->sec_level, conn->required_sec_level, conn->encrypt);
-
-    if (conn->encrypt && conn->sec_level >= BT_SECURITY_L2) {
-        LOG_WRN("[BT] WATCHDOG: encryption active, forcing L2CAP path\n");
-        hid_ctx.security_done = true;
-        hid_ctx.security_done_tick = xTaskGetTickCount();
-        if (hid_ctx.outgoing) {
-            hid_ctx.sdp_pending = true;
-        }
-        handshake_maybe_begin();
-        return true;
-    }
-
-    /* A timeout is not a rejected key. Keep the bond for normal PS reconnect. */
-    LOG_WRN("[BT] Security timeout: preserving bond, disconnecting\n");
-    bt_hid_host_disconnect();
+    if (!conn->encrypt || conn->sec_level < BT_SECURITY_L2)
+        return false;
+    hid_ctx.security_done = true;
+    hid_ctx.security_done_tick = xTaskGetTickCount();
+    if (hid_ctx.outgoing)
+        hid_ctx.sdp_pending = true;
+    handshake_maybe_begin();
     return true;
 }
 
@@ -1989,9 +1977,10 @@ int8_t bt_hid_host_get_cached_rssi(void)
     return cached_rssi;
 }
 
-int bt_hid_host_send_output(const uint8_t *data, uint16_t len)
+int bt_hid_host_send_output_session(const uint8_t *data, uint16_t len, uint32_t generation)
 {
-    uint32_t generation = app_tx_generation;
+    if (generation != app_tx_generation)
+        return -ENOTCONN;
     if (!hid_ctx.intr_connected || !hid_ctx.conn ||
         hid_ctx.state == BT_HID_STATE_DISCONNECTING)
         return -ENOTCONN;
@@ -2052,6 +2041,16 @@ int bt_hid_host_send_output(const uint8_t *data, uint16_t len)
     hid_tx_drain_one();
 
     return 0;
+}
+
+uint32_t bt_hid_host_session(void)
+{
+    return app_tx_generation;
+}
+
+int bt_hid_host_send_output(const uint8_t *data, uint16_t len)
+{
+    return bt_hid_host_send_output_session(data, len, app_tx_generation);
 }
 
 int bt_hid_host_set_feature(uint8_t report_id, const uint8_t *data,
@@ -2327,10 +2326,11 @@ bool bt_hid_host_is_dse(void)
     return hid_ctx.is_dse;
 }
 
-int bt_hid_host_set_feature_crc(uint8_t report_id, const uint8_t *data,
-                                uint16_t len)
+int bt_hid_host_set_feature_crc_session(uint8_t report_id, const uint8_t *data,
+                                        uint16_t len, uint32_t generation)
 {
-    uint32_t generation = app_tx_generation;
+    if (generation != app_tx_generation)
+        return -ENOTCONN;
     if (!hid_ctx.ctrl_connected || !hid_ctx.conn) {
         LOG_WRN("[HID] SET_FEATURE_CRC(0x%02x): not connected (ctrl=%d conn=%p)\n",
                report_id, hid_ctx.ctrl_connected, hid_ctx.conn);
@@ -2372,6 +2372,11 @@ int bt_hid_host_set_feature_crc(uint8_t report_id, const uint8_t *data,
     return 0;
 }
 
+int bt_hid_host_set_feature_crc(uint8_t report_id, const uint8_t *data, uint16_t len)
+{
+    return bt_hid_host_set_feature_crc_session(report_id, data, len, app_tx_generation);
+}
+
 void bt_hid_host_persist_if_dirty(void)
 {
     if (bonded_refresh_pending || pairing_addr_pending)
@@ -2386,18 +2391,4 @@ void bt_hid_host_persist_if_dirty(void)
 void bt_hid_host_handshake_tick(void)
 {
     handshake_send_pending();
-}
-
-void bt_hid_host_radio_idle(void)
-{
-    bt_br_set_connectable(false);
-    bt_br_set_discoverable(false);
-    LOG_INF("[BT] Radio idle — page/inquiry scan disabled\n");
-}
-
-void bt_hid_host_radio_wake(void)
-{
-    bt_br_set_connectable(true);
-    bt_br_set_discoverable(true);
-    LOG_INF("[BT] Radio wake — page/inquiry scan re-enabled\n");
 }

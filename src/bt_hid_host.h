@@ -106,6 +106,11 @@ bool bt_hid_host_poll_disconnect(void);
  * @return 0 on success
  */
 int bt_hid_host_send_output(const uint8_t *data, uint16_t len);
+/* Tag work before queueing/encoding; old sessions cannot send to a new peer. */
+uint32_t bt_hid_host_session(void);
+int bt_hid_host_send_output_session(const uint8_t *data, uint16_t len, uint32_t session);
+int bt_hid_host_set_feature_crc_session(uint8_t report_id, const uint8_t *data,
+                                        uint16_t len, uint32_t session);
 
 /* Continue queued output after failed submissions; call from the BT task. */
 void bt_hid_host_poll_tx(void);
@@ -250,11 +255,11 @@ bool bt_hid_host_poll_security(void);
 bool bt_hid_host_poll_sdp(void);
 
 /**
- * Security establishment watchdog. If ACL connected but security
- * not established within timeout, take corrective action.
- * @return true if watchdog triggered
+ * Observe actual encryption if the SDK notification was missed.
+ * No application deadline or inferred disconnect.
+ * @return true if encrypted readiness was recovered
  */
-bool bt_hid_host_poll_security_watchdog(void);
+bool bt_hid_host_poll_security_ready(void);
 
 /**
  * Read RSSI from the connected device via HCI.
@@ -268,19 +273,5 @@ int bt_hid_host_read_rssi(int8_t *rssi);
  * @return last RSSI in dBm, or 0 if not available
  */
 int8_t bt_hid_host_get_cached_rssi(void);
-
-/**
- * Disable page scan + inquiry scan to silence the BT radio.
- * Call when USB host is confirmed offline (e.g. sustained SUSPEND after
- * controller power-off) to reduce power consumption / heat.
- * Re-enabled automatically on next bt_hid_host_try_reconnect() or scan_start().
- */
-void bt_hid_host_radio_idle(void);
-
-/**
- * Re-enable page scan + inquiry scan after radio_idle.
- * Resumes passive acceptance of controller connections. Call from task context only.
- */
-void bt_hid_host_radio_wake(void);
 
 #endif /* BT_HID_HOST_H */

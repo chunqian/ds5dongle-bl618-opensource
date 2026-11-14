@@ -1,5 +1,6 @@
 #include "usb_gamepad.h"
 #include "usb_audio_control.h"
+#include "usb_wake.h"
 #include "compiler/compiler_ld.h"
 #include "ds5_usb_audio.h"
 #include "audio.h"
@@ -63,6 +64,7 @@ static bool first_usb_send_logged = false;
 
 typedef struct {
     uint8_t  report_id;
+    uint32_t session;
     uint16_t len;
     bool     is_dse;
     uint8_t  data[SET_REPORT_MAX_DATA];
@@ -874,7 +876,9 @@ void usb_gamepad_process_deferred(void)
            xQueueReceive(set_report_queue, &entry, 0) == pdTRUE) {
         LOG_INF("[USB] Deferred SET_REPORT(0x%02x) → BT, %u bytes%s\n",
                entry.report_id, entry.len, entry.is_dse ? " (DSE)" : "");
-        bt_hid_host_set_feature_crc(entry.report_id, entry.data, entry.len);
+        if (bt_hid_host_set_feature_crc_session(entry.report_id, entry.data,
+                                                entry.len, entry.session) == 0 && entry.is_dse)
+            dse_on_profile_write(entry.report_id);
     }
 
     /* Recover a failed queue attempt even when the controller stops sending. */
@@ -1448,8 +1452,11 @@ void usbd_hid_set_report(uint8_t busid, uint8_t intf, uint8_t report_id,
     if (report_type == 0x03 && payload_len > 0 &&
         (report_id == 0x60 || report_id == 0x61 ||
          report_id == 0x62 || report_id == 0x80)) {
+        if (bt_hid_host_get_state() != BT_HID_STATE_CONNECTED)
+            return;
         set_report_entry_t entry;
         entry.report_id = report_id;
+        entry.session = bt_hid_host_session();
         entry.is_dse    = true;
         entry.len = (payload_len <= SET_REPORT_MAX_DATA)
                         ? payload_len : SET_REPORT_MAX_DATA;
@@ -1457,7 +1464,6 @@ void usbd_hid_set_report(uint8_t busid, uint8_t intf, uint8_t report_id,
         BaseType_t ok = xQueueSendFromISR(set_report_queue, &entry, NULL);
         LOG_ISR("[USB-ISR] SET_REPORT(DSE 0x%02x) queued=%d len=%lu\n",
                report_id, (int)(ok == pdTRUE), (unsigned long)payload_len);
-        dse_on_profile_write(report_id);
         return;
     }
 
@@ -1474,6 +1480,7 @@ void usbd_hid_set_report(uint8_t busid, uint8_t intf, uint8_t report_id,
 
 void usb_soft_disconnect(void)
 {
+    usb_wake_note_usb_reconnect();
     volatile uint32_t *phy_tst = (volatile uint32_t *)(USB_BASE + 0x114);
     *phy_tst |= 1u;
     LOG_INF("[USB] Soft disconnect (stealth)\n");

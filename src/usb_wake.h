@@ -22,7 +22,7 @@ void usb_wake_on_bt_input(const uint8_t *payload, uint16_t len);
 /** Advance the wake FSM. Call periodically from the USB task loop. */
 void usb_wake_task(void);
 
-/** Check and clear radio wake flag. Call from bt_task context. */
-bool usb_wake_radio_wake_pending(void);
+/* Ignore suspend caused by our own deliberate USB detach/re-enumeration. */
+void usb_wake_note_usb_reconnect(void);
 
 #endif /* USB_WAKE_H */

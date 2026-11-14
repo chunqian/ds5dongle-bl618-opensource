@@ -8,6 +8,7 @@
 #include <string.h>
 #include "debug_log.h"
 #include "bflb_mtimer.h"
+#include "bflb_irq.h"
 
 /* ---- UAC1 entity IDs ---- */
 #define AUDIO_IT_SPK_ID     0x01
@@ -446,6 +447,15 @@ void usb_audio_stop(void)
     pcm_write_idx = 0;
     pcm_ready = false;
     state_mgr_set_spk_active(false);
+}
+
+void usb_audio_discard_pending(void)
+{
+    uintptr_t irq = bflb_irq_save();
+    pcm_write_pos = 0;
+    pcm_write_idx = 0;
+    pcm_ready = false;
+    bflb_irq_restore(irq);
 }
 
 bool usb_audio_read(int16_t *out)

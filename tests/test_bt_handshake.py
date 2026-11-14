@@ -174,8 +174,7 @@ for signature in (
     "static void auth_pairing_failed(", "static void security_changed(",
 ):
     support += "\n" + extract(SOURCE, signature) + "\n"
-support += "\n#define SECURITY_TIMEOUT_TICKS pdMS_TO_TICKS(8000)\n"
-support += extract(SOURCE, "bool bt_hid_host_poll_security_watchdog(")
+support += extract(SOURCE, "bool bt_hid_host_poll_security_ready(")
 
 support += r'''
 struct bt_hci_evt_auth_complete { uint8_t status; uint16_t handle; };
@@ -299,13 +298,13 @@ int main(void) {
     assert(!edge_unlocks && hid_ctx.state==BT_HID_STATE_HANDSHAKE && hid_ctx.check_dse);
 
     setup(); hid_ctx.state=BT_HID_STATE_CONNECTING;
-    tick=7999; assert(!bt_hid_host_poll_security_watchdog() && !deleted_keys);
-    tick=8000; assert(bt_hid_host_poll_security_watchdog());
-    assert(disconnected==1 && !deleted_keys && hid_ctx.state==BT_HID_STATE_DISCONNECTING);
-    assert(!bt_hid_host_poll_security_watchdog() && disconnected==1);
+    tick=7999; assert(!bt_hid_host_poll_security_ready() && !deleted_keys);
+    tick=8000; assert(!bt_hid_host_poll_security_ready());
+    tick=60000; assert(!bt_hid_host_poll_security_ready());
+    assert(!disconnected && !deleted_keys && hid_ctx.state==BT_HID_STATE_CONNECTING);
     setup(); hid_ctx.state=BT_HID_STATE_CONNECTING; tick=8000;
     current.encrypt=true; current.sec_level=BT_SECURITY_L2; hid_ctx.outgoing=true;
-    assert(bt_hid_host_poll_security_watchdog() && hid_ctx.security_done);
+    assert(bt_hid_host_poll_security_ready() && hid_ctx.security_done);
     assert(hid_ctx.security_done_tick==8000 && hid_ctx.sdp_pending && !disconnected && !deleted_keys);
 
     setup(); auth_event(BT_HCI_ERR_AUTH_FAIL,1);

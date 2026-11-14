@@ -26,6 +26,8 @@ harness = r'''
 #define DS5_USB_INPUT_PAYLOAD_LEN 63
 #define DS5_DPAD_NONE 8
 enum { LED_RED_BLINK, LED_PURPLE_BLINK_SLOW, LED_PURPLE_BLINK_FAST, LED_GREEN_SOLID };
+static int input_queue, output_queue;
+static void xQueueReset(int queue) { (void)queue; }
 static uint64_t handshake_start_us, connecting_start_tick;
 static uint64_t conn_led_start_us;
 static unsigned usb_fwd_count;

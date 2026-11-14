@@ -62,6 +62,8 @@ bool usb_audio_read(int16_t *out);
  * Called on USB RESET to avoid stale flags suppressing 0x31 output.
  */
 void usb_audio_stop(void);
+/* Drop previous BT session PCM without closing the host streaming interface. */
+void usb_audio_discard_pending(void);
 
 /**
  * Semaphore handle for audio task synchronization.
