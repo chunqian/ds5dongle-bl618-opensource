@@ -1,18 +1,10 @@
-"""Compile production reset/config code and exercise the real BOOT FSM offline."""
+"""Compile production reset/config code and exercise persistence offline; gesture coverage is in test_boot_button.py."""
 from pathlib import Path
 import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 main = (ROOT / 'src/main.c').read_text()
-start = main.index('switch (btn_fsm) {')
-end = start + len('switch (btn_fsm) {')
-depth = 1
-while depth:
-    depth += (main[end] == '{') - (main[end] == '}')
-    end += 1
-fsm = main[start:end]
-
 storage = r'''
 #include <assert.h>
 #include <errno.h>
@@ -100,65 +92,6 @@ int main(void) {
 }
 '''
 
-button = r'''
-#include <assert.h>
-#include <stdint.h>
-#include <stdbool.h>
-#include <stdio.h>
-#define LOG_DBG(...) ((void)0)
-#define LOG_INF(...) ((void)0)
-#define LOG_ERR(...) ((void)0)
-#define BOOT_HOLD_US (3ULL * 1000000ULL)
-#define BOOT_CLICK_WINDOW 5
-#define pdMS_TO_TICKS(x) (x)
-enum { BTN_IDLE, BTN_PRESSING, BTN_HELD, BTN_WAIT } btn_fsm;
-enum { LED_RED_BLINK, LED_BLINK_TRIPLE, LED_GREEN_SOLID, LED_PURPLE_BLINK_SLOW };
-static uint8_t btn_press_samples,btn_wait_samples,btn_click_count,scan_fail_count;
-static uint64_t btn_press_start_us;
-static bool bt_init_failed;
-static bool btn_reset_requested,ds5_connected,scan_after_disconnect,request_ok=true;
-static unsigned idle_ticks,requests,reboots,switches,scans;
-static void led_status_set(int p) {(void)p;}
-static bool factory_reset_request(void) {requests++;return request_ok;}
-static void vTaskDelay(int t) {(void)t;}
-static void GLB_SW_System_Reset(void) {reboots++;}
-static int bt_hid_host_get_bonded_count(void) {return 2;}
-static int bt_hid_host_switch_next(void) {switches++;return 1;}
-static void bt_hid_host_disconnect(void) {}
-static void bt_hid_host_scan_start(int x) {(void)x;scans++;}
-static void step(uint64_t btn_now,bool pressed) {
-''' + fsm + r'''
-}
-static void fresh(void) {
-    btn_fsm=BTN_IDLE;btn_press_samples=btn_wait_samples=btn_click_count=0;
-    requests=reboots=switches=scans=0;btn_reset_requested=false;request_ok=true;bt_init_failed=false;
-}
-int main(void) {
-    fresh();step(1,true);step(2900001,true);step(3000000,true);assert(requests==0);
-    step(3000001,true);assert(requests==1 && reboots==0);
-    step(8000001,true);assert(requests==1 && reboots==0);
-    step(8100001,false);assert(reboots==1);
-    fresh();step(0,true);step(2900000,false);assert(requests==0);
-    step(3000000,true);step(5900000,true);assert(requests==0);
-    step(6000000,true);assert(requests==1);step(6100000,false);assert(reboots==1);
-    fresh();request_ok=false;step(0,true);step(3000000,true);step(3100000,false);
-    assert(requests==1 && reboots==0);
-    request_ok=true;step(4000000,true);step(7000000,true);step(7100000,false);assert(reboots==1);
-    fresh();step(0,true);step(100000,false);
-    for(int i=0;i<5;i++) step(200000+i*100000,false);
-    assert(switches==1 && requests==0);
-    fresh();step(0,true);step(100000,false);step(200000,true);step(300000,false);
-    for(int i=0;i<5;i++) step(400000+i*100000,false);
-    assert(scans==1 && requests==0);
-    fresh();bt_init_failed=true;step(0,true);step(100000,false);
-    for(int i=0;i<5;i++) step(200000+i*100000,false);
-    assert(reboots==1 && !switches && !scans && !requests);
-    fresh();bt_init_failed=true;step(0,true);step(3000000,true);step(3100000,false);
-    assert(requests==1 && reboots==1 && !scans);
-    puts("PASS: exact 3-second threshold, delayed polls, release-only reboot, failed request retry, single/double click");
-}
-'''
-
 with tempfile.TemporaryDirectory(prefix='ds5-factory-reset-') as directory:
     temp = Path(directory)
     (temp / 'bflb_irq.h').write_text('#include <stdint.h>\nstatic inline uintptr_t bflb_irq_save(void) { return 0; }\nstatic inline void bflb_irq_restore(uintptr_t x) { (void)x; }\n')
@@ -168,8 +101,7 @@ size_t ef_get_env_blob(const char*,void*,size_t,size_t*);
 EfErrCode ef_set_env_blob(const char*,const void*,size_t);
 EfErrCode ef_del_env(const char*);
 ''')
-    for name, code, sources in [('storage', storage, ['src/factory_reset.c', 'src/config.c']),
-                                 ('button', button, [])]:
+    for name, code, sources in [('storage', storage, ['src/factory_reset.c', 'src/config.c'])]:
         path = temp / (name + '.c')
         path.write_text(code)
         subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror',

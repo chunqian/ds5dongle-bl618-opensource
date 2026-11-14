@@ -15,6 +15,7 @@
 #include "state_mgr.h"
 #include "config.h"
 #include "factory_reset.h"
+#include "boot_button.h"
 #include "dse.h"
 #include "remap.h"
 
@@ -37,8 +38,9 @@
 #define USB_TASK_PRIORITY     (configMAX_PRIORITIES - 1)
 #define LED_TASK_STACK_SIZE   STACK_WORDS(1024*2)
 #define LED_TASK_PRIORITY     (tskIDLE_PRIORITY + 1)
-#define BOOT_HOLD_US         (3ULL * 1000000ULL)
-#define BOOT_CLICK_WINDOW    5    /* 500ms window between clicks */
+#define BUTTON_TASK_STACK_SIZE STACK_WORDS(1024)
+#define BUTTON_TASK_PRIORITY   (configMAX_PRIORITIES - 2)
+#define BUTTON_QUEUE_DEPTH     16
 
 #define INPUT_QUEUE_ITEM_SZ  sizeof(struct input_message)
 
@@ -47,11 +49,13 @@ struct input_message { uint32_t session; uint8_t data[DS5_BT_INPUT_REPORT_SIZE];
 
 static QueueHandle_t input_queue;
 static QueueHandle_t output_queue;
+static QueueHandle_t button_queue;
 /* Critical workers and queues never depend on runtime heap availability. */
-static StaticTask_t bt_tcb, usb_tcb, led_tcb;
+static StaticTask_t bt_tcb, usb_tcb, led_tcb, button_tcb;
 static StackType_t bt_stack[BT_TASK_STACK_SIZE], usb_stack[USB_TASK_STACK_SIZE],
-                   led_stack[LED_TASK_STACK_SIZE];
-static StaticQueue_t input_queue_cb, output_queue_cb;
+                   led_stack[LED_TASK_STACK_SIZE], button_stack[BUTTON_TASK_STACK_SIZE];
+static StaticQueue_t input_queue_cb, output_queue_cb, button_queue_cb;
+static uint8_t button_queue_storage[BUTTON_QUEUE_DEPTH * sizeof(enum boot_button_event)];
 static uint8_t input_queue_storage[INPUT_QUEUE_ITEM_SZ];
 static uint8_t output_queue_storage[1]; /* Coalesced wake signal, not report storage. */
 static volatile bool ds5_connected = false;
@@ -352,6 +356,67 @@ static bool boot_button_pressed(void)
     return bflb_gpio_read(btn_gpio, BOOT_BUTTON_PIN) != 0;
 }
 
+/* GPIO sampling never waits for Bluetooth HCI, Flash, or a full event queue.
+ * This task preempts bt_task; all actions remain in that task's context. */
+static void button_task(void *arg)
+{
+    (void)arg;
+    struct boot_button button = {0};
+    TickType_t last = xTaskGetTickCount();
+    TickType_t period = pdMS_TO_TICKS(BOOT_BUTTON_SAMPLE_MS);
+    if (!period) period = 1;
+    for (;;) {
+        enum boot_button_event event = boot_button_update(&button,
+            bflb_mtimer_get_time_us(), boot_button_pressed());
+        if (event != BOOT_BUTTON_NONE && xQueueSend(button_queue, &event, 0) == pdTRUE)
+            boot_button_ack(&button);
+        vTaskDelayUntil(&last, period);
+    }
+}
+
+/* Bounded drain preserves HOLD -> RELEASE even if Bluetooth was busy when
+ * the button was released. Flash writes and controller operations stay here. */
+static void process_button_events(void)
+{
+    static bool reset_requested;
+    enum boot_button_event event;
+    for (unsigned i = 0; i < BUTTON_QUEUE_DEPTH; ++i) {
+        if (xQueueReceive(button_queue, &event, 0) != pdTRUE) break;
+        if (event == BOOT_BUTTON_HOLD) {
+            reset_requested = factory_reset_request();
+            led_status_set(reset_requested ? LED_BLINK_TRIPLE : LED_RED_BLINK);
+            if (!reset_requested) LOG_ERR("[BTN] Reset request failed; release and retry\n");
+            continue;
+        }
+        if (event == BOOT_BUTTON_RELEASE) {
+            if (reset_requested) {
+                vTaskDelay(pdMS_TO_TICKS(300));
+                GLB_SW_System_Reset();
+                return;
+            }
+            enum bt_hid_host_state state = bt_hid_host_get_state();
+            led_status_set(state == BT_HID_STATE_CONNECTED ? LED_GREEN_SOLID :
+                           state == BT_HID_STATE_IDLE ? LED_PURPLE_BLINK_SLOW :
+                                                       LED_PURPLE_BLINK_FAST);
+            continue;
+        }
+        if (bt_init_failed) {
+            GLB_SW_System_Reset();
+            return;
+        }
+        if (event == BOOT_BUTTON_SINGLE && bt_hid_host_get_bonded_count() > 1) {
+            bt_hid_host_switch_next();
+        } else if (event == BOOT_BUTTON_SINGLE || event == BOOT_BUTTON_DOUBLE) {
+            if (ds5_connected) {
+                scan_after_disconnect = true;
+                bt_hid_host_disconnect();
+            } else {
+                bt_hid_host_scan_start(0);
+            }
+        }
+    }
+}
+
 static void bt_task(void *arg)
 {
     (void)arg;
@@ -395,21 +460,6 @@ static void bt_task(void *arg)
     uint8_t output_wake;
     uint16_t loop_count = 0;
 
-    /*
-     * Button gesture FSM (polled at 10 Hz, independent of loop speed).
-     *   single click  → switch to next bonded controller
-     *   double click  → disconnect + fresh scan (search new controller)
-     *   hold >= 3s    → request full settings reset; reboot on release
-     */
-    enum { BTN_IDLE, BTN_PRESSING, BTN_HELD, BTN_WAIT } btn_fsm = BTN_IDLE;
-    uint8_t  btn_press_samples = 0;
-    uint8_t  btn_wait_samples  = 0;
-    uint8_t  btn_click_count   = 0;
-    uint64_t btn_last_poll_us  = 0;
-    uint64_t btn_press_start_us = 0;
-    bool     btn_reset_requested = false;
-    uint8_t  btn_debug_counter = 0;
-
     prev_led_disabled = config_led_disabled();
     conn_led_start_us = bflb_mtimer_get_time_us();
 
@@ -420,120 +470,7 @@ static void bt_task(void *arg)
                    loop_count, bt_hid_host_get_state(), ds5_connected);
         }
 
-        /* ---- BOOT button gesture FSM (10 Hz cadence) ----
-         * Placed BEFORE any continue statements so the button is
-         * always responsive regardless of BT state machine activity. */
-        uint64_t btn_now = bflb_mtimer_get_time_us();
-        if (btn_now - btn_last_poll_us >= 100000ULL) {
-            btn_last_poll_us = btn_now;
-            bool pressed = boot_button_pressed();
-
-            if (++btn_debug_counter >= 50) {
-                btn_debug_counter = 0;
-                LOG_DBG("[BTN] GPIO%d raw=%d fsm=%d\n",
-                       BOOT_BUTTON_PIN,
-                       (int)bflb_gpio_read(btn_gpio, BOOT_BUTTON_PIN),
-                       btn_fsm);
-            }
-
-            switch (btn_fsm) {
-            case BTN_IDLE:
-                if (pressed) {
-                    btn_fsm = BTN_PRESSING;
-                    btn_press_samples = 1;
-                    btn_press_start_us = btn_now;
-                    LOG_DBG("[BTN] IO2 pressed (raw=%d)\n",
-                           (int)bflb_gpio_read(btn_gpio, BOOT_BUTTON_PIN));
-                }
-                break;
-
-            case BTN_PRESSING:
-                if (pressed) {
-                    btn_press_samples++;
-                    /* LED feedback while holding: fast red blink to show
-                     * "keep holding" (revert to previous pattern on release) */
-                    if (btn_press_samples == 3) {
-                        LOG_DBG("[BTN] IO2 holding...\n");
-                        led_status_set(LED_RED_BLINK);
-                    }
-                    if (btn_now - btn_press_start_us >= BOOT_HOLD_US) {
-                        btn_click_count = 0;
-                        btn_fsm = BTN_HELD;
-                        btn_reset_requested = factory_reset_request();
-                        if (btn_reset_requested) {
-                            LOG_INF("[BTN] IO2 held 3s — full reset saved; release to reboot\n");
-                            led_status_set(LED_BLINK_TRIPLE);
-                        } else {
-                            LOG_ERR("[BTN] Failed to save reset request; release and retry\n");
-                            led_status_set(LED_RED_BLINK);
-                        }
-                    }
-                } else {
-                    btn_click_count++;
-                    btn_fsm = BTN_WAIT;
-                    btn_wait_samples = 0;
-                    /* Restore LED to current BT state since hold was cancelled */
-                    if (btn_press_samples >= 3) {
-                        led_status_set(ds5_connected ? LED_GREEN_SOLID
-                                                     : LED_PURPLE_BLINK_SLOW);
-                    }
-                    LOG_DBG("[BTN] IO2 released (click #%d)\n", btn_click_count);
-                }
-                break;
-
-            case BTN_HELD:
-                if (!pressed) {
-                    btn_fsm = BTN_IDLE;
-                    btn_press_samples = 0;
-                    if (btn_reset_requested) {
-                        LOG_INF("[BTN] IO2 released after hold — resetting all settings\n");
-                        vTaskDelay(pdMS_TO_TICKS(300));
-                        GLB_SW_System_Reset();
-                    }
-                }
-                break;
-
-            case BTN_WAIT:
-                if (pressed) {
-                    btn_fsm = BTN_PRESSING;
-                    btn_press_samples = 1;
-                    btn_press_start_us = btn_now;
-                } else if (++btn_wait_samples >= BOOT_CLICK_WINDOW) {
-                    uint8_t clicks = btn_click_count;
-                    btn_click_count = 0;
-                    btn_fsm = BTN_IDLE;
-                    btn_press_samples = 0;
-
-                    if (bt_init_failed && clicks) {
-                        /* Do not re-enter a partly initialized SDK. A user
-                         * click retries through a complete system restart. */
-                        GLB_SW_System_Reset();
-                    } else if (clicks == 1) {
-                        if (bt_hid_host_get_bonded_count() > 1) {
-                            int next = bt_hid_host_switch_next();
-                            LOG_INF("[BTN] Single click — switching to controller %d\n", next);
-                        } else {
-                            LOG_INF("[BTN] Single click — only 1 bonded, fresh scan\n");
-                            if (ds5_connected) {
-                                scan_after_disconnect = true;
-                                bt_hid_host_disconnect();
-                            } else {
-                                bt_hid_host_scan_start(0);
-                            }
-                        }
-                    } else if (clicks >= 2) {
-                        LOG_INF("[BTN] Double click — disconnect + fresh scan\n");
-                        if (ds5_connected) {
-                            scan_after_disconnect = true;
-                            bt_hid_host_disconnect();
-                        } else {
-                            bt_hid_host_scan_start(0);
-                        }
-                    }
-                }
-                break;
-            }
-        }
+        process_button_events();
 
         if (bt_init_failed) {
             /* Keep USB and BOOT recovery available. */
@@ -867,12 +804,16 @@ int main(void)
     /* Both queues coalesce notifications. Full output state lives in state_mgr,
      * so queue saturation cannot lose a field update or release. */
     output_queue = xQueueCreateStatic(1, sizeof(uint8_t), output_queue_storage, &output_queue_cb);
-    if (!input_queue || !output_queue) {
+    button_queue = xQueueCreateStatic(BUTTON_QUEUE_DEPTH, sizeof(enum boot_button_event),
+                                      button_queue_storage, &button_queue_cb);
+    if (!input_queue || !output_queue || !button_queue) {
         LOG_ERR("[B] queue alloc FAIL\n");
         vAssertCalled();
     }
 
-    if (!xTaskCreateStatic(bt_task, "bt", BT_TASK_STACK_SIZE, NULL,
+    if (!xTaskCreateStatic(button_task, "button", BUTTON_TASK_STACK_SIZE, NULL,
+                           BUTTON_TASK_PRIORITY, button_stack, &button_tcb) ||
+        !xTaskCreateStatic(bt_task, "bt", BT_TASK_STACK_SIZE, NULL,
                            BT_TASK_PRIORITY, bt_stack, &bt_tcb) ||
         !xTaskCreateStatic(usb_task, "usb", USB_TASK_STACK_SIZE, NULL,
                            USB_TASK_PRIORITY, usb_stack, &usb_tcb) ||

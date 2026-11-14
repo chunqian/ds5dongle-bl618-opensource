@@ -149,7 +149,9 @@ LCTech BL616 has a single blue LED (GPIO27); states are distinguished by blink c
 |---------|--------|
 | **Single click** | Switch to the next paired controller (up to 8 remembered) |
 | **Double click** | Disconnect current controller + scan for a new one (link keys preserved) |
-| **Long press (3s)** | Clear all bonds + start scanning (triple LED flash to confirm) |
+| **Long press (3s)** | Clear all user settings and bonds; reboot on release after the triple flash |
+
+BOOT is sampled by a dedicated task every 5ms with 15ms debounce and a 500ms release-to-next-press double-click window. Gestures are queued to the Bluetooth task for execution, so its HCI waits do not delay button sampling.
 
 ## Features
 

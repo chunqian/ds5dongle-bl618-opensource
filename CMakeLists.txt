@@ -35,6 +35,7 @@ target_sources(app PRIVATE
     src/deferred_store.c
     src/config.c
     src/factory_reset.c
+    src/boot_button.c
     src/dse.c
     src/remap.c
 )
