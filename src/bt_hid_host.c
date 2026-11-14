@@ -2383,13 +2383,13 @@ int bt_hid_host_switch_next(void)
 {
     bonded_list_refresh();
     taskENTER_CRITICAL();
-    if (bonded_count <= 1) {
+    if (bonded_count == 0) {
         taskEXIT_CRITICAL();
-        LOG_INF("[BT] switch_next: only %d bonded, nothing to switch\n",
-               bonded_count);
+        LOG_INF("[BT] switch_next: no bonded controller, waiting\n");
         return -1;
     }
 
+    /* With one bond, select the same peer and restart passive reconnect. */
     pairing_addr_pending = false; /* Explicit user selection supersedes pairing. */
     bonded_list_select_index((active_idx + 1) % bonded_count);
     bt_addr_t selected = active_addr;

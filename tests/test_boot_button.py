@@ -106,9 +106,10 @@ static void send(enum boot_button_event e){queue[wr++]=e;process_button_events()
 int main(void){
  request_ok=false;send(BOOT_BUTTON_HOLD);send(BOOT_BUTTON_RELEASE);
  assert(requests==1 && !reboots && !scans);
- for(bonds=0;bonds<2;bonds++){send(BOOT_BUTTON_SINGLE);assert(!switches && !scans && !disconnects);}
- send(BOOT_BUTTON_SINGLE);assert(switches==1 && !scans);
- send(BOOT_BUTTON_DOUBLE);assert(scans==1 && switches==1);
+ bonds=0;send(BOOT_BUTTON_SINGLE);assert(!switches && !scans && !disconnects);
+ bonds=1;send(BOOT_BUTTON_SINGLE);assert(switches==1 && !scans);
+ bonds=2;send(BOOT_BUTTON_SINGLE);assert(switches==2 && !scans);
+ send(BOOT_BUTTON_DOUBLE);assert(scans==1 && switches==2);
  ds5_connected=true;send(BOOT_BUTTON_DOUBLE);assert(disconnects==1 && scan_after_disconnect);
  bt_init_failed=true;send(BOOT_BUTTON_SINGLE);assert(reboots==1);
  bt_init_failed=false;request_ok=true;send(BOOT_BUTTON_HOLD);assert(reboots==1);

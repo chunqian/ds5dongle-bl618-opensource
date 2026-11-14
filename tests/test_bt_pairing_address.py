@@ -268,6 +268,23 @@ int main(void) {
     bt_hid_host_persist_if_dirty(); assert(!pairing_addr_pending && !bonded_count);
     assert(bt_hid_host_try_reconnect()==-1 && bt_hid_host_switch_next()==-1);
     bonded_list_load(); expect_active(zero);
+
+    /* A single bond still disconnects and waits for the same peer, preserving
+     * its key/address. With no live ACL, the same action remains passive. */
+    memset(&hid_ctx,0,sizeof(hid_ctx));
+    key_count=1; keys[0]=first_addr; first.refs=1; hid_ctx.conn=&first;
+    assert(bt_hid_host_switch_next()==0);
+    expect_active(first_addr);
+    assert(key_count==1 && hid_ctx.selection_only && switch_pending);
+    assert(hid_ctx.disconnect_requested && hid_ctx.state==BT_HID_STATE_DISCONNECTING);
+    assert(!memcmp(&hid_ctx.selection_addr,&first_addr,6));
+    conn_disconnected(&first,0x13);
+    assert(bt_hid_host_poll_disconnect() && !hid_ctx.conn && !switch_pending);
+    assert(hid_ctx.state==BT_HID_STATE_IDLE && key_count==1);
+    assert(bt_hid_host_switch_next()==0);
+    assert(hid_ctx.state==BT_HID_STATE_IDLE && !hid_ctx.connect_pending && !hid_ctx.conn);
+    expect_active(first_addr);
+    assert(!memcmp(&saved_address,&first_addr,6));
     assert(!critical_depth);
     puts("PASS: BR address, deferred keys, full-table replacement, deletion, address migration/reorder, save retry and concurrent selection");
 }

@@ -404,7 +404,7 @@ static void process_button_events(void)
             GLB_SW_System_Reset();
             return;
         }
-        if (event == BOOT_BUTTON_SINGLE && bt_hid_host_get_bonded_count() > 1) {
+        if (event == BOOT_BUTTON_SINGLE && bt_hid_host_get_bonded_count() > 0) {
             bt_hid_host_switch_next();
         } else if (event == BOOT_BUTTON_DOUBLE) {
             if (ds5_connected) {

@@ -147,7 +147,7 @@ LCTech BL616 has a single blue LED (GPIO27); states are distinguished by blink c
 
 | Gesture | Action |
 |---------|--------|
-| **Single click** | Switch to the next paired controller (up to 8 remembered; no action with fewer than two, never starts pairing) |
+| **Single click** | Switch to the next paired controller; with one bond, disconnect and wait for that controller to reconnect; with no bonds, no action (never starts pairing) |
 | **Double click** | Disconnect current controller + scan for a new one (link keys preserved) |
 | **Long press (3s)** | Clear all user settings and bonds; reboot on release after the triple flash |
 
