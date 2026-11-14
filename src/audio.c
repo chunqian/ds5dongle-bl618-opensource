@@ -3,6 +3,7 @@
 #include "bt_hid_host.h"
 #include "ds5_protocol.h"
 #include "config.h"
+#include "usb_gamepad.h"
 
 #include "FreeRTOS.h"
 #include "semphr.h"
@@ -500,7 +501,7 @@ int audio_init(void)
 }
 
 /* ---- Send a 0x32 status report to toggle controller mic streaming ---- */
-static int send_mic_status(bool enabled, uint32_t session)
+static int send_mic_status(bool enabled, uint32_t session, uint32_t usb_session)
 {
     if (bt_hid_host_get_state() != BT_HID_STATE_CONNECTED)
         return -1;
@@ -521,7 +522,7 @@ static int send_mic_status(bool enabled, uint32_t session)
                              DS5_BT_OUTPUT_EXT_SIZE - 4);
     ds5_write_le32(&pkt[DS5_BT_OUTPUT_EXT_SIZE - 4], crc);
 
-    return bt_hid_host_send_output_session(pkt, DS5_BT_OUTPUT_EXT_SIZE, session);
+    return bt_hid_host_send_state_session(pkt, DS5_BT_OUTPUT_EXT_SIZE, session, usb_session);
 }
 
 /* Runtime Opus mutations and encoding buffers belong exclusively to audio_task.
@@ -563,13 +564,16 @@ static void audio_sync_mic(void)
         mic_session = current_session;
         mic_status_pending = true;
     }
+    /* Sync a silent SET_CONFIGURATION(0) before snapshotting mic intent. */
+    uint32_t usb_session = usb_gamepad_host_session();
     bool pending = mic_status_pending;
     bool enabled = mic_enabled;
     uint32_t epoch = mic_generation;
     bflb_irq_restore(irq);
-    if (pending && connected && send_mic_status(enabled, current_session) == 0) {
+    if (pending && connected && send_mic_status(enabled, current_session, usb_session) == 0) {
         irq = bflb_irq_save();
-        if (epoch == mic_generation && current_session == bt_hid_host_session())
+        if (epoch == mic_generation && current_session == bt_hid_host_session() &&
+            usb_session == usb_gamepad_host_session())
             mic_status_pending = false;
         bflb_irq_restore(irq);
     }

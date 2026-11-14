@@ -30,6 +30,10 @@
 
 typedef void (*usb_gamepad_output_cb_t)(const uint8_t *data, uint16_t len);
 
+/* Independent host epoch; reset/detach ends it, suspend/resume preserves it. */
+uint32_t usb_gamepad_host_session(void);
+bool usb_gamepad_host_active(void);
+
 int usb_gamepad_init(usb_gamepad_output_cb_t output_cb);
 
 int usb_gamepad_send_raw_input(const uint8_t *payload);

@@ -58,34 +58,28 @@ void initialize(struct config_body config) {
     assert(!memcmp(crc,last_output+138,4));
 }
 '''
-# Execute USB ISR callback: the first five host frames must be retained.
+# Execute the actual USB callback: congestion may coalesce wakes, never fields.
 production += r'''
-#define USB_OUTPUT_BUF_SZ 64
-#define pdTRUE 1
 enum { BT_HID_STATE_CONNECTED, BT_HID_STATE_DISCONNECTING };
 static int bt_state=BT_HID_STATE_CONNECTED;
 static int bt_hid_host_get_state(void) { return bt_state; }
 static bool ds5_connected=true;
-static unsigned out_drop_count, accepted;
+bool usb_gamepad_host_active(void) { return true; }
+static unsigned accepted;
 static int output_queue;
-struct output_message { uint32_t session; uint8_t data[64]; };
-static uint32_t bt_hid_host_session(void) { return 7; }
-static uint8_t reports[5][64];
-static int xQueueSendToBackFromISR(int queue,const void *msg,void *wake) {
-    (void)queue;(void)wake;
-    if(accepted==5) return 0;
-    const struct output_message *message=msg;
-    assert(message->session==7);
-    memcpy(reports[accepted++],message->data,64); return pdTRUE;
+static int xQueueOverwriteFromISR(int queue,const void *msg,void *wake) {
+    (void)queue;(void)wake; assert(*(const uint8_t *)msg==1); ++accepted; return 1;
 }
 '''
 production += extract(main, 'static void on_usb_output(')
 production += r'''
 void check_host_frames(void) {
     uint8_t frame[64]={DS5_USB_REPORT_ID_OUTPUT};
-    for(unsigned i=0;i<6;i++) { frame[2]=i; on_usb_output(frame,64); }
-    assert(accepted==5 && out_drop_count==1);
-    for(unsigned i=0;i<5;i++) assert(reports[i][2]==i);
+    frame[1]=0x0c; frame[11]=frame[22]=1; on_usb_output(frame,64);
+    frame[1]=0x04; frame[11]=0; frame[22]=0;
+    for(unsigned i=0;i<20;i++) on_usb_output(frame,64);
+    uint8_t state[47]; state_mgr_get(state,47);
+    assert(accepted==21 && state[10]==0 && state[21]==1);
     accepted=0; bt_state=BT_HID_STATE_DISCONNECTING;
     on_usb_output(frame,64); assert(!accepted);
 }
@@ -160,7 +154,7 @@ int main(void) {
         for(unsigned i=10;i<32;i++) assert(fresh[i]==0);
     }
     check_host_frames();
-    puts("PASS: reference initialization/4000 state updates, 0x32 framing/CRC, session reset, first host frames and overflow order");
+    puts("PASS: reference initialization/4000 state updates, 0x32 framing/CRC, session reset, host field merge and final release under burst traffic");
 }
 '''
 # The only initial-state caller is the connection primer callback.

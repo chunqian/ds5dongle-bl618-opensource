@@ -41,10 +41,9 @@
 #define BOOT_CLICK_WINDOW    5    /* 500ms window between clicks */
 
 #define INPUT_QUEUE_ITEM_SZ  sizeof(struct input_message)
-#define USB_OUTPUT_BUF_SZ    64  /* Report ID (1) + SetStateData (up to 63 for DSE) */
 
 struct input_message { uint32_t session; uint8_t data[DS5_BT_INPUT_REPORT_SIZE]; };
-struct output_message { uint32_t session; uint8_t data[USB_OUTPUT_BUF_SZ]; };
+
 
 static QueueHandle_t input_queue;
 static QueueHandle_t output_queue;
@@ -54,7 +53,7 @@ static StackType_t bt_stack[BT_TASK_STACK_SIZE], usb_stack[USB_TASK_STACK_SIZE],
                    led_stack[LED_TASK_STACK_SIZE];
 static StaticQueue_t input_queue_cb, output_queue_cb;
 static uint8_t input_queue_storage[INPUT_QUEUE_ITEM_SZ];
-static uint8_t output_queue_storage[5 * sizeof(struct output_message)];
+static uint8_t output_queue_storage[1]; /* Coalesced wake signal, not report storage. */
 static volatile bool ds5_connected = false;
 static volatile bool bt_disconnect_pending_usb = false;
 static volatile bool battery_low = false;
@@ -76,7 +75,6 @@ static uint8_t output_seq = 0;  /* sequence counter for 0x31 BT output */
 static bool first_input_logged = false;
 static uint32_t usb_fwd_count = 0;
 
-static volatile uint32_t out_drop_count = 0;   /* queue-full drops */
 
 /* Build a standard 0x31 BT output report (78 bytes) for ongoing output.
  * set_state_data: 47 bytes of SetStateData
@@ -304,28 +302,43 @@ static void on_hid_state(enum bt_hid_host_state state)
 }
 
 
-/* ---- USB output callback (host → device) ----
- * Runs in USB interrupt context — only copy raw bytes, let bt_task
- * do the heavy lifting (CRC, BT report construction). */
-
+/* Merge before acknowledging USB. A saturated transport cannot discard a
+ * flagged field or final release. The queue is only a one-byte wake signal. */
 static void on_usb_output(const uint8_t *data, uint16_t len)
 {
-    if (!ds5_connected || len < 2 ||
-        bt_hid_host_get_state() != BT_HID_STATE_CONNECTED)
+    uintptr_t irq = bflb_irq_save();
+    if (!ds5_connected || len < 2 || !usb_gamepad_host_active() ||
+        bt_hid_host_get_state() != BT_HID_STATE_CONNECTED ||
+        data[0] != DS5_USB_REPORT_ID_OUTPUT) {
+        bflb_irq_restore(irq);
         return;
+    }
+    uint8_t payload[DS5_USB_OUTPUT_PAYLOAD_LEN] = {0};
+    uint16_t copy = len - 1;
+    if (copy > sizeof(payload)) copy = sizeof(payload);
+    memcpy(payload, data + 1, copy);
+    state_mgr_update(payload, sizeof(payload));
+    uint8_t wake = 1;
+    xQueueOverwriteFromISR(output_queue, &wake, NULL);
+    bflb_irq_restore(irq);
+}
 
-    if (data[0] != DS5_USB_REPORT_ID_OUTPUT)
-        return;
-
-    struct output_message msg;
-    msg.session = bt_hid_host_session();
-    uint16_t copy = (len <= USB_OUTPUT_BUF_SZ) ? len : USB_OUTPUT_BUF_SZ;
-    memcpy(msg.data, data, copy);
-    if (copy < USB_OUTPUT_BUF_SZ)
-        memset(msg.data + copy, 0, USB_OUTPUT_BUF_SZ - copy);
-    /* Keep accepted reports in order, matching the downstream DS5Dongle FIFO. */
-    if (xQueueSendToBackFromISR(output_queue, &msg, NULL) != pdTRUE)
-        out_drop_count++;
+static void process_state_output(void)
+{
+    uint8_t merged[DS5_USB_OUTPUT_PAYLOAD_LEN];
+    uint32_t version;
+    uintptr_t irq = bflb_irq_save();
+    uint32_t session = bt_hid_host_session();
+    uint32_t usb_session = usb_gamepad_host_session();
+    bool pending = state_mgr_output_snapshot(merged, sizeof(merged), &version);
+    bflb_irq_restore(irq);
+    if (!pending) return;
+    uint8_t packet[DS5_BT_OUTPUT_REPORT_SIZE];
+    build_bt_output(merged, sizeof(merged), output_seq, packet);
+    if (bt_hid_host_send_state_session(packet, sizeof(packet), session, usb_session) == 0) {
+        output_seq = (output_seq + 1) & 0x0f;
+        state_mgr_output_ack(version);
+    }
 }
 
 /* ---- FreeRTOS tasks ---- */
@@ -390,8 +403,7 @@ static void bt_task(void *arg)
     if (!err) bt_hid_host_scan_start(0);
     LOG_INF("[BT_TASK] Entering main loop\n");
 
-    struct output_message output;
-    uint8_t *usb_out = output.data;
+    uint8_t output_wake;
     uint16_t loop_count = 0;
 
     /*
@@ -543,9 +555,10 @@ static void bt_task(void *arg)
 
         /* Periodic RSSI read (~every 5 s) */
         {
-            static uint16_t rssi_tick = 0;
-            if (++rssi_tick >= 500 && ds5_connected) {
-                rssi_tick = 0;
+            static uint64_t last_rssi_us;
+            uint64_t now = bflb_mtimer_get_time_us();
+            if (ds5_connected && now - last_rssi_us >= 5000000ULL) {
+                last_rssi_us = now;
                 bt_hid_host_read_rssi(NULL);
             }
         }
@@ -620,47 +633,11 @@ static void bt_task(void *arg)
         }
 
         if (ds5_connected) {
-            /* Push UAC volume/mute changes to controller immediately */
-            uint8_t merged[DS5_USB_OUTPUT_PAYLOAD_LEN];
-            uint32_t volume_version;
-            uint32_t volume_session = bt_hid_host_session();
-            if (state_mgr_volume_snapshot(merged, sizeof(merged), &volume_version)) {
-                uint8_t bt_out[DS5_BT_OUTPUT_REPORT_SIZE];
-                build_bt_output(merged, DS5_USB_OUTPUT_PAYLOAD_LEN,
-                                output_seq, bt_out);
-                output_seq = (output_seq + 1) & 0x0F;
-                if (bt_hid_host_send_output_reliable_session(bt_out, sizeof(bt_out), volume_session) == 0)
-                    state_mgr_vol_ack(volume_version);
-            }
-
-            /* Merge flagged fields like DS5Dongle. BL618 retains 0x39 audio,
-             * which has no SetStateData, so state still travels as 0x31 even
-             * while audio is active. Never discard the first host reports. */
-            if (state_mgr_is_spk_active()) {
-                while (xQueueReceive(output_queue, &output, 0) == pdTRUE) {
-                    if (output.session != bt_hid_host_session()) continue;
-                    uint8_t *payload = usb_out + 1;
-                    state_mgr_merge_snapshot(payload, DS5_USB_OUTPUT_PAYLOAD_LEN);
-
-                    uint8_t bt_out[DS5_BT_OUTPUT_REPORT_SIZE];
-                    build_bt_output(payload, DS5_USB_OUTPUT_PAYLOAD_LEN,
-                                    output_seq, bt_out);
-                    output_seq = (output_seq + 1) & 0x0F;
-                    bt_hid_host_send_output_session(bt_out, DS5_BT_OUTPUT_REPORT_SIZE, output.session);
-                }
-                vTaskDelay(pdMS_TO_TICKS(24));
-            } else if (xQueueReceive(output_queue, &output, pdMS_TO_TICKS(24)) == pdTRUE) {
-                if (output.session != bt_hid_host_session()) continue;
-                uint8_t *payload = usb_out + 1;
-
-                state_mgr_merge_snapshot(payload, DS5_USB_OUTPUT_PAYLOAD_LEN);
-
-                uint8_t bt_out[DS5_BT_OUTPUT_REPORT_SIZE];
-                build_bt_output(payload, DS5_USB_OUTPUT_PAYLOAD_LEN,
-                                output_seq, bt_out);
-                output_seq = (output_seq + 1) & 0x0F;
-                bt_hid_host_send_output_session(bt_out, DS5_BT_OUTPUT_REPORT_SIZE, output.session);
-            }
+            /* Wake immediately on host output; retry pending final state even
+             * if no more host reports arrive. Do not replay queued raw reports. */
+            xQueueReceive(output_queue, &output_wake,
+                          pdMS_TO_TICKS(state_mgr_output_pending() ? 1 : 24));
+            process_state_output();
         } else {
             vTaskDelay(pdMS_TO_TICKS(100));
 
@@ -889,13 +866,10 @@ static void usb_task(void *arg)
             {
                 uint8_t cur_mic_bit = (raw_report[2 + DS5_HEADSET_BYTE] >> 2) & 1;
                 if (prev_mic_bit != 0xFF && cur_mic_bit != prev_mic_bit) {
-                    uint8_t mute_state[DS5_USB_OUTPUT_PAYLOAD_LEN];
-                    memset(mute_state, 0, sizeof(mute_state));
-                    mute_state[1] = 0x01;  /* flags1: AllowMuteLight */
-                    mute_state[8] = cur_mic_bit ? 0x01 : 0x00;
-                    uint8_t pkt[DS5_BT_OUTPUT_EXT_SIZE];
-                    build_bt_output_ext(mute_state, DS5_USB_OUTPUT_PAYLOAD_LEN, pkt);
-                    bt_hid_host_send_output_session(pkt, DS5_BT_OUTPUT_EXT_SIZE, input.session);
+                    uintptr_t irq = bflb_irq_save();
+                    if (input.session == bt_hid_host_session() && ds5_connected)
+                        state_mgr_set_mic_light(cur_mic_bit != 0);
+                    bflb_irq_restore(irq);
                 }
                 prev_mic_bit = cur_mic_bit;
             }
@@ -1068,10 +1042,9 @@ int main(void)
     LOG_INF("[B] audio: %s\n", audio_ok ? "OK" : "FAIL");
 
     input_queue = xQueueCreateStatic(1, INPUT_QUEUE_ITEM_SZ, input_queue_storage, &input_queue_cb);
-    /* Depth-1: USB ISR always delivers the latest report to usb_task.
-     * The 10-deep app_tx_fifo in bt_hid_host.c provides the actual buffering
-     * and CAN_SEND_NOW flow control (one BT packet in-flight at a time). */
-    output_queue = xQueueCreateStatic(5, sizeof(struct output_message), output_queue_storage, &output_queue_cb);
+    /* Both queues coalesce notifications. Full output state lives in state_mgr,
+     * so queue saturation cannot lose a field update or release. */
+    output_queue = xQueueCreateStatic(1, sizeof(uint8_t), output_queue_storage, &output_queue_cb);
     if (!input_queue || !output_queue) {
         LOG_ERR("[B] queue alloc FAIL\n");
         vAssertCalled();

@@ -45,6 +45,12 @@ static uint8_t state[SET_STATE_SIZE];
 static volatile bool spk_active;
 static volatile bool vol_dirty;
 static uint32_t vol_version;
+static uint8_t initial_state[SET_STATE_SIZE];
+static bool initialized, output_dirty;
+static uint32_t output_version;
+
+/* Caller holds the IRQ mask for the entire state transaction. */
+static void output_changed(void) { output_dirty = true; ++output_version; }
 
 void state_mgr_init(const uint8_t *init_data, uint8_t len)
 {
@@ -53,6 +59,10 @@ void state_mgr_init(const uint8_t *init_data, uint8_t len)
     if (len > SET_STATE_SIZE)
         len = SET_STATE_SIZE;
     memcpy(state, init_data, len);
+    memcpy(initial_state, state, SET_STATE_SIZE);
+    initialized = true;
+    output_dirty = false;
+    ++output_version;
     spk_active = false;
     vol_dirty = false;
     ++vol_version;
@@ -99,6 +109,7 @@ void state_mgr_update(const uint8_t *data, uint8_t len)
     if (data[38] & 0x01) state[42] = data[42];
     if (f1 & 0x10) state[43] = data[43];
     if (f1 & 0x04) memcpy(state + 44, data + 44, 3);
+    output_changed();
     bflb_irq_restore(irq);
 }
 
@@ -123,6 +134,7 @@ void state_mgr_apply_config(uint8_t spk_vol, uint8_t hp_vol, uint8_t spk_gain,
         /* state[36] high nibble = TriggerMotorPowerReduction [0..10] */
         state[36] = (state[36] & 0x0F) | ((trigger_reduce & 0x0F) << 4);
     }
+    output_changed();
     bflb_irq_restore(irq);
 }
 
@@ -150,6 +162,7 @@ void state_mgr_set_volume(uint8_t spk_vol, uint8_t hp_vol)
     config_get()->speaker_volume = spk_vol;
     vol_dirty = true;
     ++vol_version;
+    output_changed();
     bflb_irq_restore(irq);
 }
 
@@ -167,6 +180,7 @@ void state_mgr_set_mute(bool mute)
         state[9] &= ~0x60;
     vol_dirty = true;
     ++vol_version;
+    output_changed();
     bflb_irq_restore(irq);
 }
 
@@ -181,6 +195,7 @@ void state_mgr_restore_config_volume(void)
     state[9] &= ~0x60;
     vol_dirty = true;
     ++vol_version;
+    output_changed();
     bflb_irq_restore(irq);
 }
 
@@ -209,6 +224,7 @@ void state_mgr_set_led_color(uint8_t r, uint8_t g, uint8_t b)
     state[44] = r;
     state[45] = g;
     state[46] = b;
+    output_changed();
     bflb_irq_restore(irq);
 }
 
@@ -219,5 +235,64 @@ void state_mgr_merge_snapshot(uint8_t *data, uint8_t size)
     uintptr_t irq = bflb_irq_save();
     state_mgr_update(data, size);
     state_mgr_get(data, size);
+    bflb_irq_restore(irq);
+}
+
+void state_mgr_set_mic_light(bool muted)
+{
+    uintptr_t irq = bflb_irq_save();
+    state[1] |= 0x01;
+    state[8] = muted ? 1 : 0;
+    output_changed();
+    bflb_irq_restore(irq);
+}
+
+bool state_mgr_output_pending(void)
+{
+    uintptr_t irq = bflb_irq_save();
+    bool pending = output_dirty;
+    bflb_irq_restore(irq);
+    return pending;
+}
+
+bool state_mgr_output_snapshot(uint8_t *out, uint8_t size, uint32_t *version)
+{
+    uintptr_t irq = bflb_irq_save();
+    bool pending = output_dirty;
+    if (pending) {
+        state_mgr_get(out, size);
+        *version = output_version;
+    }
+    bflb_irq_restore(irq);
+    return pending;
+}
+
+void state_mgr_output_ack(uint32_t version)
+{
+    uintptr_t irq = bflb_irq_save();
+    if (version == output_version) {
+        output_dirty = false;
+        vol_dirty = false;
+    }
+    bflb_irq_restore(irq);
+}
+
+/* USB host lifetime ends independently of Bluetooth. Release old host effects
+ * on the still-connected controller and restore configured defaults. Never
+ * replay cached trigger/rumble/light state into the next USB session. */
+void state_mgr_usb_reset(void)
+{
+    uintptr_t irq = bflb_irq_save();
+    if (initialized) {
+        memcpy(state, initial_state, SET_STATE_SIZE);
+        struct config_body *cfg = config_get();
+        state_mgr_apply_config(cfg->speaker_volume, cfg->headset_volume,
+                               cfg->speaker_gain, cfg->trigger_reduce);
+        state_mgr_set_led_color(cfg->led_r, cfg->led_g, cfg->led_b);
+        spk_active = false;
+        vol_dirty = false;
+        ++vol_version;
+        output_changed();
+    }
     bflb_irq_restore(irq);
 }

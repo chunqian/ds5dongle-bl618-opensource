@@ -71,6 +71,7 @@ static bool first_usb_send_logged = false;
 typedef struct {
     uint8_t  report_id;
     uint32_t session;
+    uint32_t usb_session; /* Origin only: accepted Edge transactions are durable. */
     uint16_t len;
     bool     is_dse;
     uint8_t  data[SET_REPORT_MAX_DATA];
@@ -672,6 +673,42 @@ static void apply_audio_profile(void)
 }
 
 static volatile bool usb_configured = false;
+static volatile uint32_t host_session = 1;
+static volatile bool host_session_open;
+
+/* Idempotent across soft detach -> RESET -> DISCONNECTED notifications. */
+static void usb_host_session_end(void)
+{
+    uintptr_t irq = bflb_irq_save();
+    if (host_session_open) {
+        host_session_open = false;
+        usb_configured = false;
+        if (++host_session == 0) ++host_session;
+        state_mgr_usb_reset();
+        usb_audio_stop();
+        usb_audio_mic_stop();
+        audio_reset_encoder();
+    }
+    bflb_irq_restore(irq);
+}
+
+/* CherryUSB does not emit an event for SET_CONFIGURATION(0). Observe its
+ * actual configuration before accepting/submitting host output as well. */
+uint32_t usb_gamepad_host_session(void)
+{
+    uintptr_t irq = bflb_irq_save();
+    if (host_session_open && !usb_device_is_configured(0)) usb_host_session_end();
+    uint32_t session = host_session;
+    bflb_irq_restore(irq);
+    return session;
+}
+
+bool usb_gamepad_host_active(void)
+{
+    usb_gamepad_host_session();
+    return host_session_open && usb_configured;
+}
+
 /* BT presentation policy is independent of the HID-controlled audio profile. */
 static volatile bool usb_bt_hidden = false;
 static volatile bool usb_reenumerating = false;
@@ -764,6 +801,8 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
 {
     switch (event) {
     case USBD_EVENT_CONFIGURED:
+        usb_host_session_end(); /* Re-selecting a configuration resets its state too. */
+        host_session_open = true;
         usb_audio_control_configured(&audio_control);
         usb_configured = true;
         ep_in_busy = false;
@@ -774,6 +813,7 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
         try_send_pending();
         break;
     case USBD_EVENT_RESET:
+        usb_host_session_end();
         usb_audio_control_reset(&audio_control, bflb_mtimer_get_time_us());
         /* A reset alone need not recreate the host's interface objects.
          * Force a real removal before replacing the audio configuration;
@@ -819,6 +859,7 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
         LOG_INF("[USB-EVT] CONNECTED (VBUS detected)\n");
         break;
     case USBD_EVENT_DISCONNECTED:
+        usb_host_session_end();
         aux_reset();
         usb_audio_control_disconnect(&audio_control);
         apply_audio_profile();
@@ -931,6 +972,8 @@ void usb_gamepad_process_feature_sets(void)
             retry_at = 0;
             continue;
         }
+        /* USB epoch changes do not revoke an already acknowledged profile
+         * transaction. FIFO order also keeps its unlock ahead of later writes. */
         uint64_t now = bflb_mtimer_get_time_us();
         if (now < retry_at) break;
         int ret = bt_hid_host_set_feature_crc_session(entry.report_id, entry.data,
@@ -1618,11 +1661,14 @@ void usbd_hid_set_report(uint8_t busid, uint8_t intf, uint8_t report_id,
         return;
     }
 
-    /* DSE profile writes (0x60-0x62) and unlock (0x80) — forward + notify */
+    /* Accepted Edge writes/unlock form durable, ordered transactions tied to
+     * this controller. Finish them across USB re-enumeration, including the
+     * unlock prerequisite; only a Bluetooth session change discards them. */
     if (report_type == 0x03 &&
         (report_id == 0x60 || report_id == 0x61 ||
          report_id == 0x62 || report_id == 0x80)) {
-        if (!set_report_queue || !payload_len || payload_len > SET_REPORT_MAX_DATA ||
+        if (!usb_gamepad_host_active() || !set_report_queue ||
+            !payload_len || payload_len > SET_REPORT_MAX_DATA ||
             bt_hid_host_get_state() != BT_HID_STATE_CONNECTED) {
             feature_set_rejected = true;
             return;
@@ -1630,6 +1676,7 @@ void usbd_hid_set_report(uint8_t busid, uint8_t intf, uint8_t report_id,
         set_report_entry_t entry;
         entry.report_id = report_id;
         entry.session = bt_hid_host_session();
+        entry.usb_session = usb_gamepad_host_session();
         entry.is_dse    = true;
         entry.len = payload_len;
         memcpy(entry.data, payload, entry.len);
@@ -1653,6 +1700,7 @@ void usbd_hid_set_report(uint8_t busid, uint8_t intf, uint8_t report_id,
 
 void usb_soft_disconnect(void)
 {
+    usb_host_session_end();
     usb_wake_note_usb_reconnect();
     volatile uint32_t *phy_tst = (volatile uint32_t *)(USB_BASE + 0x114);
     *phy_tst |= 1u;

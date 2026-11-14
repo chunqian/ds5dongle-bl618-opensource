@@ -109,6 +109,9 @@ bool bt_hid_host_poll_disconnect(void);
 int bt_hid_host_send_output(const uint8_t *data, uint16_t len);
 /* Tag work before queueing/encoding; old sessions cannot send to a new peer. */
 uint32_t bt_hid_host_session(void);
+/* State stays with the caller until accepted; no FIFO backlog of old host effects. */
+int bt_hid_host_send_state_session(const uint8_t *data, uint16_t len,
+                                   uint32_t session, uint32_t usb_session);
 int bt_hid_host_send_output_session(const uint8_t *data, uint16_t len, uint32_t session);
 int bt_hid_host_set_feature_crc_session(uint8_t report_id, const uint8_t *data,
                                         uint16_t len, uint32_t session);

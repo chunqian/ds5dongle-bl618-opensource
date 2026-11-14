@@ -49,6 +49,9 @@ static int results[32];
 static unsigned sent_ids[128];
 static struct { struct bt_conn *conn; bt_conn_tx_cb_t cb; void *arg; } completions[128];
 static int hid_tx_pool;
+static uint32_t host_epoch=1;
+static bool reset_host_during_alloc;
+static uint32_t usb_gamepad_host_session(void) { return host_epoch; }
 static bool first_output_logged;
 #define taskENTER_CRITICAL() (++critical_depth)
 #define taskEXIT_CRITICAL() do { assert(critical_depth); --critical_depth; } while (0)
@@ -61,6 +64,8 @@ static bool first_output_logged;
 #define L2CAP_BR_MTU 672
 #define DS5_BT_OUTPUT_REPORT_SIZE 78
 #define DS5_BT_OUTPUT_REPORT_ID 0x31
+#define DS5_BT_OUTPUT_EXT_SIZE 142
+#define DS5_BT_OUTPUT_REPORT_ID_EXT 0x32
 #define HID_TRANS_DATA 0xA
 #define HID_REPORT_OUTPUT 2
 #define HID_REPORT_FEATURE 3
@@ -74,6 +79,7 @@ static struct bt_conn *bt_conn_ref(struct bt_conn *c) {
 static void bt_conn_unref(struct bt_conn *c) { assert(c->refs>0); --c->refs; }
 static struct net_buf *net_buf_alloc(void *pool, int wait) {
     assert(!critical_depth);
+    if (reset_host_during_alloc) { reset_host_during_alloc=false; ++host_epoch; }
     if (allocation_failures) { --allocation_failures; return NULL; }
     assert(allocated<128); return &buffers[allocated++];
 }
@@ -95,6 +101,7 @@ static void ds5_write_le32(uint8_t *out, uint32_t value) {
 '''
 harness += "int bt_hid_host_get_feature(uint8_t report_id);\n"
 harness += fifo + "\n" + function("send_output_session") + "\n" + function("bt_hid_host_send_output_reliable_session") + "\n" + function("bt_hid_host_send_output_session") + "\n" + function("bt_hid_host_send_output")
+harness += "\n" + function("bt_hid_host_send_state_session")
 harness += "\n" + "\n".join(function(name) for name in (
     "bt_hid_host_get_feature_session", "bt_hid_host_get_feature", "bt_hid_host_set_feature_session", "bt_hid_host_set_feature", "bt_hid_host_set_feature_crc_guarded", "bt_hid_host_set_feature_crc_session", "bt_hid_host_set_feature_crc"))
 for name in ("bt_hid_host_refresh_feature", "feature_refresh_poll"):
@@ -318,6 +325,23 @@ int main(void) {
     assert(bt_hid_host_set_feature_crc(0x80,feature,sizeof(feature))==-ENOTCONN);
     assert(sends==1 && connection.refs==1);
     setup();
+    /* State remains caller-owned under congestion; no stale state in FIFO. */
+    setup(); uint8_t state_report[78]={0x31,91};
+    allocation_failures=1;
+    assert(bt_hid_host_send_state_session(state_report,78,app_tx_generation,host_epoch)==-ENOBUFS);
+    assert(!app_tx_busy && !app_tx_retry_pending && app_tx_head==app_tx_tail);
+    results[0]=-EIO; result_count=1;
+    assert(bt_hid_host_send_state_session(state_report,78,app_tx_generation,host_epoch)==-EIO);
+    assert(!app_tx_busy && !app_tx_retry_pending);
+    assert(bt_hid_host_send_state_session(state_report,78,app_tx_generation,host_epoch)==0);
+    unsigned before=sends;
+    assert(bt_hid_host_send_state_session(state_report,78,app_tx_generation,host_epoch)==-EAGAIN && sends==before);
+    complete(); reset_host_during_alloc=true;
+    assert(bt_hid_host_send_state_session(state_report,78,app_tx_generation,host_epoch)==-ENOTCONN);
+    assert(sends==before && !app_tx_busy); /* allocation raced USB reset */
+    assert(bt_hid_host_send_state_session(state_report,78,app_tx_generation,host_epoch-1)==-ENOTCONN);
+    assert(bt_hid_host_send_state_session(state_report,78,app_tx_generation,host_epoch)==0);
+    complete();
     puts("PASS: SDK error propagation, single buffer release, FIFO recovery, bounded failures, stale callbacks and refs");
 }
 '''

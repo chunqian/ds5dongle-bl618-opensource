@@ -87,4 +87,11 @@ void state_mgr_set_led_color(uint8_t r, uint8_t g, uint8_t b);
 
 void state_mgr_merge_snapshot(uint8_t *data, uint8_t size);
 
+/* Latest desired state survives congestion; ACK only the exact accepted version. */
+bool state_mgr_output_pending(void);
+bool state_mgr_output_snapshot(uint8_t *out, uint8_t size, uint32_t *version);
+void state_mgr_output_ack(uint32_t version);
+void state_mgr_set_mic_light(bool muted);
+void state_mgr_usb_reset(void);
+
 #endif /* STATE_MGR_H */

@@ -76,6 +76,7 @@ static uint64_t bflb_mtimer_get_time_us(void) {
     return now_us;
 }
 
+static void usb_host_session_end(void) {} /* Exercised with real state in test_output_lifecycle.py. */
 static void usb_wake_note_usb_reconnect(void) {}
 static void aux_reset(void) {}
 static void usb_audio_stop(void) {}

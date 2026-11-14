@@ -2,6 +2,7 @@
 #include "ds5_protocol.h"
 #include "dse.h"
 #include "config.h"
+#include "usb_gamepad.h"
 #include "bflb_irq.h"
 
 #include <bluetooth/bluetooth.h>
@@ -452,6 +453,7 @@ static bool first_output_logged = false;
 static uint8_t  app_tx_buf[APP_TX_SLOTS][APP_TX_DATA_SZ];
 static uint16_t app_tx_len[APP_TX_SLOTS];
 static bool app_tx_reliable[APP_TX_SLOTS];
+static uint32_t app_tx_host_session; /* Nonzero only for direct, revocable state. */
 /* One failed critical submission remains ahead of the FIFO. Ordinary streaming
  * reports keep the reference project's drop-on-error policy. */
 static uint8_t app_tx_retry_data[APP_TX_DATA_SZ];
@@ -493,6 +495,7 @@ static int hid_send_buf(struct bt_l2cap_br_chan *chan, struct net_buf *buf,
     bool connected = (chan == &hid_ctx.intr_chan && hid_ctx.intr_connected) ||
                      (chan == &hid_ctx.ctrl_chan && hid_ctx.ctrl_connected);
     if (generation == app_tx_generation && (!cb || app_tx_busy) &&
+        (!cb || !app_tx_host_session || app_tx_host_session == usb_gamepad_host_session()) &&
         connected && hid_ctx.state != BT_HID_STATE_DISCONNECTING &&
         hid_ctx.conn && chan->chan.conn == hid_ctx.conn) {
         conn = bt_conn_ref(hid_ctx.conn);
@@ -542,6 +545,7 @@ static void hid_tx_drain_one(void)
             return;
         }
         app_tx_busy = true;
+        app_tx_host_session = 0; /* FIFO holds controller-scoped initialization. */
         generation = app_tx_generation;
         if (app_tx_retry_pending) {
             len = app_tx_retry_len;
@@ -594,6 +598,7 @@ static void app_tx_fifo_reset(void)
     app_tx_tail = 0;
     app_tx_busy = false;
     app_tx_retry_pending = false;
+    app_tx_host_session = 0;
     memset(feature_refresh_pending, 0, sizeof(feature_refresh_pending));
     taskEXIT_CRITICAL();
 }
@@ -2189,6 +2194,48 @@ static int send_output_session(const uint8_t *data, uint16_t len, uint32_t gener
     hid_tx_drain_one();
 
     return 0;
+}
+
+/* Latest USB state is never put in the historical FIFO. The state manager
+ * retains it until the SDK accepts this exact snapshot; while busy, newer
+ * field updates replace it. This keeps final releases and USB revocation
+ * effective even under sustained congestion. */
+int bt_hid_host_send_state_session(const uint8_t *data, uint16_t len,
+                                   uint32_t generation, uint32_t usb_session)
+{
+    if (!data || !usb_session ||
+        !((len == DS5_BT_OUTPUT_REPORT_SIZE && data[0] == DS5_BT_OUTPUT_REPORT_ID) ||
+          (len == DS5_BT_OUTPUT_EXT_SIZE && data[0] == DS5_BT_OUTPUT_REPORT_ID_EXT)))
+        return -EINVAL;
+    taskENTER_CRITICAL();
+    if (generation != app_tx_generation || usb_session != usb_gamepad_host_session() ||
+        !hid_ctx.conn || !hid_ctx.intr_connected || hid_ctx.state != BT_HID_STATE_CONNECTED) {
+        taskEXIT_CRITICAL();
+        return -ENOTCONN;
+    }
+    if (app_tx_busy || app_tx_retry_pending || app_tx_head != app_tx_tail) {
+        taskEXIT_CRITICAL();
+        return -EAGAIN;
+    }
+    app_tx_busy = true;
+    app_tx_host_session = usb_session;
+    taskEXIT_CRITICAL();
+
+    int err = -ENOBUFS;
+    struct net_buf *buf = net_buf_alloc(&hid_tx_pool, K_NO_WAIT);
+    if (buf) {
+        net_buf_reserve(buf, BT_L2CAP_CHAN_SEND_RESERVE);
+        net_buf_add_u8(buf, HID_HEADER(HID_TRANS_DATA, HID_REPORT_OUTPUT));
+        net_buf_add_mem(buf, data, len);
+        /* hid_send_buf rechecks both sessions AFTER allocation/formatting. */
+        err = hid_tx_submit(buf, generation);
+    }
+    if (err < 0) {
+        taskENTER_CRITICAL();
+        if (generation == app_tx_generation) app_tx_busy = false;
+        taskEXIT_CRITICAL();
+    }
+    return err < 0 ? err : 0;
 }
 
 /* Success transfers retry ownership to the queue, not a controller ACK. */

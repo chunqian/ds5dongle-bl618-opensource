@@ -77,6 +77,13 @@ static int bt_hid_host_send_output_session(const uint8_t *data,unsigned len,uint
     if (toggle_during_send) { toggle_during_send=false; audio_set_mic_active(false); }
     return fail_status?-1:0;
 }
+static uint32_t host_epoch=1;
+static uint32_t usb_gamepad_host_session(void) { return host_epoch; }
+static int bt_hid_host_send_state_session(const uint8_t *data,unsigned len,uint32_t epoch,uint32_t host) {
+    if (host!=host_epoch) return -1;
+    return bt_hid_host_send_output_session(data,len,epoch);
+}
+
 static bool stream_active, mic_active, host_speaker_open, host_mic_open, audio_visible, audio_suspended;
 static bool speaker_ep_busy, mic_ep_busy;
 static uint64_t speaker_retry_us, mic_retry_us;

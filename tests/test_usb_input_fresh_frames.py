@@ -90,6 +90,8 @@ static int usbd_ep_start_write(uint8_t bus, uint8_t ep, const uint8_t *data, uin
     return 0;
 }
 static uint64_t bflb_mtimer_get_time_us(void) { return 1000000; }
+static bool host_session_open;
+static void usb_host_session_end(void) { host_session_open=false; }
 static void usb_soft_disconnect(void) {}
 static void apply_audio_profile(void) {}
 static void aux_reset(void) {}

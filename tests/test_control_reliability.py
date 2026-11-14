@@ -60,8 +60,12 @@ harness += r'''
 #define SET_REPORT_MAX_DATA 64
 #define pdTRUE 1
 typedef int BaseType_t;
-typedef struct { uint8_t report_id,len; bool is_dse; uint32_t session; uint8_t data[64]; } set_report_entry_t;
+typedef struct { uint8_t report_id,len; bool is_dse; uint32_t session,usb_session; uint8_t data[64]; } set_report_entry_t;
 static int set_report_queue=1;
+static uint32_t host_epoch=1;
+static bool host_active=true;
+uint32_t usb_gamepad_host_session(void) { return host_epoch; }
+bool usb_gamepad_host_active(void) { return host_active; }
 static set_report_entry_t queue[4];
 static unsigned queued;
 static int xQueuePeek(int q,void *p,unsigned timeout) {
@@ -158,6 +162,16 @@ int main(void) {
     assert(gamepad_class_request(0,&request,&data,&len)==-1);
     callback_reject=false; assert(gamepad_class_request(0,&request,&data,&len)==0);
     callback_result=-2; assert(gamepad_class_request(0,&request,&data,&len)==-2);
+
+    /* USB detach cannot truncate an accepted unlock/profile-save transaction. */
+    setup(); clock_us=30000000; body[0]=0x70; body[1]=1;
+    forward(0x80,3,body,sizeof(body)); forward(0x60,3,body,sizeof(body));
+    failures=1; usb_gamepad_process_feature_sets(); assert(queued==2 && calls==1);
+    ++host_epoch; host_active=false; clock_us+=10000;
+    usb_gamepad_process_feature_sets();
+    assert(!queued && calls==3 && ids[1]==0x80 && ids[2]==0x60);
+    forward(0x61,3,body,sizeof(body)); assert(feature_set_rejected && !queued);
+    host_active=true;
 
     /* Acknowledging a queued snapshot cannot clear a later volume/mute change. */
     uint8_t initial[47]={0}, out[63]; uint32_t a,b;
