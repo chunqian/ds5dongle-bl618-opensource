@@ -69,48 +69,11 @@ static volatile TickType_t connecting_start_tick = 0;
 static volatile bool dse_mode_changed = false;
 static volatile bool prev_led_disabled = false;
 static volatile bool scan_after_disconnect = false;
-/* Deferred primer re-send: after CONNECTED, wait ~300ms then re-send
- * volume to ensure the controller has fully initialized its HID channel. */
-static volatile uint64_t primer_resend_us = 0;
-#define PRIMER_RESEND_DELAY_US  (300ULL * 1000ULL)
-/* Stealth mode: frames of Windows USB output to wait before sending primer */
-static volatile uint8_t stealth_primer_countdown = 0;
 static uint8_t output_seq = 0;  /* sequence counter for 0x31 BT output */
 static bool first_input_logged = false;
 static uint32_t usb_fwd_count = 0;
 
-static volatile uint64_t out_isr_ts_us = 0;   /* timestamp set in USB ISR */
 static volatile uint32_t out_drop_count = 0;   /* queue-full drops */
-
-/* Apply dongle config overlays directly onto a raw SetStateData frame
- * (pass-through mode — no flag accumulation, matches DS5Dongle behavior). */
-static void apply_config_overlay(uint8_t *d, uint16_t len)
-{
-    if (len < DS5_USB_OUTPUT_PAYLOAD_LEN) return;
-    struct config_body *cfg = config_get();
-    if (cfg->trigger_reduce > 0) {
-        d[1] |= 0x40;
-        d[36] = (d[36] & 0x0F) | ((cfg->trigger_reduce & 0x0F) << 4);
-    }
-    if (cfg->speaker_gain > 0) {
-        d[1] |= 0x80;
-        d[37] = cfg->speaker_gain & 0x07;
-    }
-    if (cfg->lock_volume) {
-        static uint8_t lock_vol_log_cnt = 0;
-        d[0] = (d[0] & ~0x70) | 0x30;
-        d[4] = cfg->headset_volume;
-        d[5] = cfg->speaker_volume;
-        if (lock_vol_log_cnt < 5) {
-            lock_vol_log_cnt++;
-            LOG_INF("[VOL-LOCK] inject hp=%d spk=%d flags0=0x%02X\n",
-                    cfg->headset_volume, cfg->speaker_volume, d[0]);
-        }
-    } else {
-        if (d[0] & 0x10) cfg->headset_volume = d[4];
-        if (d[0] & 0x20) cfg->speaker_volume = d[5];
-    }
-}
 
 /* Build a standard 0x31 BT output report (78 bytes) for ongoing output.
  * set_state_data: 47 bytes of SetStateData
@@ -151,151 +114,36 @@ static void build_bt_output_ext(const uint8_t *set_state_data, uint16_t len,
     ds5_write_le32(&out[DS5_BT_OUTPUT_EXT_SIZE - 4], crc);
 }
 
-/* Default SetStateData sent as LED primer on first connect / reconnect.
- * Matches DS5Dongle's update_state() primer exactly.
- *
- * !!!  DO NOT CHANGE THE FOLLOWING VALUES WITHOUT CAREFUL TESTING  !!!
- *
- * [0] flags0 = 0x80 (AllowAudioControl ONLY)
- *   — Adding more flags here causes the controller to misinterpret the
- *     primer as a real game output. LED will be overridden on first connect.
- *
- * [1] flags1 = 0x04 (AllowLedColor ONLY)
- *   — Must include AllowLedColor so the controller accepts our LED color.
- *     Do NOT add AllowRumbleEmulation or other flags; they break LED init.
- *
- * [38] = 0x03 (AllowLightBrightnessChange | AllowColorLightFadeAnimation)
- *   — Required so byte[41] and byte[42] are processed by the controller.
- *
- * [41] LightFadeAnimation = 0x02 (FadeOut)
- *   !!!  MUST BE FadeOut (2). Do NOT change to Nothing (0) or FadeIn (1).  !!!
- *   — Verified by extensive testing (v4.4d vs v4.5d): changing this to 0
- *     silently breaks LED on ALL subsequent game sessions. The controller
- *     ignores our color and keeps whatever the OS sent last (usually blue).
- *     This value matches DS5Dongle reference firmware exactly.
- *
- * [42] LightBrightness = 0x00 (Bright)
- *   — Must be Bright (0). DS5Dongle uses the same value.
- *
- * [44..46] = {0xFF, 0xFF, 0xFF} — initial color: white
- *   — Safe to change the color. Changing the animation/brightness is NOT. */
+/* DS5Dongle state_init_data, with the user's configured LED color retained.
+ * Reset the complete controller state once per connection; no old-session
+ * trigger replay or delayed LED primer that could overwrite host output. */
 static const uint8_t init_set_state[DS5_USB_OUTPUT_PAYLOAD_LEN] = {
-    /* [0] flags0: AllowAudioControl only — DO NOT ADD MORE FLAGS */
-    0x80,
-    /* [1] flags1: AllowLedColor only — DO NOT ADD MORE FLAGS */
-    0x04,
-    /* [2..9] all zeros (no rumble, no volumes, no mute) */
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    /* [10..20] RightTriggerFFB (11 bytes) */ 0,0,0,0,0,0,0,0,0,0,0,
-    /* [21..31] LeftTriggerFFB (11 bytes) */  0,0,0,0,0,0,0,0,0,0,0,
-    /* [32..37] zeros (Timestamp, MotorPowerLevel, AudioControl2) */ 0,0,0,0,0,0,
-    /* [38] AllowLightBrightnessChange | AllowColorLightFadeAnimation — required */
-    0x03,
-    /* [39] HapticLowPassFilter */ 0x00,
-    /* [40] UNK */  0x00,
-    /* [41] LightFadeAnimation: FadeOut=2 — MUST BE 2, see note above */
-    0x02,
-    /* [42] LightBrightness: Bright=0 — MUST BE 0, see note above */
-    0x00,
-    /* [43] PlayerIndicators: none */
-    0x00,
-    /* [44] LedRed   — color only, safe to change */
-    CONFIG_DEFAULT_LED_R,
-    /* [45] LedGreen — color only, safe to change */
-    CONFIG_DEFAULT_LED_G,
-    /* [46] LedBlue  — color only, safe to change */
-    CONFIG_DEFAULT_LED_B,
+    [0] = 0xfd, [1] = 0xf7,
+    [6] = 0xff,                 /* Mic volume */
+    [7] = 0x09,                 /* Internal mic, noise cancellation */
+    [9] = 0x0f,                 /* Touch/motion/haptic/audio power save */
+    [37] = 0x01,                /* SpeakerCompPreGain */
+    [38] = 0x07,                /* Brightness/fade + improved rumble */
+    [41] = 0x02, [42] = 0x01,   /* FadeOut, Mid */
+    [44] = CONFIG_DEFAULT_LED_R,
+    [45] = CONFIG_DEFAULT_LED_G,
+    [46] = CONFIG_DEFAULT_LED_B,
 };
 
 /* ---- BT HID callbacks ---- */
 
-/* Persistent cache of the last trigger configuration the game sent.
- * The DualSense controller is stateful (keeps trigger config until changed),
- * but on reconnection its state is lost. We replay this cache after primer
- * so the controller immediately resumes adaptive triggers. */
-static uint8_t cached_trigger_flags = 0;          /* bits 2,3 of flags0 */
-static uint8_t cached_trigger_r[11];              /* bytes 10-20: RightTriggerFFB */
-static uint8_t cached_trigger_l[11];              /* bytes 21-31: LeftTriggerFFB */
-
-/* Persistent cache of the last LED color the game set.
- * Same principle: controller loses LED state on BT disconnect,
- * games don't re-send color after USB replug. */
-static bool    cached_led_valid = false;
-static uint8_t cached_led_rgb[3];                 /* bytes 44-46: R, G, B */
-static uint8_t cached_player_ind = 0;             /* byte 43: PlayerIndicators */
-static bool    cached_player_valid = false;
-static bool    game_was_active_at_disconnect = false;  /* snapshot at BT disconnect */
-
-/* Called from the output forwarding path to snapshot game state
- * whenever the game sends a report with relevant flags set. */
-static void cache_output_state(const uint8_t *set_state_data)
-{
-    uint8_t f0 = set_state_data[0];
-    uint8_t f1 = set_state_data[1];
-
-    /* Cache trigger data (accumulate flags independently — game may send
-     * left and right in separate frames) */
-    if (f0 & 0x04) {
-        cached_trigger_flags |= 0x04;
-        memcpy(cached_trigger_r, set_state_data + 10, 11);
-    }
-    if (f0 & 0x08) {
-        cached_trigger_flags |= 0x08;
-        memcpy(cached_trigger_l, set_state_data + 21, 11);
-    }
-
-    /* Cache LED color */
-    if (f1 & 0x04) {
-        cached_led_rgb[0] = set_state_data[44];
-        cached_led_rgb[1] = set_state_data[45];
-        cached_led_rgb[2] = set_state_data[46];
-        cached_led_valid = true;
-    }
-
-    /* Cache player indicators */
-    if (f1 & 0x10) {
-        cached_player_ind = set_state_data[43];
-        cached_player_valid = true;
-    }
-}
-
-/* Send the 0x32 LED primer — initial state and later USB LED restoration. */
 static void send_led_primer(void)
 {
     state_mgr_init(init_set_state, DS5_USB_OUTPUT_PAYLOAD_LEN);
     struct config_body *cfg = config_get();
     state_mgr_apply_config(cfg->speaker_volume, cfg->headset_volume,
                            cfg->speaker_gain, cfg->trigger_reduce);
-    uint8_t merged[DS5_USB_OUTPUT_PAYLOAD_LEN];
-    state_mgr_get(merged, DS5_USB_OUTPUT_PAYLOAD_LEN);
-
-    /* Always include volume in primer so controller starts with correct level.
-     * Critical for lock_volume: without this, controller resets to default 0. */
-    merged[0] |= 0x30;
-    LOG_INF("[PRIMER] vol hp=%d spk=%d lock=%d\n",
-            cfg->headset_volume, cfg->speaker_volume, cfg->lock_volume);
-
-    merged[44] = cfg->led_r;
-    merged[45] = cfg->led_g;
-    merged[46] = cfg->led_b;
     state_mgr_set_led_color(cfg->led_r, cfg->led_g, cfg->led_b);
-    state_mgr_clear_flags();
-
-    /* Only replay trigger cache — games don't re-send trigger data after
-     * USB re-enumeration. LED and player indicators are NOT replayed because
-     * USB replug causes the host to re-send them; caching would cause stale
-     * game colors to persist after game exit. */
-    if (cached_trigger_flags) {
-        merged[0] |= cached_trigger_flags;
-        if (cached_trigger_flags & 0x04)
-            memcpy(merged + 10, cached_trigger_r, 11);
-        if (cached_trigger_flags & 0x08)
-            memcpy(merged + 10 + 11, cached_trigger_l, 11);
-    }
-
+    uint8_t merged[DS5_USB_OUTPUT_PAYLOAD_LEN];
+    state_mgr_get(merged, sizeof(merged));
     uint8_t buf[DS5_BT_OUTPUT_EXT_SIZE];
-    build_bt_output_ext(merged, DS5_USB_OUTPUT_PAYLOAD_LEN, buf);
-    bt_hid_host_send_output(buf, DS5_BT_OUTPUT_EXT_SIZE);
+    build_bt_output_ext(merged, sizeof(merged), buf);
+    bt_hid_host_send_output(buf, sizeof(buf));
 }
 
 /* Called after the initial Feature GET batch, before completing detection. */
@@ -336,14 +184,7 @@ static void on_hid_state(enum bt_hid_host_state state)
     case BT_HID_STATE_IDLE: {
         handshake_start_us = 0;
         connecting_start_tick = 0;
-        stealth_primer_countdown = 0;
-        primer_resend_us = 0;
         bool was_connected = ds5_connected;
-        if (was_connected) {
-            uint64_t since_out = bflb_mtimer_get_time_us() - out_isr_ts_us;
-            game_was_active_at_disconnect = (out_isr_ts_us != 0) &&
-                                            (since_out < 5000000ULL);
-        }
         if (ds5_connected) {
             ds5_connected = false;
             battery_low = false;
@@ -431,15 +272,12 @@ static void on_hid_state(enum bt_hid_host_state state)
 
         /* DS5Dongle reattaches only while the host is awake. Keeping the
          * existing attachment during suspend avoids an unintended USB wake. */
-        if (!usb_wake_host_suspended() && usb_gamepad_set_bt_visible(true)) {
-            stealth_primer_countdown = 5;
-            LOG_INF("[MAIN] USB reattached; primer pending after host output\n");
-        }
+        if (!usb_wake_host_suspended())
+            usb_gamepad_set_bt_visible(true);
         bt_disconnect_pending_usb = false;
 
         ds5_connected = true;
         battery_low = false;
-        primer_resend_us = bflb_mtimer_get_time_us();
         usb_wake_on_bt_connect();
         conn_led_start_us = bflb_mtimer_get_time_us();
         conn_led_off = false;
@@ -478,13 +316,9 @@ static void on_usb_output(const uint8_t *data, uint16_t len)
     memcpy(msg, data, copy);
     if (copy < USB_OUTPUT_BUF_SZ)
         memset(msg + copy, 0, USB_OUTPUT_BUF_SZ - copy);
-    if (xQueueIsQueueFullFromISR(output_queue)) {
-        uint8_t dummy[USB_OUTPUT_BUF_SZ];
-        xQueueReceiveFromISR(output_queue, dummy, NULL);
+    /* Keep accepted reports in order, matching the downstream DS5Dongle FIFO. */
+    if (xQueueSendToBackFromISR(output_queue, msg, NULL) != pdTRUE)
         out_drop_count++;
-    }
-    out_isr_ts_us = bflb_mtimer_get_time_us();
-    xQueueSendToBackFromISR(output_queue, msg, NULL);
 }
 
 /* ---- FreeRTOS tasks ---- */
@@ -793,56 +627,35 @@ static void bt_task(void *arg)
                                 output_seq, bt_out);
                 output_seq = (output_seq + 1) & 0x0F;
                 bt_hid_host_send_output(bt_out, DS5_BT_OUTPUT_REPORT_SIZE);
-                state_mgr_clear_flags();
             }
 
-            /* Pass-through output forwarding (matches DS5Dongle):
-             * Each USB output frame is independently forwarded to BT with
-             * only config overlays applied — no flag accumulation or merging. */
+            /* Merge flagged fields like DS5Dongle. BL618 retains 0x39 audio,
+             * which has no SetStateData, so state still travels as 0x31 even
+             * while audio is active. Never discard the first host reports. */
             if (state_mgr_is_spk_active()) {
-                int batch = 0;
                 while (xQueueReceive(output_queue, usb_out, 0) == pdTRUE) {
                     uint8_t *payload = usb_out + 1;
-                    apply_config_overlay(payload, DS5_USB_OUTPUT_PAYLOAD_LEN);
-                    cache_output_state(payload);
+                    state_mgr_update(payload, DS5_USB_OUTPUT_PAYLOAD_LEN);
+                    state_mgr_get(payload, DS5_USB_OUTPUT_PAYLOAD_LEN);
 
                     uint8_t bt_out[DS5_BT_OUTPUT_REPORT_SIZE];
                     build_bt_output(payload, DS5_USB_OUTPUT_PAYLOAD_LEN,
                                     output_seq, bt_out);
                     output_seq = (output_seq + 1) & 0x0F;
                     bt_hid_host_send_output(bt_out, DS5_BT_OUTPUT_REPORT_SIZE);
-                    batch++;
                 }
                 vTaskDelay(pdMS_TO_TICKS(24));
             } else if (xQueueReceive(output_queue, usb_out, pdMS_TO_TICKS(24)) == pdTRUE) {
                 uint8_t *payload = usb_out + 1;
 
-                /* Stealth mode: drain Windows' blue init frames without forwarding
-                 * to BT, then fire primer so controller receives purple BEFORE
-                 * any Windows output (same ordering as normal mode). */
-                if (stealth_primer_countdown > 0) {
-                    cache_output_state(payload);
-                    stealth_primer_countdown--;
-                    if (stealth_primer_countdown == 0) {
-                        LOG_INF("[MAIN] Stealth: primer fired, forwarding starts\n");
-                        send_led_primer();
-                        primer_resend_us = bflb_mtimer_get_time_us();
-                    } else {
-                        LOG_INF("[MAIN] Stealth: holding BT forward, countdown=%d\n",
-                                (int)stealth_primer_countdown);
-                    }
-                    goto next_output_iter;
-                }
-
-                apply_config_overlay(payload, DS5_USB_OUTPUT_PAYLOAD_LEN);
-                cache_output_state(payload);
+                state_mgr_update(payload, DS5_USB_OUTPUT_PAYLOAD_LEN);
+                state_mgr_get(payload, DS5_USB_OUTPUT_PAYLOAD_LEN);
 
                 uint8_t bt_out[DS5_BT_OUTPUT_REPORT_SIZE];
                 build_bt_output(payload, DS5_USB_OUTPUT_PAYLOAD_LEN,
                                 output_seq, bt_out);
                 output_seq = (output_seq + 1) & 0x0F;
                 bt_hid_host_send_output(bt_out, DS5_BT_OUTPUT_REPORT_SIZE);
-next_output_iter:;
             }
         } else {
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -994,13 +807,6 @@ static void usb_task(void *arg)
                    (unsigned long)*(volatile uint32_t *)(USB_BASE + 0x0C4));
         }
         usb_gamepad_process_deferred();
-
-        if (primer_resend_us && ds5_connected &&
-            stealth_primer_countdown == 0 &&
-            (bflb_mtimer_get_time_us() - primer_resend_us) > PRIMER_RESEND_DELAY_US) {
-            primer_resend_us = 0;
-            send_led_primer();
-        }
 
         /* Connection watchdog: if connected and we've received at least one
          * report, but then nothing for 3s → controller likely powered off.

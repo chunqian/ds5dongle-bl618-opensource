@@ -57,6 +57,7 @@ static bool first_output_logged;
 #define LOG_DBG(...) ((void)0)
 #define K_NO_WAIT 0
 #define BT_L2CAP_CHAN_SEND_RESERVE 8
+#define L2CAP_BR_MTU 672
 #define DS5_BT_OUTPUT_REPORT_SIZE 78
 #define DS5_BT_OUTPUT_REPORT_ID 0x31
 #define HID_TRANS_DATA 0xA
@@ -91,9 +92,14 @@ static void ds5_write_le32(uint8_t *out, uint32_t value) {
     for(unsigned i=0;i<4;i++) out[i]=(value>>(i*8))&0xff;
 }
 '''
+harness += "int bt_hid_host_get_feature(uint8_t report_id);\n"
 harness += fifo + "\n" + function("bt_hid_host_send_output")
 harness += "\n" + "\n".join(function(name) for name in (
-    "bt_hid_host_get_feature", "bt_hid_host_set_feature", "bt_hid_host_set_feature_crc"))
+    "get_feature_for_session", "bt_hid_host_get_feature", "bt_hid_host_set_feature", "bt_hid_host_set_feature_crc"))
+for name in ("bt_hid_host_refresh_feature", "feature_refresh_poll"):
+    start=source.index(("static void " if name=="feature_refresh_poll" else "void ")+name+"(", source.index("int bt_hid_host_get_feature("))
+    end=source.index("\n}",start)+2
+    harness += "\n"+source[start:end]
 harness += r'''
 static void enqueue(unsigned id) {
     uint8_t data[78]={0x31}; data[1]=id;
@@ -152,7 +158,7 @@ int main(void) {
     int errors[]={-ENOTCONN,-ENOBUFS};
     /* GET/SET/CRC/direct audio share the consuming adapter and return errors. */
     for(unsigned i=0;i<2;i++) {
-        uint8_t feature[8]={0}; uint8_t output[142]={0x32};
+        uint8_t feature[8]={0}; uint8_t output[547]={0x39};
         setup(); results[0]=errors[i]; result_count=1;
         assert(bt_hid_host_get_feature(0x20)==errors[i]);
         assert(buffers[0].data[0]==0x43 && buffers[0].data[1]==0x20);
@@ -215,6 +221,36 @@ int main(void) {
     refill_on_error=false; result_count=result_index=0;
     bt_hid_host_poll_tx(); assert(app_tx_busy);
     complete(); assert(!app_tx_busy && app_tx_head==app_tx_tail);
+
+    /* Exactly ten queued packets behind one submitted packet; reject the
+     * newest on overflow and retain 0x32/0x31 order. Audio stays direct. */
+    setup();
+    uint8_t init[142]={0x32,90}, next[78]={0x31,91}, pcm[547]={0x39,92};
+    assert(bt_hid_host_send_output(init,sizeof(init))==0);
+    for(unsigned i=0;i<APP_TX_DEPTH;i++) enqueue(i);
+    assert(bt_hid_host_send_output(next,sizeof(next))==-ENOBUFS);
+    assert(sends==1 && sent_ids[0]==90);
+    assert(bt_hid_host_send_output(pcm,sizeof(pcm))==0 && sends==2);
+    for(unsigned i=0;i<APP_TX_DEPTH;i++) {
+        complete(); assert(sent_ids[i+2]==i);
+    }
+    complete(); assert(!app_tx_busy && app_tx_head==app_tx_tail);
+    assert(bt_hid_host_send_output(NULL,1)==-EINVAL);
+    assert(bt_hid_host_send_output(next,0)==-EINVAL);
+    assert(bt_hid_host_send_output(next,672)==-EMSGSIZE);
+
+    /* Coalesced GETs survive different IDs and transient send failure,
+     * but are dropped across session reset. */
+    setup();
+    bt_hid_host_refresh_feature(0x81); bt_hid_host_refresh_feature(0x63);
+    bt_hid_host_refresh_feature(0x81);
+    results[0]=-ENOBUFS; result_count=1;
+    bt_hid_host_poll_tx(); assert(sends==1);
+    bt_hid_host_poll_tx(); assert(sends==2 && buffers[1].data[1]==0x63);
+    bt_hid_host_poll_tx(); assert(sends==3 && buffers[2].data[1]==0x81);
+    bt_hid_host_poll_tx(); assert(sends==3);
+    bt_hid_host_refresh_feature(0x70); app_tx_fifo_reset();
+    bt_hid_host_poll_tx(); assert(sends==3);
 
     /* Old callbacks must not clear busy/drain a newly reset session, even
      * if the SDK reuses the same connection pointer. */

@@ -127,6 +127,10 @@ int bt_hid_host_set_feature(uint8_t report_id, const uint8_t *data, uint16_t len
  */
 int bt_hid_host_get_feature(uint8_t report_id);
 
+/* Coalesce a host Feature refresh for the BT task; safe from USB callbacks.
+ * Pending requests are discarded with the Bluetooth session. */
+void bt_hid_host_refresh_feature(uint8_t report_id);
+
 /**
  * Get current connection state.
  */

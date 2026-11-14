@@ -41,6 +41,7 @@ static volatile bool pending_valid, pending_active, usb_configured, ep_in_busy;
 static struct config_body test_config;
 struct config_body *config_get(void) { return &test_config; }
 static bool first_usb_send_logged, kbd_ep_busy;
+static bool usb_bt_hidden, usb_reenumerating;
 static struct usb_audio_control audio_control;
 static void (*hook_configured)(void), (*hook_resume)(void), (*hook_suspend)(void);
 static uintptr_t masked;

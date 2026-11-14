@@ -22,8 +22,8 @@ void state_mgr_update(const uint8_t *data, uint8_t len);
 
 /**
  * Copy the current merged state into the output buffer.
- * The output always has all Allow flags set so the controller processes
- * every field.
+ * Initialized Allow flags are retained, with rumble mode bits updated from
+ * host reports, matching DS5Dongle.
  */
 void state_mgr_get(uint8_t *out, uint8_t size);
 
@@ -36,8 +36,8 @@ void state_mgr_apply_config(uint8_t spk_vol, uint8_t hp_vol, uint8_t spk_gain,
                             uint8_t trigger_reduce);
 
 /**
- * Set the speaker-active flag. When true, non-rumble output reports are
- * suppressed to avoid conflicting with audio-driven haptic feedback.
+ * Set the speaker-active flag. BL618 sends state separately from its 0x39
+ * audio packets, including while speaker streaming is active.
  * Called from USB Audio Class callbacks when the host opens/closes
  * the speaker streaming interface.
  */
@@ -77,32 +77,6 @@ bool state_mgr_vol_dirty(void);
  * Clear the volume-dirty flag after the update has been sent.
  */
 void state_mgr_vol_ack(void);
-
-/**
- * Clear accumulated flags (state[0], state[1]) so that subsequent
- * game frames start accumulating from zero.  Called after primer send.
- */
-void state_mgr_clear_flags(void);
-
-/**
- * Clear only one-shot action flags (like ResetLights) that must not
- * persist across BT sends.  Called after each regular BT output send
- * to prevent one-shot flags from accumulating indefinitely.
- */
-void state_mgr_clear_oneshot_flags(void);
-
-/**
- * Check whether the given SetStateData should be forwarded to the
- * controller right now.
- * When the speaker is active, only reports with UseRumbleNotHaptics
- * or UseRumbleNotHaptics2 are allowed through; other reports are
- * suppressed because the haptic actuators are driven by the audio
- * stream. state_mgr_update() must still be called unconditionally
- * so that the merged state is up-to-date when audio stops.
- * @param data  SetStateData (47 bytes, same pointer passed to update)
- * @return true if the report should be sent to the controller
- */
-bool state_mgr_should_send(const uint8_t *data);
 
 /**
  * Persist custom LED color into internal state so subsequent

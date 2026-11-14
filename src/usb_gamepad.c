@@ -70,10 +70,6 @@ typedef struct {
 
 static QueueHandle_t set_report_queue = NULL;
 
-/* Pending feature GET request, deferred from ISR to task context.
- * 0 = no pending request. Written by ISR, consumed by process_deferred(). */
-static volatile uint8_t pending_feature_rid = 0;
-
 /* DualSense USB HID Report Descriptor (321 bytes) */
 static const uint8_t hid_report_desc_ds[HID_REPORT_DESC_SIZE_DS] = {
     0x05, 0x01,       /* Usage Page (Generic Desktop Ctrls) */
@@ -873,13 +869,6 @@ void usb_gamepad_process_deferred(void)
         LOG_INF("[USB] Remap profile %d saved to flash\n", usb_remap_save_profile);
     }
 
-    uint8_t frid = pending_feature_rid;
-    if (frid != 0) {
-        pending_feature_rid = 0;
-        bt_hid_host_get_feature(frid);
-        LOG_INF("[USB] Deferred GET_REPORT(Feature 0x%02x) → BT\n", frid);
-    }
-
     set_report_entry_t entry;
     while (set_report_queue &&
            xQueueReceive(set_report_queue, &entry, 0) == pdTRUE) {
@@ -1337,6 +1326,7 @@ void usbd_hid_get_report(uint8_t busid, uint8_t intf, uint8_t report_id,
     /* DSE profile reports (0x70-0x7B): NAK while prefetch in progress
      * so the PS Accessories app retries instead of caching empty data. */
     if (dse_is_profile_report(report_id) && !dse_profiles_ready()) {
+        bt_hid_host_refresh_feature(report_id);
         *len = 0;
         return;
     }
@@ -1344,7 +1334,13 @@ void usbd_hid_get_report(uint8_t busid, uint8_t intf, uint8_t report_id,
     /* DualSense Feature Reports — forwarded to/from BT */
     const uint8_t *cached;
     uint16_t cached_len;
-    if (bt_hid_host_get_cached_feature(report_id, &cached, &cached_len)) {
+    bool has_cache = bt_hid_host_get_cached_feature(report_id, &cached, &cached_len);
+    /* DS5Dongle returns cached data immediately and refreshes mutable reports
+     * in the background. Cache misses also fetch, even if a fallback is used. */
+    if (!has_cache || report_id == 0x81 || report_id == 0x63 ||
+        report_id == 0x64 || report_id == 0x65 || dse_is_profile_report(report_id))
+        bt_hid_host_refresh_feature(report_id);
+    if (has_cache) {
         if (cached_len > FEATURE_DATA_MAX)
             cached_len = FEATURE_DATA_MAX;
         feature_resp_buf[0] = report_id;
@@ -1358,7 +1354,6 @@ void usbd_hid_get_report(uint8_t busid, uint8_t intf, uint8_t report_id,
         LOG_INF("[USB] GET_REPORT(Feature 0x%02x) → %u bytes from fallback\n",
                report_id, *len);
     } else {
-        pending_feature_rid = report_id;
         *len = 0;
         LOG_INF("[USB] GET_REPORT(Feature 0x%02x) → not cached, deferred to task\n",
                report_id);
@@ -1388,6 +1383,10 @@ void usbd_hid_set_report(uint8_t busid, uint8_t intf, uint8_t report_id,
         uint8_t cmd = payload[0];
         if (cmd == 0x01 && payload_len > 1) {
             config_set(payload + 1, payload_len - 1);
+            /* DS5Dongle updates the live state as well as saved preferences. */
+            struct config_body *cfg = config_get();
+            state_mgr_apply_config(cfg->speaker_volume, cfg->headset_volume,
+                                   cfg->speaker_gain, cfg->trigger_reduce);
             usb_gamepad_set_polling_rate(config_get()->polling_rate_mode);
             if (config_get()->lock_volume)
                 state_mgr_restore_config_volume();

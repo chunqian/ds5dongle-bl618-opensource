@@ -26,11 +26,11 @@ harness = r'''
 #define DS5_USB_INPUT_PAYLOAD_LEN 63
 #define DS5_DPAD_NONE 8
 enum { LED_RED_BLINK, LED_PURPLE_BLINK_SLOW, LED_PURPLE_BLINK_FAST, LED_GREEN_SOLID };
-static uint64_t handshake_start_us, connecting_start_tick, primer_resend_us;
-static uint64_t out_isr_ts_us, conn_led_start_us;
-static unsigned stealth_primer_countdown, usb_fwd_count;
+static uint64_t handshake_start_us, connecting_start_tick;
+static uint64_t conn_led_start_us;
+static unsigned usb_fwd_count;
 static uint8_t cached_battery_level, cached_battery_state;
-static bool ds5_connected, battery_low, first_input_logged, game_was_active_at_disconnect;
+static bool ds5_connected, battery_low, first_input_logged;
 static bool bt_disconnect_pending_usb, conn_led_off, scan_after_disconnect, dse_mode_changed;
 static bool wake_enabled, suspended, visible;
 static unsigned visibility_calls, wake_connects, wake_disconnects, neutral_reports;
@@ -65,7 +65,6 @@ static void setup(void) {
     ds5_connected=bt_disconnect_pending_usb=suspended=wake_enabled=false;
     visible=true;
     visibility_calls=wake_connects=wake_disconnects=neutral_reports=0;
-    stealth_primer_countdown=0;
 }
 int main(void) {
     setup();
@@ -96,7 +95,6 @@ int main(void) {
         on_hid_state(BT_HID_STATE_CONNECTED);
         assert(visible==(!hidden || !asleep));
         assert(visibility_calls==!asleep);
-        assert(stealth_primer_countdown==((hidden && !asleep) ? 5 : 0));
         assert(ds5_connected && wake_connects==1);
     }
     puts("PASS: immediate USB hide after ACL teardown, wake/suspend exceptions, reconnect, startup errors");

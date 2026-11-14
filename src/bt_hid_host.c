@@ -350,17 +350,20 @@ static bool first_output_logged = false;
  *   bt_hid_host_send_output() → enqueue to app_tx_fifo (10-deep)
  *   on_hid_output_sent() fires when HCI ACKs the packet → drain next one
  *
- * This ensures only ONE packet is in-flight in the BT stack at any time,
+ * This ensures only ONE queued output packet is in-flight at any time,
  * preventing net_buf pool exhaustion and HCI credit starvation.
  */
 #define APP_TX_DEPTH    10
-#define APP_TX_DATA_SZ  80   /* 1 HID header + 79 bytes (covers 0x31 78-byte report) */
+#define APP_TX_DATA_SZ  512  /* DS5Dongle send_element size, includes HID header */
+#define APP_TX_SLOTS (APP_TX_DEPTH + 1) /* ring sentinel; ten usable queued slots */
 
-static uint8_t  app_tx_buf[APP_TX_DEPTH][APP_TX_DATA_SZ];
-static uint16_t app_tx_len[APP_TX_DEPTH];
+static uint8_t  app_tx_buf[APP_TX_SLOTS][APP_TX_DATA_SZ];
+static uint16_t app_tx_len[APP_TX_SLOTS];
 static volatile uint8_t  app_tx_head = 0;   /* next slot to consume */
 static volatile uint8_t  app_tx_tail = 0;   /* next slot to fill */
 static volatile bool     app_tx_busy = false; /* true: one packet is in HCI */
+static uint8_t feature_refresh_pending[32]; /* coalesced GETs, indexed by report ID */
+static void feature_refresh_poll(void);
 static uint32_t app_tx_generation = 1; /* invalidate callbacks across FIFO resets */
 
 /* bt_conn_tx_cb_t: SDK declaration from conn_internal.h */
@@ -444,7 +447,7 @@ static void hid_tx_drain_one(void)
         uint8_t idx = app_tx_head;
         len = app_tx_len[idx];
         memcpy(data, app_tx_buf[idx], len);
-        app_tx_head = (idx + 1) % APP_TX_DEPTH;
+        app_tx_head = (idx + 1) % APP_TX_SLOTS;
         taskEXIT_CRITICAL();
 
         int err = -ENOBUFS;
@@ -476,6 +479,7 @@ static void app_tx_fifo_reset(void)
     app_tx_head = 0;
     app_tx_tail = 0;
     app_tx_busy = false;
+    memset(feature_refresh_pending, 0, sizeof(feature_refresh_pending));
     taskEXIT_CRITICAL();
 }
 
@@ -484,6 +488,7 @@ void bt_hid_host_poll_tx(void)
     /* A producer may refill the FIFO during a bounded failure drain. No
      * completion is pending then; the BT task supplies the next opportunity. */
     hid_tx_drain_one();
+    feature_refresh_poll();
 }
 
 static struct bt_br_discovery_result discovery_results[BT_MAX_DISCOVERED];
@@ -1991,22 +1996,19 @@ int bt_hid_host_send_output(const uint8_t *data, uint16_t len)
         hid_ctx.state == BT_HID_STATE_DISCONNECTING)
         return -ENOTCONN;
 
-    /* Route by report type:
-     *   0x31 game output (78 B)  → 10-deep FIFO with CAN_SEND_NOW flow control
-     *   0x32 init (142 B)        → direct send (large, infrequent, bypasses FIFO)
-     *   0x39 audio (547 B)       → direct send (too large for FIFO slot, high rate)
-     *
-     * This matches DS5Dongle which routes only game output through send_fifo;
-     * audio haptics and init go via separate direct l2cap_send calls. */
-    bool is_game_output = (len <= APP_TX_DATA_SZ - 1) &&
-                          (len == DS5_BT_OUTPUT_REPORT_SIZE || data[0] == DS5_BT_OUTPUT_REPORT_ID);
+    if (!data || !len)
+        return -EINVAL;
+    if (len > L2CAP_BR_MTU - 1)
+        return -EMSGSIZE;
 
-    if (!is_game_output) {
+    /* Both 0x31 state and 0x32 initialization use the same ordered FIFO,
+     * as DS5Dongle bt_write(). Retain BL618's larger 0x39 audio direct path. */
+    if (len > APP_TX_DATA_SZ - 1) {
         /* Direct path: allocate and send immediately */
         struct net_buf *buf = net_buf_alloc(&hid_tx_pool, K_NO_WAIT);
         if (!buf) {
             LOG_WRN("[HID] send_output direct: pool empty (len=%d)\n", (int)len);
-            return -1;
+            return -ENOBUFS;
         }
         net_buf_reserve(buf, BT_L2CAP_CHAN_SEND_RESERVE);
         net_buf_add_u8(buf, HID_HEADER(HID_TRANS_DATA, HID_REPORT_OUTPUT));
@@ -2019,18 +2021,19 @@ int bt_hid_host_send_output(const uint8_t *data, uint16_t len)
         return 0;
     }
 
-    /* FIFO path for 0x31 game output (equivalent to DS5Dongle's send_fifo) */
+    /* FIFO path for state/initialization reports. */
     taskENTER_CRITICAL();
     if (generation != app_tx_generation || !hid_ctx.conn ||
         !hid_ctx.intr_connected || hid_ctx.state == BT_HID_STATE_DISCONNECTING) {
         taskEXIT_CRITICAL();
         return -ENOTCONN;
     }
-    uint8_t next_tail = (app_tx_tail + 1) % APP_TX_DEPTH;
+    uint8_t next_tail = (app_tx_tail + 1) % APP_TX_SLOTS;
 
-    /* Preserve the existing drop-oldest policy when the FIFO is full. */
+    /* DS5Dongle rejects the new packet when full, preserving queued order. */
     if (next_tail == app_tx_head) {
-        app_tx_head = (app_tx_head + 1) % APP_TX_DEPTH;
+        taskEXIT_CRITICAL();
+        return -ENOBUFS;
     }
 
     uint8_t slot = app_tx_tail;
@@ -2076,9 +2079,8 @@ int bt_hid_host_set_feature(uint8_t report_id, const uint8_t *data,
     return 0;
 }
 
-int bt_hid_host_get_feature(uint8_t report_id)
+static int get_feature_for_session(uint8_t report_id, uint32_t generation)
 {
-    uint32_t generation = app_tx_generation;
     if (!hid_ctx.ctrl_connected || !hid_ctx.conn)
         return -1;
 
@@ -2097,6 +2099,48 @@ int bt_hid_host_get_feature(uint8_t report_id)
 
     LOG_DBG("[HID] GET_REPORT(Feature, 0x%02x) sent\n", report_id);
     return 0;
+}
+
+int bt_hid_host_get_feature(uint8_t report_id)
+{
+    return get_feature_for_session(report_id, app_tx_generation);
+}
+
+void bt_hid_host_refresh_feature(uint8_t report_id)
+{
+    taskENTER_CRITICAL();
+    /* Do not mix host GETs into the initial type-detection batch. A host
+     * read during handshake can retry after CONNECTED. */
+    if (hid_ctx.state == BT_HID_STATE_CONNECTED && hid_ctx.ctrl_connected)
+        feature_refresh_pending[report_id >> 3] |= 1u << (report_id & 7);
+    taskEXIT_CRITICAL();
+}
+
+static void feature_refresh_poll(void)
+{
+    int report_id = -1;
+    taskENTER_CRITICAL();
+    uint32_t generation = app_tx_generation;
+    if (hid_ctx.state == BT_HID_STATE_CONNECTED && hid_ctx.ctrl_connected) {
+        for (unsigned i = 0; i < 256; ++i) {
+            if (feature_refresh_pending[i >> 3] & (1u << (i & 7))) {
+                feature_refresh_pending[i >> 3] &= ~(1u << (i & 7));
+                report_id = (int)i;
+                break;
+            }
+        }
+    }
+    taskEXIT_CRITICAL();
+    if (report_id < 0)
+        return;
+    /* A failed submission has no response: keep it for a later task poll.
+     * Requests for other IDs, or a repeated ISR request, remain independent. */
+    if (get_feature_for_session((uint8_t)report_id, generation)) {
+        taskENTER_CRITICAL();
+        if (generation == app_tx_generation && hid_ctx.state == BT_HID_STATE_CONNECTED)
+            feature_refresh_pending[report_id >> 3] |= 1u << (report_id & 7);
+        taskEXIT_CRITICAL();
+    }
 }
 
 enum bt_hid_host_state bt_hid_host_get_state(void)
